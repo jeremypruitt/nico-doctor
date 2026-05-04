@@ -14,6 +14,7 @@ use crate::sources::temporal::{TemporalSource, TemporalClient, RawTemporalEvent}
 use crate::sources::postgres::{PostgresSource, PostgresClient, PgEntityData};
 use crate::sources::k8s::{K8sSource, K8sClient, K8sPodData};
 use crate::sources::loki::{LokiSource, LokiClient, LokiLogLine, K8sLogStreamClient, K8sLogLine};
+use crate::sources::redfish::{RedfishSource, RedfishClient, RedfishData};
 use crate::timeline::filter_timeline;
 use crate::correlate::exit_code;
 use crate::event::Event;
@@ -30,7 +31,7 @@ struct Cli {
     #[arg(short = 't', long)]
     r#type: Option<String>,
 
-    /// Restrict to specific sources (comma-separated: temporal,postgres,k8s,loki)
+    /// Restrict to specific sources (comma-separated: temporal,postgres,k8s,loki,redfish)
     #[arg(short = 's', long, value_delimiter = ',')]
     sources: Vec<String>,
 
@@ -136,6 +137,17 @@ impl K8sLogStreamClient for TodoK8sLogStreamClient {
     }
 }
 
+// Real Redfish client resolves DPU entities via Postgres hosts.dpu_id, then
+// queries the host BMC with read-only GETs (ADR-002).
+struct TodoRedfishClient;
+
+#[async_trait]
+impl RedfishClient for TodoRedfishClient {
+    async fn query(&self, _id: &str, _id_type: &IdType) -> Result<RedfishData> {
+        todo!("real Redfish client — resolve host via Postgres hosts.dpu_id for DPU entities, query BMC GET endpoints via REDFISH_BMC_BASE_URL")
+    }
+}
+
 #[derive(Serialize)]
 struct JsonOutput<'a> {
     version: u32,
@@ -225,6 +237,7 @@ async fn main() {
             cli.pod.clone(),
             since,
         ))),
+        ("redfish", Box::new(RedfishSource::new(Box::new(TodoRedfishClient)))),
     ];
 
     let sources: Vec<Box<dyn Source>> = if cli.sources.is_empty() {
@@ -292,6 +305,14 @@ async fn main() {
         if !pg_state.is_empty() {
             println!("\nPostgres state (current):");
             for s in &pg_state {
+                println!("  {}: {}", s.key, s.value);
+            }
+        }
+
+        let redfish_state: Vec<&StateEntry> = state.iter().filter(|s| s.source == "redfish").collect();
+        if !redfish_state.is_empty() {
+            println!("\nRedfish state (current):");
+            for s in &redfish_state {
                 println!("  {}: {}", s.key, s.value);
             }
         }
