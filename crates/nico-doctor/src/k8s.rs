@@ -17,4 +17,5 @@ pub struct EventInfo {
 pub trait K8sClient: Send + Sync {
     async fn list_pods(&self, namespace: &str) -> Result<Vec<PodInfo>>;
     async fn list_events(&self, namespace: &str, since: Duration) -> Result<Vec<EventInfo>>;
+    async fn pod_logs(&self, namespace: &str, pod: &str, since: Duration) -> Result<Vec<String>>;
 }

@@ -6,7 +6,9 @@ use nico_common::output::{OutputMode, Status};
 mod k8s;
 mod layer;
 mod layers;
+mod loki;
 mod runner;
+mod temporal;
 
 use layer::RunOpts;
 use runner::Report;

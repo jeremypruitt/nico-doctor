@@ -120,6 +120,9 @@ mod tests {
                 reason: e.reason.clone(),
             }).collect())
         }
+        async fn pod_logs(&self, _namespace: &str, _pod: &str, _since: Duration) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
     }
 
     fn opts() -> RunOpts {
