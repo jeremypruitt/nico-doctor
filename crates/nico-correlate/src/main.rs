@@ -81,7 +81,7 @@ struct TodoTemporalClient;
 #[async_trait]
 impl TemporalClient for TodoTemporalClient {
     async fn get_history(&self, _workflow_id: &str) -> Result<Vec<RawTemporalEvent>> {
-        todo!("real Temporal gRPC client — see issue #14")
+        Err(anyhow::anyhow!("not implemented: real Temporal gRPC client — see issue #14"))
     }
 }
 
@@ -91,7 +91,7 @@ struct TodoPostgresClient;
 #[async_trait]
 impl PostgresClient for TodoPostgresClient {
     async fn query_entity(&self, _id: &str, _id_type: &IdType) -> Result<PgEntityData> {
-        todo!("real Postgres client — connect via NICO_POSTGRES_URL")
+        Err(anyhow::anyhow!("not implemented: real Postgres client — connect via NICO_POSTGRES_URL"))
     }
 }
 
@@ -101,7 +101,7 @@ struct TodoK8sClient;
 #[async_trait]
 impl K8sClient for TodoK8sClient {
     async fn find_pods_with_events(&self, _id: &str, _id_type: &IdType) -> Result<Vec<K8sPodData>> {
-        todo!("real k8s client — uses in-cluster or kubeconfig")
+        Err(anyhow::anyhow!("not implemented: real k8s client — uses in-cluster or kubeconfig"))
     }
 }
 
@@ -117,7 +117,7 @@ impl LokiClient for TodoLokiClient {
         _since: Duration,
         _pod_pattern: Option<&str>,
     ) -> Result<Vec<LokiLogLine>> {
-        todo!("real Loki HTTP client — query LOKI_URL with label selectors derived from entity ID")
+        Err(anyhow::anyhow!("not implemented: real Loki HTTP client — query LOKI_URL with label selectors derived from entity ID"))
     }
 }
 
@@ -133,7 +133,7 @@ impl K8sLogStreamClient for TodoK8sLogStreamClient {
         _since: Duration,
         _pod_pattern: Option<&str>,
     ) -> Result<Vec<K8sLogLine>> {
-        todo!("real k8s log streaming client — kubectl logs equivalent")
+        Err(anyhow::anyhow!("not implemented: real k8s log streaming client — kubectl logs equivalent"))
     }
 }
 
@@ -144,7 +144,7 @@ struct TodoRedfishClient;
 #[async_trait]
 impl RedfishClient for TodoRedfishClient {
     async fn query(&self, _id: &str, _id_type: &IdType) -> Result<RedfishData> {
-        todo!("real Redfish client — resolve host via Postgres hosts.dpu_id for DPU entities, query BMC GET endpoints via REDFISH_BMC_BASE_URL")
+        Err(anyhow::anyhow!("not implemented: real Redfish client — resolve host via Postgres hosts.dpu_id for DPU entities, query BMC GET endpoints via REDFISH_BMC_BASE_URL"))
     }
 }
 
