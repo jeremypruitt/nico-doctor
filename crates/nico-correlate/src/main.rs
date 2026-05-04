@@ -6,12 +6,14 @@ mod sources;
 mod timeline;
 
 use clap::Parser;
+use chrono::Duration;
 use serde::Serialize;
 use crate::id::{IdType, detect_id_type};
 use crate::source::{Source, SourceResult, StateEntry};
 use crate::sources::temporal::{TemporalSource, TemporalClient, RawTemporalEvent};
 use crate::sources::postgres::{PostgresSource, PostgresClient, PgEntityData};
 use crate::sources::k8s::{K8sSource, K8sClient, K8sPodData};
+use crate::sources::loki::{LokiSource, LokiClient, LokiLogLine, K8sLogStreamClient, K8sLogLine};
 use crate::timeline::filter_timeline;
 use crate::correlate::exit_code;
 use crate::event::Event;
@@ -28,13 +30,48 @@ struct Cli {
     #[arg(short = 't', long)]
     r#type: Option<String>,
 
-    /// Restrict to specific sources (comma-separated: temporal,postgres,k8s)
+    /// Restrict to specific sources (comma-separated: temporal,postgres,k8s,loki)
     #[arg(short = 's', long, value_delimiter = ',')]
     sources: Vec<String>,
+
+    /// Limit log search to pods matching this pattern
+    #[arg(long)]
+    pod: Option<String>,
+
+    /// Look-back window for log sources (e.g. 1h, 30m, 2h30m; default: 1h)
+    #[arg(long, default_value = "1h")]
+    since: String,
 
     /// Output JSON
     #[arg(short = 'j', long)]
     json: bool,
+}
+
+fn parse_since(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    if let Ok(secs) = s.parse::<i64>() {
+        return Ok(Duration::seconds(secs));
+    }
+    let mut total = Duration::zero();
+    let mut num = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            num.push(ch);
+        } else {
+            let n: i64 = num.parse().map_err(|_| format!("invalid duration: {s}"))?;
+            num.clear();
+            total = total + match ch {
+                'h' => Duration::hours(n),
+                'm' => Duration::minutes(n),
+                's' => Duration::seconds(n),
+                _ => return Err(format!("unknown unit '{ch}' in duration '{s}'; use h, m, or s")),
+            };
+        }
+    }
+    if !num.is_empty() {
+        return Err(format!("trailing number without unit in duration '{s}'"));
+    }
+    Ok(total)
 }
 
 // Real Temporal client is wired in issue #14.
@@ -64,6 +101,38 @@ struct TodoK8sClient;
 impl K8sClient for TodoK8sClient {
     async fn find_pods_with_events(&self, _id: &str, _id_type: &IdType) -> Result<Vec<K8sPodData>> {
         todo!("real k8s client — uses in-cluster or kubeconfig")
+    }
+}
+
+// Real Loki HTTP client is wired when reqwest is added.
+struct TodoLokiClient;
+
+#[async_trait]
+impl LokiClient for TodoLokiClient {
+    async fn query_range(
+        &self,
+        _id: &str,
+        _id_type: &IdType,
+        _since: Duration,
+        _pod_pattern: Option<&str>,
+    ) -> Result<Vec<LokiLogLine>> {
+        todo!("real Loki HTTP client — query LOKI_URL with label selectors derived from entity ID")
+    }
+}
+
+// Real k8s log streaming client is wired when kube-rs is added.
+struct TodoK8sLogStreamClient;
+
+#[async_trait]
+impl K8sLogStreamClient for TodoK8sLogStreamClient {
+    async fn stream_logs(
+        &self,
+        _id: &str,
+        _id_type: &IdType,
+        _since: Duration,
+        _pod_pattern: Option<&str>,
+    ) -> Result<Vec<K8sLogLine>> {
+        todo!("real k8s log streaming client — kubectl logs equivalent")
     }
 }
 
@@ -115,6 +184,14 @@ fn parse_id_type(s: &str) -> Option<IdType> {
 async fn main() {
     let cli = Cli::parse();
 
+    let since = match parse_since(&cli.since) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: --since {e}");
+            std::process::exit(1);
+        }
+    };
+
     let id_type = if let Some(ref t) = cli.r#type {
         match parse_id_type(t) {
             Some(it) => Some(it),
@@ -142,6 +219,12 @@ async fn main() {
         ("temporal", Box::new(TemporalSource::new(Box::new(TodoTemporalClient)))),
         ("postgres", Box::new(PostgresSource::new(Box::new(TodoPostgresClient)))),
         ("k8s", Box::new(K8sSource::new(Box::new(TodoK8sClient)))),
+        ("loki", Box::new(LokiSource::new(
+            Box::new(TodoLokiClient),
+            Box::new(TodoK8sLogStreamClient),
+            cli.pod.clone(),
+            since,
+        ))),
     ];
 
     let sources: Vec<Box<dyn Source>> = if cli.sources.is_empty() {
@@ -219,6 +302,10 @@ async fn main() {
             for s in &k8s_state {
                 println!("  {}  {}", s.key, s.value);
             }
+        }
+
+        for s in state.iter().filter(|s| s.source == "loki") {
+            println!("{}", s.value);
         }
 
         for name in &unavailable {
