@@ -3,6 +3,7 @@ pub struct OutputMode {
     pub ascii: bool,
 }
 
+#[derive(Debug, PartialEq, Clone)]
 pub enum Status {
     Ok,
     Warn,
