@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use crate::event::{Event, Severity};
 use crate::id::IdType;
-use crate::source::{Source, SourceResult, SourceUnavailable};
+use crate::source::{Source, SourceResult, SourceOutput, SourceUnavailable};
 
 pub struct RawTemporalEvent {
     pub event_type: String,
@@ -48,7 +48,10 @@ impl Source for TemporalSource {
 
     async fn collect(&self, id: &str, _id_type: &IdType) -> SourceResult {
         match self.client.get_history(id).await {
-            Ok(raw_events) => SourceResult::Events(raw_events.into_iter().map(map_event).collect()),
+            Ok(raw_events) => SourceResult::Output(SourceOutput {
+                events: raw_events.into_iter().map(map_event).collect(),
+                state: vec![],
+            }),
             Err(e) => SourceResult::Unavailable(SourceUnavailable {
                 name: "temporal",
                 reason: e.to_string(),
@@ -99,15 +102,15 @@ mod tests {
         ]);
         let source = TemporalSource::new(Box::new(client));
         let result = source.collect("hp-abc", &IdType::Workflow).await;
-        let events = match result {
-            SourceResult::Events(e) => e,
-            _ => panic!("expected Events"),
+        let output = match result {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
         };
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, "WorkflowExecutionStarted");
-        assert_eq!(events[0].severity, Severity::Info);
-        assert_eq!(events[0].source, "temporal");
-        assert_eq!(events[0].ts, ts(1000));
+        assert_eq!(output.events.len(), 1);
+        assert_eq!(output.events[0].kind, "WorkflowExecutionStarted");
+        assert_eq!(output.events[0].severity, Severity::Info);
+        assert_eq!(output.events[0].source, "temporal");
+        assert_eq!(output.events[0].ts, ts(1000));
     }
 
     #[tokio::test]
@@ -117,11 +120,11 @@ mod tests {
         ]);
         let source = TemporalSource::new(Box::new(client));
         let result = source.collect("hp-abc", &IdType::Workflow).await;
-        let events = match result {
-            SourceResult::Events(e) => e,
-            _ => panic!("expected Events"),
+        let output = match result {
+            SourceResult::Output(o) => o,
+            _ => panic!("expected Output"),
         };
-        assert_eq!(events[0].severity, Severity::Error);
+        assert_eq!(output.events[0].severity, Severity::Error);
     }
 
     #[tokio::test]

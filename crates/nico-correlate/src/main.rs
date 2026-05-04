@@ -8,8 +8,10 @@ mod timeline;
 use clap::Parser;
 use serde::Serialize;
 use crate::id::{IdType, detect_id_type};
-use crate::source::{Source, SourceResult};
+use crate::source::{Source, SourceResult, StateEntry};
 use crate::sources::temporal::{TemporalSource, TemporalClient, RawTemporalEvent};
+use crate::sources::postgres::{PostgresSource, PostgresClient, PgEntityData};
+use crate::sources::k8s::{K8sSource, K8sClient, K8sPodData};
 use crate::timeline::filter_timeline;
 use crate::correlate::exit_code;
 use crate::event::Event;
@@ -26,6 +28,10 @@ struct Cli {
     #[arg(short = 't', long)]
     r#type: Option<String>,
 
+    /// Restrict to specific sources (comma-separated: temporal,postgres,k8s)
+    #[arg(short = 's', long, value_delimiter = ',')]
+    sources: Vec<String>,
+
     /// Output JSON
     #[arg(short = 'j', long)]
     json: bool,
@@ -41,6 +47,26 @@ impl TemporalClient for TodoTemporalClient {
     }
 }
 
+// Real Postgres client is wired when sqlx is added.
+struct TodoPostgresClient;
+
+#[async_trait]
+impl PostgresClient for TodoPostgresClient {
+    async fn query_entity(&self, _id: &str, _id_type: &IdType) -> Result<PgEntityData> {
+        todo!("real Postgres client — connect via NICO_POSTGRES_URL")
+    }
+}
+
+// Real k8s client is wired when kube-rs is added.
+struct TodoK8sClient;
+
+#[async_trait]
+impl K8sClient for TodoK8sClient {
+    async fn find_pods_with_events(&self, _id: &str, _id_type: &IdType) -> Result<Vec<K8sPodData>> {
+        todo!("real k8s client — uses in-cluster or kubeconfig")
+    }
+}
+
 #[derive(Serialize)]
 struct JsonOutput<'a> {
     version: u32,
@@ -48,6 +74,7 @@ struct JsonOutput<'a> {
     id_type: &'a str,
     events: Vec<JsonEvent<'a>>,
     sources_unavailable: Vec<&'a str>,
+    state: Vec<JsonStateEntry<'a>>,
 }
 
 #[derive(Serialize)]
@@ -56,6 +83,13 @@ struct JsonEvent<'a> {
     source: &'a str,
     kind: &'a str,
     severity: &'a str,
+}
+
+#[derive(Serialize)]
+struct JsonStateEntry<'a> {
+    source: &'a str,
+    key: &'a str,
+    value: &'a str,
 }
 
 fn id_type_str(t: &IdType) -> &'static str {
@@ -104,9 +138,20 @@ async fn main() {
 
     println!("detected type: {}", id_type_str(&id_type));
 
-    let sources: Vec<Box<dyn Source>> = vec![
-        Box::new(TemporalSource::new(Box::new(TodoTemporalClient))),
+    let all_sources: Vec<(&str, Box<dyn Source>)> = vec![
+        ("temporal", Box::new(TemporalSource::new(Box::new(TodoTemporalClient)))),
+        ("postgres", Box::new(PostgresSource::new(Box::new(TodoPostgresClient)))),
+        ("k8s", Box::new(K8sSource::new(Box::new(TodoK8sClient)))),
     ];
+
+    let sources: Vec<Box<dyn Source>> = if cli.sources.is_empty() {
+        all_sources.into_iter().map(|(_, s)| s).collect()
+    } else {
+        all_sources.into_iter()
+            .filter(|(name, _)| cli.sources.iter().any(|s| s == name))
+            .map(|(_, s)| s)
+            .collect()
+    };
 
     let mut all_results: Vec<SourceResult> = Vec::new();
     for source in &sources {
@@ -114,7 +159,12 @@ async fn main() {
     }
 
     let events: Vec<Event> = all_results.iter()
-        .filter_map(|r| if let SourceResult::Events(e) = r { Some(e.clone()) } else { None })
+        .filter_map(|r| if let SourceResult::Output(o) = r { Some(o.events.clone()) } else { None })
+        .flatten()
+        .collect();
+
+    let state: Vec<StateEntry> = all_results.iter()
+        .filter_map(|r| if let SourceResult::Output(o) = r { Some(o.state.clone()) } else { None })
         .flatten()
         .collect();
 
@@ -142,6 +192,11 @@ async fn main() {
                 },
             }).collect(),
             sources_unavailable: unavailable.clone(),
+            state: state.iter().map(|s| JsonStateEntry {
+                source: s.source,
+                key: &s.key,
+                value: &s.value,
+            }).collect(),
         };
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
     } else {
@@ -149,8 +204,25 @@ async fn main() {
         for e in &filtered {
             println!("  {}  {}  {}", e.ts.format("%H:%M:%S"), e.source, e.kind);
         }
+
+        let pg_state: Vec<&StateEntry> = state.iter().filter(|s| s.source == "postgres").collect();
+        if !pg_state.is_empty() {
+            println!("\nPostgres state (current):");
+            for s in &pg_state {
+                println!("  {}: {}", s.key, s.value);
+            }
+        }
+
+        let k8s_state: Vec<&StateEntry> = state.iter().filter(|s| s.source == "k8s").collect();
+        if !k8s_state.is_empty() {
+            println!("\nK8s pods touched:");
+            for s in &k8s_state {
+                println!("  {}  {}", s.key, s.value);
+            }
+        }
+
         for name in &unavailable {
-            println!("  [source unavailable: {name}]");
+            println!("[source unavailable: {name}]");
         }
     }
 
