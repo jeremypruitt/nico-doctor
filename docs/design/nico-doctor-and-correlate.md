@@ -313,14 +313,40 @@ Implementation: each source exposes an optional watch() stream. Merge with tokio
 - **Bounded memory.** Don't read all logs at once. Stream, filter on the fly, drop non-matching lines. A misuse against a busy production cluster shouldn't OOM your laptop.
 - **Source extension is the design.** Adding ClickHouse logs, Datadog APM, or a future MCP-style source should be a new file in sources/ and a registry entry. No core changes.
 ---
-## Build order
-Day 1 — nico-common skeleton: config loading, output module, k8s client wrapper, error types. Test against your kind cluster.
-Day 2 — nico-doctor cluster + logs + health layers. Get the human output looking right before adding more layers; output quality matters more than feature count.
-Day 3 — nico-doctor workflows + grpc + postgres layers. JSON output. Exit codes. Wire into a pre-deploy check script.
-Day 4-5 — nico-correlate with temporal + postgres sources. Timeline output. ID auto-detection.
-Day 6 — nico-correlate logs + k8s sources. Diagnosis hints (only the conservative ones).
-Day 7 — --tail mode and polish. Tests. README with screenshots.
-You'll know it's done when you find yourself reaching for these two tools as the first move in incidents instead of the underlying ones, *and* you still drop into the underlying tools the moment a question gets specific. That's the right division of labor.
+## Slicing plan
+
+Six vertical slices. Each slice ships independently — at the end of any slice
+the binary is releasable as "nico-doctor v0.N: layers 1..N working."
+
+**Slice 1 — cluster layer (the chassis)**
+End-to-end path that establishes all the shared infrastructure: CLI parsing,
+config loading, output module (color, ASCII, NO_COLOR), KubeClient trait
+(real + fake impls), human format, JSON format with versioned schema, exit
+code calculation, integration test against fake client with insta snapshot,
+JSON schema round-trip test, CI workflow (cargo build, test, clippy, fmt),
+README with one screenshot.
+
+**Slice 2 — logs layer**
+Adds log-streaming check. Reuses everything from slice 1; only new code is
+the layer itself + its tests.
+
+**Slice 3 — workflows layer**
+Adds Temporal client + stuck/failed workflow detection.
+
+**Slice 4 — health layer**
+Adds HTTP /healthz /readyz checks via the reach-mode logic from ADR-005.
+
+**Slice 5 — gRPC layer**
+Adds tonic + reflection against Core.
+
+**Slice 6 — postgres layer**
+Adds sqlx + pg_stat_activity / pg_locks queries.
+
+The pattern: slice 1 is heavy because it builds the chassis. Slices 2–6 are
+each ~1 day of work because they reuse the chassis unchanged. If a later
+slice forces a chassis change, that's a signal — pause, decide whether the
+chassis was wrong (refactor it now, all slices benefit) or whether the new
+layer is special (encapsulate the difference).
 ---
 ## What not to add
 - **No web UI, no TUI.** Both tools are stdin-stdout, scriptable, and disposable.
