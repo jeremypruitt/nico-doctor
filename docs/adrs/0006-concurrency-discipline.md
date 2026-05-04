@@ -5,10 +5,10 @@
 
 ## Context
 
-The whole point of `nico-doctor` is parallel I/O — running six layers of
-checks concurrently so the report comes back in seconds rather than minutes.
-Done naively, this can hammer the apiserver, leak tasks, or leave the user
-staring at a hung tool when one check goes slow.
+Both `nico-doctor` (six parallel layers) and `nico-correlate` (parallel
+Sources) rely on parallel I/O so their output comes back in seconds rather
+than minutes. Done naively, this can hammer the apiserver, leak tasks, or
+leave the user staring at a hung tool when one check goes slow.
 
 ## Decision
 

@@ -1,4 +1,4 @@
-# nico-doctor — Domain Context
+# nico-tools — Domain Context
 
 ## Purpose
 Diagnostic CLI for nico/carbide/ncx installations. Read-only. Compresses the

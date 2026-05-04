@@ -5,10 +5,11 @@
 
 ## Context
 
-`nico-doctor` needs to reach service endpoints (`/healthz`, `/readyz`, gRPC
-reflection, Postgres). It runs in two contexts: locally on an operator's
-laptop with kubeconfig access, and inside the cluster (e.g., a debug pod or a
-CI runner with Pod Identity).
+Both `nico-doctor` and `nico-correlate` need to reach service endpoints
+(`/healthz`, `/readyz`, gRPC reflection, Postgres, Temporal, Loki, Redfish).
+They run in two contexts: locally on an operator's laptop with kubeconfig
+access, and inside the cluster (e.g., a debug pod or a CI runner with Pod
+Identity).
 
 ## Decision
 
