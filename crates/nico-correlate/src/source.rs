@@ -16,6 +16,7 @@ pub struct SourceOutput {
 
 pub struct SourceUnavailable {
     pub name: &'static str,
+    #[allow(dead_code)]
     pub reason: String,
 }
 
@@ -26,6 +27,7 @@ pub enum SourceResult {
 
 #[async_trait]
 pub trait Source: Send + Sync {
+    #[allow(dead_code)]
     fn name(&self) -> &'static str;
     async fn collect(&self, id: &str, id_type: &IdType) -> SourceResult;
 }

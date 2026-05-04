@@ -12,6 +12,7 @@ pub struct Event {
     pub ts: DateTime<Utc>,
     pub source: String,
     pub kind: String,
+    #[allow(dead_code)]
     pub message: String,
     pub severity: Severity,
 }

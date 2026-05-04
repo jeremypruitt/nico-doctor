@@ -8,6 +8,7 @@ use crate::source::{Source, SourceResult, SourceOutput, SourceUnavailable, State
 pub struct LokiLogLine {
     pub ts: DateTime<Utc>,
     pub message: String,
+    #[allow(dead_code)]
     pub pod: Option<String>,
     pub is_serial_console: bool,
 }
