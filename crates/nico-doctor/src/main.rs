@@ -1,4 +1,5 @@
 use std::process;
+use std::sync::Arc;
 use std::time::Duration;
 use clap::Parser;
 use nico_common::output::{OutputMode, Status};
@@ -9,6 +10,7 @@ mod k8s;
 mod layer;
 mod layers;
 mod loki;
+mod postgres;
 mod runner;
 mod temporal;
 
@@ -44,6 +46,9 @@ struct Cli {
 
     #[arg(long, help = "Disable color output")]
     no_color: bool,
+
+    #[arg(long, env = "NICO_POSTGRES_URL", help = "Postgres connection URL")]
+    postgres_url: Option<String>,
 }
 
 fn print_report(report: &Report, mode: &OutputMode) {
@@ -116,8 +121,17 @@ async fn main() {
 
     let opts = RunOpts { namespace: cli.namespace.clone(), since, timeout };
 
-    // TODO(#3): wire real k8s client; for now exit cleanly with no layers
-    let layers: Vec<Box<dyn layer::Layer>> = vec![];
+    let mut layers: Vec<Box<dyn layer::Layer>> = vec![];
+
+    if let Some(ref url) = cli.postgres_url {
+        if !cli.skip.iter().any(|s| s == "postgres") {
+            match postgres::SqlxPostgresClient::new(url) {
+                Ok(pg) => layers.push(Box::new(layers::postgres::PostgresLayer::new(Arc::new(pg)))),
+                Err(e) => eprintln!("warning: postgres layer disabled: {e}"),
+            }
+        }
+    }
+
     let report = runner::run(&layers, &opts).await;
 
     if cli.json {

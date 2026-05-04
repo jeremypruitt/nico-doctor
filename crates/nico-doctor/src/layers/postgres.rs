@@ -1,0 +1,296 @@
+use std::sync::Arc;
+use std::time::Instant;
+use async_trait::async_trait;
+use nico_common::output::Status;
+use crate::postgres::PostgresClient;
+use crate::layer::{Check, Layer, LayerResult, RunOpts};
+
+const POOL_WARN_RATIO: f64 = 0.90;
+const LOCK_WARN_SECS: f64 = 5.0;
+
+pub struct PostgresLayer {
+    client: Arc<dyn PostgresClient>,
+}
+
+impl PostgresLayer {
+    pub fn new(client: Arc<dyn PostgresClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl Layer for PostgresLayer {
+    fn name(&self) -> &'static str { "postgres" }
+
+    async fn run(&self, _opts: &RunOpts) -> LayerResult {
+        let start = Instant::now();
+
+        let stats = match self.client.pool_stats().await {
+            Ok(s) => s,
+            Err(_) => {
+                return LayerResult {
+                    name: "postgres",
+                    status: Status::Unknown,
+                    checks: vec![Check {
+                        name: "pool",
+                        status: Status::Unknown,
+                        value: "postgres unreachable".into(),
+                        next_command: Some("kubectl get svc -n nico | grep postgres".into()),
+                    }],
+                    duration_ms: start.elapsed().as_millis() as u64,
+                };
+            }
+        };
+
+        let ratio = if stats.max_conn > 0 {
+            stats.active as f64 / stats.max_conn as f64
+        } else {
+            0.0
+        };
+        let pool_status = if ratio >= POOL_WARN_RATIO { Status::Warn } else { Status::Ok };
+        let mut checks = vec![Check {
+            name: "pool",
+            status: pool_status.clone(),
+            value: format!("pool {}/{} in-use", stats.active, stats.max_conn),
+            next_command: if pool_status == Status::Warn {
+                Some(
+                    "SELECT * FROM pg_stat_activity WHERE state != 'idle' ORDER BY query_start"
+                        .into(),
+                )
+            } else {
+                None
+            },
+        }];
+
+        match self.client.lock_waits().await {
+            Ok(waits) => {
+                let long_waits: Vec<_> =
+                    waits.iter().filter(|w| w.wait_secs >= LOCK_WARN_SECS).collect();
+                checks.push(Check {
+                    name: "locks",
+                    status: if long_waits.is_empty() { Status::Ok } else { Status::Warn },
+                    value: format!("{} lock waits", long_waits.len()),
+                    next_command: None,
+                });
+                for w in &long_waits {
+                    let pids: Vec<String> = std::iter::once(w.waiting_pid)
+                        .chain(w.blocking_pid)
+                        .map(|p| p.to_string())
+                        .collect();
+                    checks.push(Check {
+                        name: "lock_wait",
+                        status: Status::Warn,
+                        value: format!(
+                            "pid {} waiting {:.0}s on {} (blocked by pid {})",
+                            w.waiting_pid,
+                            w.wait_secs,
+                            w.relation.as_deref().unwrap_or("unknown"),
+                            w.blocking_pid
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "unknown".into()),
+                        ),
+                        next_command: Some(format!(
+                            "SELECT * FROM pg_stat_activity WHERE pid IN ({})",
+                            pids.join(", ")
+                        )),
+                    });
+                }
+            }
+            Err(_) => {
+                checks.push(Check {
+                    name: "locks",
+                    status: Status::Unknown,
+                    value: "lock query failed".into(),
+                    next_command: Some("kubectl get svc -n nico | grep postgres".into()),
+                });
+            }
+        }
+
+        let overall = if checks.iter().any(|c| c.status == Status::Fail) {
+            Status::Fail
+        } else if checks.iter().any(|c| c.status == Status::Warn) {
+            Status::Warn
+        } else if checks.iter().any(|c| c.status == Status::Unknown) {
+            Status::Unknown
+        } else {
+            Status::Ok
+        };
+
+        LayerResult {
+            name: "postgres",
+            status: overall,
+            checks,
+            duration_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use anyhow::Result;
+    use crate::postgres::{LockWait, PoolStats};
+
+    struct MockPostgresClient {
+        pool: std::result::Result<PoolStats, String>,
+        waits: std::result::Result<Vec<LockWait>, String>,
+    }
+
+    #[async_trait]
+    impl PostgresClient for MockPostgresClient {
+        async fn pool_stats(&self) -> Result<PoolStats> {
+            match &self.pool {
+                Ok(s) => Ok(PoolStats { active: s.active, max_conn: s.max_conn }),
+                Err(e) => Err(anyhow::anyhow!("{}", e)),
+            }
+        }
+        async fn lock_waits(&self) -> Result<Vec<LockWait>> {
+            match &self.waits {
+                Ok(ws) => Ok(ws.iter().map(|w| LockWait {
+                    waiting_pid: w.waiting_pid,
+                    blocking_pid: w.blocking_pid,
+                    relation: w.relation.clone(),
+                    wait_secs: w.wait_secs,
+                }).collect()),
+                Err(e) => Err(anyhow::anyhow!("{}", e)),
+            }
+        }
+    }
+
+    fn opts() -> RunOpts {
+        RunOpts {
+            namespace: "nico".into(),
+            since: Duration::from_secs(600),
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn layer(pool: std::result::Result<PoolStats, &str>, waits: std::result::Result<Vec<LockWait>, &str>) -> PostgresLayer {
+        PostgresLayer::new(Arc::new(MockPostgresClient {
+            pool: pool.map_err(|e| e.to_string()),
+            waits: waits.map_err(|e| e.to_string()),
+        }))
+    }
+
+    fn pool_ok(active: i64, max_conn: i64) -> std::result::Result<PoolStats, &'static str> {
+        Ok(PoolStats { active, max_conn })
+    }
+
+    #[tokio::test]
+    async fn healthy_pool_no_waits_reports_ok() {
+        let result = layer(pool_ok(10, 20), Ok(vec![])).run(&opts()).await;
+
+        assert_eq!(result.status, Status::Ok);
+        let pool_check = result.checks.iter().find(|c| c.name == "pool").unwrap();
+        assert_eq!(pool_check.status, Status::Ok);
+        assert_eq!(pool_check.value, "pool 10/20 in-use");
+        assert!(pool_check.next_command.is_none());
+        let lock_check = result.checks.iter().find(|c| c.name == "locks").unwrap();
+        assert_eq!(lock_check.value, "0 lock waits");
+    }
+
+    #[tokio::test]
+    async fn pool_at_90_pct_is_warn_with_pg_stat_activity_hint() {
+        let result = layer(pool_ok(18, 20), Ok(vec![])).run(&opts()).await;
+
+        assert_eq!(result.status, Status::Warn);
+        let pool_check = result.checks.iter().find(|c| c.name == "pool").unwrap();
+        assert_eq!(pool_check.status, Status::Warn);
+        assert_eq!(pool_check.value, "pool 18/20 in-use");
+        assert!(pool_check.next_command.as_deref().unwrap().contains("pg_stat_activity"));
+    }
+
+    #[tokio::test]
+    async fn pool_below_90_pct_is_ok() {
+        let result = layer(pool_ok(17, 20), Ok(vec![])).run(&opts()).await;
+
+        assert_eq!(result.status, Status::Ok);
+        let pool_check = result.checks.iter().find(|c| c.name == "pool").unwrap();
+        assert_eq!(pool_check.status, Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn lock_wait_over_5s_is_warn_with_pid_hint() {
+        let waits = vec![LockWait {
+            waiting_pid: 1234,
+            blocking_pid: Some(5678),
+            relation: Some("orders".into()),
+            wait_secs: 12.5,
+        }];
+        let result = layer(pool_ok(5, 20), Ok(waits)).run(&opts()).await;
+
+        assert_eq!(result.status, Status::Warn);
+        let lock_check = result.checks.iter().find(|c| c.name == "locks").unwrap();
+        assert_eq!(lock_check.status, Status::Warn);
+        assert_eq!(lock_check.value, "1 lock waits");
+
+        let lw = result.checks.iter().find(|c| c.name == "lock_wait").unwrap();
+        assert_eq!(lw.status, Status::Warn);
+        assert!(lw.value.contains("1234"), "value: {}", lw.value);
+        assert!(lw.value.contains("12s"), "value: {}", lw.value);
+        assert!(lw.value.contains("orders"), "value: {}", lw.value);
+        assert!(lw.value.contains("5678"), "value: {}", lw.value);
+        let cmd = lw.next_command.as_deref().unwrap();
+        assert!(cmd.contains("pg_stat_activity"), "cmd: {cmd}");
+        assert!(cmd.contains("1234"), "cmd: {cmd}");
+        assert!(cmd.contains("5678"), "cmd: {cmd}");
+    }
+
+    #[tokio::test]
+    async fn lock_wait_under_5s_is_ok() {
+        let waits = vec![LockWait {
+            waiting_pid: 100,
+            blocking_pid: Some(200),
+            relation: Some("users".into()),
+            wait_secs: 4.9,
+        }];
+        let result = layer(pool_ok(5, 20), Ok(waits)).run(&opts()).await;
+
+        assert_eq!(result.status, Status::Ok);
+        assert_eq!(result.checks.iter().filter(|c| c.name == "lock_wait").count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unreachable_postgres_reports_unknown_with_kubectl_hint() {
+        let result = layer(Err("connection refused"), Ok(vec![])).run(&opts()).await;
+
+        assert_eq!(result.status, Status::Unknown);
+        let pool_check = result.checks.iter().find(|c| c.name == "pool").unwrap();
+        assert_eq!(pool_check.status, Status::Unknown);
+        assert!(pool_check.next_command.as_deref().unwrap().contains("kubectl get svc"));
+    }
+
+    #[tokio::test]
+    async fn lock_wait_no_blocking_pid_shows_unknown() {
+        let waits = vec![LockWait {
+            waiting_pid: 999,
+            blocking_pid: None,
+            relation: Some("events".into()),
+            wait_secs: 10.0,
+        }];
+        let result = layer(pool_ok(5, 20), Ok(waits)).run(&opts()).await;
+
+        assert_eq!(result.status, Status::Warn);
+        let lw = result.checks.iter().find(|c| c.name == "lock_wait").unwrap();
+        assert!(lw.value.contains("blocked by pid unknown"), "value: {}", lw.value);
+        let cmd = lw.next_command.as_deref().unwrap();
+        assert!(cmd.contains("999"), "cmd: {cmd}");
+    }
+
+    #[tokio::test]
+    async fn pool_warn_and_lock_waits_both_appear_in_json_checks() {
+        let waits = vec![LockWait {
+            waiting_pid: 42,
+            blocking_pid: Some(43),
+            relation: Some("jobs".into()),
+            wait_secs: 7.0,
+        }];
+        let result = layer(pool_ok(18, 20), Ok(waits)).run(&opts()).await;
+
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.checks.iter().any(|c| c.name == "pool" && c.status == Status::Warn));
+        assert!(result.checks.iter().any(|c| c.name == "locks" && c.status == Status::Warn));
+        assert!(result.checks.iter().any(|c| c.name == "lock_wait"));
+    }
+}
