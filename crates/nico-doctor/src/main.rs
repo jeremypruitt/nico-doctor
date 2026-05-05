@@ -66,13 +66,10 @@ struct Cli {
     mode: Option<String>,
 }
 
-// --- Inactive client stubs ---
-// Used when the backing service is absent or unconfigured.
-
-struct InactiveK8sClient { reason: &'static str }
+struct Unavailable { reason: &'static str }
 
 #[async_trait]
-impl k8s::K8sClient for InactiveK8sClient {
+impl k8s::K8sClient for Unavailable {
     async fn list_pods(&self, _ns: &str) -> anyhow::Result<Vec<k8s::PodInfo>> {
         Err(anyhow::anyhow!("{}", self.reason))
     }
@@ -84,23 +81,9 @@ impl k8s::K8sClient for InactiveK8sClient {
     }
 }
 
-struct InactiveLokiClient { reason: &'static str }
-
 #[async_trait]
-impl loki::LokiClient for InactiveLokiClient {
+impl loki::LokiClient for Unavailable {
     async fn query_errors(&self, _ns: &str, _since: Duration, _limit: usize) -> anyhow::Result<loki::LokiQueryResult> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
-}
-
-struct InactivePostgresClient { reason: &'static str }
-
-#[async_trait]
-impl postgres::PostgresClient for InactivePostgresClient {
-    async fn pool_stats(&self) -> anyhow::Result<postgres::PoolStats> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
-    async fn lock_waits(&self) -> anyhow::Result<Vec<postgres::LockWait>> {
         Err(anyhow::anyhow!("{}", self.reason))
     }
 }
@@ -244,12 +227,12 @@ async fn main() {
                     (Some(url), client)
                 }
                 Err(_) => {
-                    let client = Arc::new(InactiveLokiClient { reason: "Loki service not found in namespace" }) as Arc<dyn loki::LokiClient>;
+                    let client = Arc::new(Unavailable { reason: "Loki service not found in namespace" }) as Arc<dyn loki::LokiClient>;
                     (None, client)
                 }
             }
         } else {
-            let client = Arc::new(InactiveLokiClient { reason: "LOKI_URL not set" }) as Arc<dyn loki::LokiClient>;
+            let client = Arc::new(Unavailable { reason: "LOKI_URL not set" }) as Arc<dyn loki::LokiClient>;
             (None, client)
         }
     };
@@ -326,7 +309,7 @@ async fn main() {
                     (None, true) => {
                         layers.push(Box::new(layers::logs::LogsLayer::new(
                             loki_client.clone(),
-                            Arc::new(InactiveK8sClient { reason: "kubeconfig not found" }),
+                            Arc::new(Unavailable { reason: "kubeconfig not found" }),
                         )));
                     }
                     (None, false) => {
@@ -382,9 +365,7 @@ async fn main() {
                     Err(e) => {
                         eprintln!("warning: postgres URL invalid: {e}");
                         eprintln!("  hint: set postgres.url in ~/.config/nico-tools/config.toml or use --postgres-url");
-                        layers.push(Box::new(layers::postgres::PostgresLayer::new(
-                            Arc::new(InactivePostgresClient { reason: "invalid postgres URL" }),
-                        )));
+                        layers.push(layer::UnconfiguredLayer::new("postgres", "invalid postgres URL"));
                     }
                 }
             }

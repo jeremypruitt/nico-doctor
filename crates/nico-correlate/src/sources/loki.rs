@@ -49,7 +49,7 @@ pub trait K8sLogStreamClient: Send + Sync {
 
 pub struct LokiSource {
     loki: Box<dyn LokiClient>,
-    k8s_fallback: Box<dyn K8sLogStreamClient>,
+    k8s_fallback: Option<Box<dyn K8sLogStreamClient>>,
     pub pod_pattern: Option<String>,
     pub since: Duration,
 }
@@ -57,7 +57,7 @@ pub struct LokiSource {
 impl LokiSource {
     pub fn new(
         loki: Box<dyn LokiClient>,
-        k8s_fallback: Box<dyn K8sLogStreamClient>,
+        k8s_fallback: Option<Box<dyn K8sLogStreamClient>>,
         pod_pattern: Option<String>,
         since: Duration,
     ) -> Self {
@@ -101,20 +101,27 @@ impl Source for LokiSource {
                 SourceResult::Output(SourceOutput { events, state: vec![] })
             }
             Err(loki_err) => {
-                match self.k8s_fallback.stream_logs(id, id_type, self.since, self.pod_pattern.as_deref()).await {
-                    Ok(lines) => {
-                        let events = lines.into_iter().map(k8s_line_to_event).collect();
-                        let state = vec![StateEntry {
-                            source: "loki",
-                            key: "fallback".into(),
-                            value: "[loki unavailable, using k8s streaming]".into(),
-                        }];
-                        SourceResult::Output(SourceOutput { events, state })
+                if let Some(ref k8s) = self.k8s_fallback {
+                    match k8s.stream_logs(id, id_type, self.since, self.pod_pattern.as_deref()).await {
+                        Ok(lines) => {
+                            let events = lines.into_iter().map(k8s_line_to_event).collect();
+                            let state = vec![StateEntry {
+                                source: "loki",
+                                key: "fallback".into(),
+                                value: "[loki unavailable, using k8s streaming]".into(),
+                            }];
+                            SourceResult::Output(SourceOutput { events, state })
+                        }
+                        Err(_) => SourceResult::Unavailable(SourceUnavailable {
+                            name: "loki",
+                            reason: loki_err.to_string(),
+                        }),
                     }
-                    Err(_) => SourceResult::Unavailable(SourceUnavailable {
+                } else {
+                    SourceResult::Unavailable(SourceUnavailable {
                         name: "loki",
                         reason: loki_err.to_string(),
-                    }),
+                    })
                 }
             }
         }
@@ -360,8 +367,8 @@ mod tests {
         Utc.timestamp_opt(secs, 0).unwrap()
     }
 
-    fn make_source(loki: impl LokiClient + 'static, k8s: impl K8sLogStreamClient + 'static) -> LokiSource {
-        LokiSource::new(Box::new(loki), Box::new(k8s), None, Duration::hours(1))
+    fn make_source(loki: impl LokiClient + 'static, k8s: Option<impl K8sLogStreamClient + 'static>) -> LokiSource {
+        LokiSource::new(Box::new(loki), k8s.map(|c| Box::new(c) as Box<dyn K8sLogStreamClient>), None, Duration::hours(1))
     }
 
     #[tokio::test]
@@ -372,7 +379,7 @@ mod tests {
             pod: Some("hp-worker-xyz".into()),
             is_serial_console: false,
         }]);
-        let source = make_source(loki, FakeK8sLogStreamClient::err("not needed"));
+        let source = make_source(loki, None::<FakeK8sLogStreamClient>);
         let output = match source.collect("hp-abc", &IdType::Workflow).await {
             SourceResult::Output(o) => o,
             _ => panic!("expected Output"),
@@ -391,7 +398,7 @@ mod tests {
             pod: Some("serial-console".into()),
             is_serial_console: true,
         }]);
-        let source = make_source(loki, FakeK8sLogStreamClient::err("not needed"));
+        let source = make_source(loki, None::<FakeK8sLogStreamClient>);
         let output = match source.collect("host-r12u5", &IdType::Host).await {
             SourceResult::Output(o) => o,
             _ => panic!("expected Output"),
@@ -408,7 +415,7 @@ mod tests {
             message: "starting container".into(),
             pod: "hp-worker-xyz".into(),
         }]);
-        let source = make_source(FakeLokiClient::err("connection refused"), k8s);
+        let source = make_source(FakeLokiClient::err("connection refused"), Some(k8s));
         let output = match source.collect("hp-abc", &IdType::Workflow).await {
             SourceResult::Output(o) => o,
             _ => panic!("expected Output"),
@@ -423,7 +430,7 @@ mod tests {
     async fn both_unavailable_returns_unavailable() {
         let source = make_source(
             FakeLokiClient::err("loki down"),
-            FakeK8sLogStreamClient::err("k8s down"),
+            Some(FakeK8sLogStreamClient::err("k8s down")),
         );
         match source.collect("hp-abc", &IdType::Workflow).await {
             SourceResult::Unavailable(u) => {
@@ -457,7 +464,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let source = LokiSource::new(
             Box::new(CaptureLoki { captured: captured.clone() }),
-            Box::new(FakeK8sLogStreamClient::ok(vec![])),
+            Some(Box::new(FakeK8sLogStreamClient::ok(vec![]))),
             Some("hp-worker-*".into()),
             Duration::hours(1),
         );
@@ -469,7 +476,7 @@ mod tests {
     async fn source_is_independently_optional() {
         let source = make_source(
             FakeLokiClient::err("loki unavailable"),
-            FakeK8sLogStreamClient::err("k8s unavailable"),
+            Some(FakeK8sLogStreamClient::err("k8s unavailable")),
         );
         match source.collect("hp-abc", &IdType::Workflow).await {
             SourceResult::Unavailable(u) => assert_eq!(u.name, "loki"),

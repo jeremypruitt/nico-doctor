@@ -31,3 +31,22 @@ pub trait Source: Send + Sync {
     fn name(&self) -> &'static str;
     async fn collect(&self, id: &str, id_type: &IdType) -> SourceResult;
 }
+
+pub struct UnavailableSource {
+    name: &'static str,
+    reason: String,
+}
+
+impl UnavailableSource {
+    pub fn new(name: &'static str, reason: impl Into<String>) -> Self {
+        Self { name, reason: reason.into() }
+    }
+}
+
+#[async_trait]
+impl Source for UnavailableSource {
+    fn name(&self) -> &'static str { self.name }
+    async fn collect(&self, _id: &str, _id_type: &IdType) -> SourceResult {
+        SourceResult::Unavailable(SourceUnavailable { name: self.name, reason: self.reason.clone() })
+    }
+}
