@@ -18,7 +18,7 @@ use crossterm::{
 use nico_common::output::OutputMode;
 use crate::event::{Event as CorrelateEvent, Severity};
 use crate::source::{SourceKind, StateEntry, SourceResult};
-use crate::diagnosis::{diagnose, Diagnosis};
+use crate::diagnosis::{diagnose, Diagnosis, DiagnosisConfig};
 use crate::timeline::filter_timeline;
 
 pub struct TuiContext {
@@ -32,6 +32,7 @@ pub struct TuiConfig {
     pub source_names: Vec<&'static str>,
     /// Names of sources that were skipped entirely (shown as ○).
     pub restricted: Vec<String>,
+    pub diagnosis: DiagnosisConfig,
 }
 
 /// Message sent from a source-fetch task to the TUI event loop.
@@ -81,6 +82,7 @@ struct IncrementalState {
     source_states: HashMap<String, SourceState>,
     state_entries: Vec<StateEntry>,
     diagnosis: Option<Diagnosis>,
+    diag_config: DiagnosisConfig,
     done_count: usize,
     total_sources: usize,
     has_unavailable: bool,
@@ -104,6 +106,7 @@ impl IncrementalState {
             source_states,
             state_entries: vec![],
             diagnosis: None,
+            diag_config: config.diagnosis.clone(),
             done_count: 0,
             total_sources: config.source_names.len(),
             has_unavailable: false,
@@ -131,7 +134,7 @@ impl IncrementalState {
             // Apply the same timeline filter used by the non-TUI path.
             let filtered = filter_timeline(std::mem::take(&mut self.events), 5, 10);
             self.events = filtered;
-            self.diagnosis = diagnose(&self.events, &self.state_entries);
+            self.diagnosis = diagnose(&self.events, &self.state_entries, &self.diag_config);
         }
         self.sync_cursor();
     }
@@ -512,6 +515,7 @@ mod tests {
             id: "wf-abc123".into(),
             source_names: SourceKind::ALL.iter().map(|k| k.name()).collect(),
             restricted: vec![],
+            diagnosis: DiagnosisConfig::default(),
         }
     }
 
@@ -696,6 +700,7 @@ mod tests {
             id: "wf-1".into(),
             source_names: vec!["temporal"],
             restricted: vec![],
+            diagnosis: DiagnosisConfig::default(),
         };
         let ctx = TuiContext { mode: OutputMode { color: false, ascii: true } };
         let mut state = IncrementalState::new(&config); // temporal still fetching
@@ -716,6 +721,7 @@ mod tests {
             id: "wf-1".into(),
             source_names: vec!["temporal"],
             restricted: vec![],
+            diagnosis: DiagnosisConfig::default(),
         };
         let ctx = TuiContext { mode: OutputMode { color: false, ascii: true } };
         let mut state = IncrementalState::new(&config);
@@ -799,6 +805,7 @@ mod tests {
             id: "wf-1".into(),
             source_names: vec!["temporal"],
             restricted: vec![],
+            diagnosis: DiagnosisConfig::default(),
         };
         let mut state = IncrementalState::new(&config);
         state.apply_update(TuiUpdate::SourceDone {
@@ -846,6 +853,7 @@ mod tests {
             id: "test-workflow-id".into(),
             source_names: vec![],
             restricted: vec![],
+            diagnosis: DiagnosisConfig::default(),
         };
         let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
         let mut state = IncrementalState::new(&config);

@@ -23,7 +23,7 @@ use crate::sources::loki::{LokiSource, LokiClient, K8sLogStreamClient, RealLokiC
 use crate::sources::redfish::{RedfishSource, RealRedfishClient};
 use crate::timeline::filter_timeline;
 use crate::correlate::exit_code;
-use crate::diagnosis::diagnose;
+use crate::diagnosis::{diagnose, DiagnosisConfig};
 use crate::event::Event;
 use anyhow::Result;
 
@@ -402,6 +402,7 @@ async fn main() {
             id: cli.id.clone(),
             source_names,
             restricted: restricted_names.iter().map(|s| s.to_string()).collect(),
+            diagnosis: DiagnosisConfig { stuck_threshold: config.temporal.stuck_threshold },
         };
         let id_clone = cli.id.clone();
         let id_type_clone = id_type.clone();
@@ -450,7 +451,8 @@ async fn main() {
         .collect();
 
     let filtered = filter_timeline(events, 5, 10);
-    let diag = diagnose(&filtered, &state);
+    let diag_config = DiagnosisConfig { stuck_threshold: config.temporal.stuck_threshold };
+    let diag = diagnose(&filtered, &state, &diag_config);
 
     let code = exit_code(Some(&id_type), &all_results);
 
