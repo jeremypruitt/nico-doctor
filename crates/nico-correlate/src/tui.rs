@@ -93,6 +93,7 @@ struct IncrementalState {
     list_state: ListState,
 
     help_open: bool,
+    detail_open: bool,
 
     // Filter bar — view-layer only, does not mutate self.events.
     filter_query: String,
@@ -120,6 +121,7 @@ impl IncrementalState {
             selected_key: None,
             list_state: ListState::default(),
             help_open: false,
+            detail_open: false,
             filter_query: String::new(),
             filter_active: false,
         }
@@ -165,6 +167,7 @@ impl IncrementalState {
         if self.has_unavailable { 2 } else { 0 }
     }
 
+    #[cfg(test)]
     fn selected(&self) -> Option<usize> {
         self.list_state.selected()
     }
@@ -331,7 +334,13 @@ fn event_loop<B: ratatui::backend::Backend>(
         if event::poll(std::time::Duration::from_millis(50)).expect("poll")
             && let Ok(CrosstermEvent::Key(key)) = event::read()
         {
-            if state.help_open {
+            if state.detail_open {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => state.detail_open = false,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    _ => {}
+                }
+            } else if state.help_open {
                 match key.code {
                     KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
                         state.help_open = false;
@@ -368,6 +377,7 @@ fn event_loop<B: ratatui::backend::Backend>(
                     KeyCode::PageDown => state.select_next_page(PAGE_SIZE),
                     KeyCode::Char('g') => state.select_first(),
                     KeyCode::Char('G') | KeyCode::End => state.select_last(),
+                    KeyCode::Enter => state.detail_open = true,
                     _ => {}
                 }
             }
@@ -410,6 +420,8 @@ fn make_block(title: &str, ascii: bool) -> Block<'_> {
     if ascii { b.border_set(ASCII_BORDER) } else { b }
 }
 
+const NARROW_THRESHOLD: u16 = 100;
+
 fn render(
     frame: &mut Frame,
     config: &TuiConfig,
@@ -417,21 +429,29 @@ fn render(
     state: &mut IncrementalState,
 ) {
     let area = frame.area();
+    let narrow = area.width < NARROW_THRESHOLD;
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(3)])
         .split(area);
 
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(rows[0]);
+    if narrow {
+        render_timeline(frame, ctx, state, rows[0], true);
+    } else {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(rows[0]);
+        render_timeline(frame, ctx, state, panes[0], false);
+        render_detail(frame, ctx, state, panes[1]);
+    }
 
-    render_timeline(frame, ctx, state, panes[0]);
-    render_detail(frame, ctx, state, panes[1]);
     render_status_bar(frame, ctx, state, config, rows[1]);
 
-    if state.help_open {
+    if state.detail_open {
+        render_detail_overlay(frame, ctx, state, area);
+    } else if state.help_open {
         render_help_overlay(frame, ctx, area);
     }
 }
@@ -441,6 +461,7 @@ fn render_timeline(
     ctx: &TuiContext,
     state: &mut IncrementalState,
     area: Rect,
+    narrow: bool,
 ) {
     let ascii = ctx.mode.ascii;
     let use_color = ctx.mode.color;
@@ -454,10 +475,11 @@ fn render_timeline(
     let filter_query = state.filter_query.clone();
     let show_placeholder = state.show_placeholder();
 
+    let narrow_hint = if narrow { " (Enter for detail)" } else { "" };
     let title = if !filter_query.is_empty() {
-        format!(" Timeline ({}/{}) ", filtered.len(), total)
+        format!(" Timeline ({}/{}){} ", filtered.len(), total, narrow_hint)
     } else {
-        format!(" Timeline ({} events) ", total)
+        format!(" Timeline ({} events){} ", total, narrow_hint)
     };
 
     let block = make_block(&title, ascii);
@@ -565,6 +587,69 @@ fn render_detail(
         }
     };
     frame.render_widget(widget, area);
+}
+
+fn render_detail_overlay(
+    frame: &mut Frame,
+    ctx: &TuiContext,
+    state: &IncrementalState,
+    area: Rect,
+) {
+    let ascii = ctx.mode.ascii;
+    let close_hint = if ascii { "q / Esc to close" } else { "q / Esc to close" };
+    let title = format!(" Event detail  \u{2014}  {} ", close_hint);
+
+    frame.render_widget(Clear, area);
+    let block = make_block(&title, ascii);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let filtered = state.filtered_indices();
+    let filter_has_no_results = !state.filter_query.is_empty() && filtered.is_empty();
+
+    let selected_event: Option<&CorrelateEvent> = state
+        .list_state
+        .selected()
+        .and_then(|vis| filtered.get(vis))
+        .and_then(|&raw| state.events.get(raw));
+
+    let widget = if filter_has_no_results {
+        Paragraph::new(Line::from(Span::styled("No events match filter", dim)))
+            .wrap(Wrap { trim: false })
+    } else {
+        match selected_event {
+            None => {
+                let hint = if ascii { "up/down to select an event" } else { "\u{2191}\u{2193} to select an event" };
+                Paragraph::new(Line::from(Span::styled(hint, dim))).wrap(Wrap { trim: false })
+            }
+            Some(e) => {
+                let detail = if e.message.is_empty() { e.kind.as_str() } else { e.message.as_str() };
+                let mut lines = vec![
+                    Line::from(vec![
+                        Span::styled("source:  ", dim),
+                        Span::raw(e.source.clone()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("kind:    ", dim),
+                        Span::raw(e.kind.clone()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("detail:  ", dim),
+                        Span::raw(detail.to_string()),
+                    ]),
+                ];
+                if let Some(cmd) = state.diagnosis.as_ref().and_then(|d| d.next_commands.first()) {
+                    lines.push(Line::from(vec![
+                        Span::styled("next:    ", dim),
+                        Span::raw(cmd.clone()),
+                    ]));
+                }
+                Paragraph::new(lines).wrap(Wrap { trim: false })
+            }
+        }
+    };
+    frame.render_widget(widget, inner);
 }
 
 fn render_status_bar(
@@ -1326,6 +1411,129 @@ mod tests {
             all_rows.contains("No events match filter"),
             "Expected 'No events match filter': {all_rows}"
         );
+    }
+
+    // ─── Narrow / wide layout ─────────────────────────────────────────────────
+
+    #[test]
+    fn narrow_layout_single_pane_80x24() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+        state.select_first();
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let row0 = row_str(&buf, 0, 80);
+        assert!(row0.contains("Timeline"), "Timeline title missing in narrow mode: {row0}");
+        assert!(!row0.contains("Event detail"), "Event detail pane should be hidden at <100 cols: {row0}");
+        assert!(row0.contains("Enter for detail"), "Expected '(Enter for detail)' hint in narrow title: {row0}");
+    }
+
+    #[test]
+    fn narrow_layout_title_hint_absent_in_wide_mode() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+        state.select_first();
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let row0 = row_str(&buf, 0, 120);
+        assert!(!row0.contains("Enter for detail"), "No 'Enter for detail' hint in wide mode: {row0}");
+        assert!(row0.contains("Event detail"), "Detail pane should be visible at >=100 cols: {row0}");
+    }
+
+    #[test]
+    fn detail_overlay_renders_full_screen_narrow() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+        state.select_first();
+        state.detail_open = true;
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 80)).collect::<Vec<_>>().join("\n");
+        assert!(all_rows.contains("Event detail"), "Expected 'Event detail' in overlay: {all_rows}");
+        assert!(all_rows.contains("q / Esc"), "Expected close hint in overlay: {all_rows}");
+        assert!(all_rows.contains("source:"), "Expected 'source:' in overlay content: {all_rows}");
+    }
+
+    #[test]
+    fn detail_overlay_renders_full_screen_wide() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+        state.select_first();
+        state.detail_open = true;
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let row0 = row_str(&buf, 0, 120);
+        // Overlay takes full screen — row 0 should be the overlay border with the detail title
+        assert!(row0.contains("Event detail"), "Expected overlay title in row 0: {row0}");
+        assert!(row0.contains("q / Esc"), "Expected close hint in overlay title: {row0}");
+    }
+
+    #[test]
+    fn detail_overlay_dismissed_by_state() {
+        let config = sample_config();
+        let mut state = sample_state(&config);
+        state.select_first();
+        state.detail_open = true;
+        assert!(state.detail_open);
+        state.detail_open = false;
+        assert!(!state.detail_open, "detail_open should be false after dismissal");
+    }
+
+    #[test]
+    fn detail_overlay_not_shown_by_default() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+        state.select_first();
+        // detail_open defaults to false
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let row0 = row_str(&buf, 0, 80);
+        // In narrow mode, row 0 should show Timeline, not the overlay title
+        assert!(row0.contains("Timeline"), "Timeline should show when detail overlay is closed: {row0}");
+        assert!(!row0.contains("q / Esc"), "Overlay should not be visible by default: {row0}");
+    }
+
+    #[test]
+    fn narrow_layout_filtered_title_includes_enter_hint() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (config, mut state) = three_event_state();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        state.filter_query = "temporal".into();
+        state.filter_active = true;
+        state.sync_cursor();
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let row0 = row_str(&buf, 0, 80);
+        assert!(row0.contains("2/3"), "Expected '2/3' filter ratio: {row0}");
+        assert!(row0.contains("Enter for detail"), "Expected Enter hint in narrow filtered title: {row0}");
     }
 
     #[test]
