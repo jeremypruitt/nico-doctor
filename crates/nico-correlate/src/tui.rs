@@ -70,13 +70,13 @@ fn event_loop<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|f| render(f, output, ctx)).expect("draw");
 
-        if event::poll(std::time::Duration::from_millis(100)).expect("poll") {
-            if let Ok(CrosstermEvent::Key(key)) = event::read() {
-                match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    _ => {}
-                }
+        if event::poll(std::time::Duration::from_millis(100)).expect("poll")
+            && let Ok(CrosstermEvent::Key(key)) = event::read()
+        {
+            match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                _ => {}
             }
         }
     }
@@ -87,7 +87,7 @@ fn render(frame: &mut Frame, output: &CorrelateOutput, ctx: &TuiContext) {
     let area = frame.area();
     // ctx.mode carries the color/ascii flags threaded from --no-color / --ascii.
     // Color and ASCII substitution rendering is deferred to subsequent layout issues.
-    let quit_hint = if ctx.mode.ascii { "q:quit" } else { "q:quit" };
+    let quit_hint = if ctx.mode.ascii { "q:quit" } else { "q:quit \u{2715}" };
     let title = format!(
         " nico-correlate: {}  ({} events)  {} ",
         output.id,
