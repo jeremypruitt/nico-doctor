@@ -11,6 +11,7 @@ use serde::Serialize;
 use crate::id::{IdType, detect_id_type};
 use crate::source::{Source, SourceResult, StateEntry};
 use crate::sources::temporal::{TemporalSource, TemporalClient, RawTemporalEvent};
+use crate::sources::temporal_grpc::GrpcTemporalClient;
 use crate::sources::postgres::{PostgresSource, PostgresClient, PgEntityData, SqlxPostgresClient};
 use crate::sources::k8s::{K8sSource, K8sClient, K8sPodData, KubeRsK8sClient};
 use crate::sources::loki::{LokiSource, LokiClient, LokiLogLine, K8sLogStreamClient, K8sLogLine};
@@ -75,13 +76,14 @@ fn parse_since(s: &str) -> Result<Duration, String> {
     Ok(total)
 }
 
-// Real Temporal client is wired in issue #14.
-struct TodoTemporalClient;
+struct InactiveTemporalClient {
+    reason: String,
+}
 
 #[async_trait]
-impl TemporalClient for TodoTemporalClient {
+impl TemporalClient for InactiveTemporalClient {
     async fn get_history(&self, _workflow_id: &str) -> Result<Vec<RawTemporalEvent>> {
-        Err(anyhow::anyhow!("not implemented: real Temporal gRPC client — see issue #14"))
+        Err(anyhow::anyhow!("{}", self.reason))
     }
 }
 
@@ -242,8 +244,16 @@ async fn main() {
         Err(e) => Box::new(InactiveK8sClient { reason: format!("kubeconfig unavailable: {e}") }),
     };
 
+    let temporal_client: Box<dyn TemporalClient> = match std::env::var("NICO_TEMPORAL_ADDRESS") {
+        Ok(addr) => {
+            let ns = std::env::var("NICO_TEMPORAL_NAMESPACE").unwrap_or_else(|_| "default".into());
+            Box::new(GrpcTemporalClient::new(addr, ns))
+        }
+        Err(_) => Box::new(InactiveTemporalClient { reason: "NICO_TEMPORAL_ADDRESS not set".into() }),
+    };
+
     let all_sources: Vec<(&str, Box<dyn Source>)> = vec![
-        ("temporal", Box::new(TemporalSource::new(Box::new(TodoTemporalClient)))),
+        ("temporal", Box::new(TemporalSource::new(temporal_client))),
         ("postgres", Box::new(PostgresSource::new(pg_client))),
         ("k8s", Box::new(K8sSource::new(k8s_client))),
         ("loki", Box::new(LokiSource::new(

@@ -3,3 +3,4 @@ pub mod loki;
 pub mod postgres;
 pub mod redfish;
 pub mod temporal;
+pub mod temporal_grpc;
