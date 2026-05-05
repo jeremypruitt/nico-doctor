@@ -9,10 +9,11 @@ mod timeline;
 use clap::Parser;
 use chrono::Duration;
 use serde::Serialize;
+use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat};
 use nico_common::output::{OutputMode, Status};
 use crate::id::{IdType, detect_id_type};
 use crate::source::{Source, SourceResult, StateEntry};
-use crate::sources::temporal::{TemporalSource, TemporalClient, RawTemporalEvent};
+use crate::sources::temporal::{TemporalSource, TemporalClient};
 use crate::sources::temporal_grpc::GrpcTemporalClient;
 use crate::sources::postgres::{PostgresSource, PostgresClient, PgEntityData, SqlxPostgresClient};
 use crate::sources::k8s::{K8sSource, K8sClient, K8sPodData, KubeRsK8sClient};
@@ -58,6 +59,10 @@ struct Cli {
     /// Disable color output
     #[arg(long)]
     no_color: bool,
+
+    /// Config file path (default: ~/.config/nico-tools/config.toml)
+    #[arg(long, value_name = "PATH")]
+    config: Option<String>,
 }
 
 fn parse_since(s: &str) -> Result<Duration, String> {
@@ -85,17 +90,6 @@ fn parse_since(s: &str) -> Result<Duration, String> {
         return Err(format!("trailing number without unit in duration '{s}'"));
     }
     Ok(total)
-}
-
-struct InactiveTemporalClient {
-    reason: String,
-}
-
-#[async_trait]
-impl TemporalClient for InactiveTemporalClient {
-    async fn get_history(&self, _workflow_id: &str) -> Result<Vec<RawTemporalEvent>> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
 }
 
 struct InactivePostgresClient {
@@ -234,6 +228,30 @@ fn severity_to_status(s: &crate::event::Severity) -> Status {
 async fn main() {
     let cli = Cli::parse();
 
+    // Load config file from --config or the default path.
+    let config_path = cli.config.as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home).join(".config/nico-tools/config.toml")
+        });
+    let file_toml = std::fs::read_to_string(&config_path).ok();
+
+    let overrides = ConfigOverrides {
+        color: if cli.no_color { Some(ColorMode::Never) } else { None },
+        format: if cli.json { Some(OutputFormat::Json) } else { None },
+        ..Default::default()
+    };
+
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let config = match Config::load(file_toml.as_deref(), &env, &overrides) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error loading config: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let since = match parse_since(&cli.since) {
         Ok(d) => d,
         Err(e) => {
@@ -294,12 +312,9 @@ async fn main() {
     }
     let id_type = id_type.unwrap();
 
-    let pg_client: Box<dyn PostgresClient> = match std::env::var("NICO_POSTGRES_URL") {
-        Ok(url) => match SqlxPostgresClient::connect(&url).await {
-            Ok(c) => Box::new(c),
-            Err(e) => Box::new(InactivePostgresClient { reason: format!("connect failed: {e}") }),
-        },
-        Err(_) => Box::new(InactivePostgresClient { reason: "NICO_POSTGRES_URL not set".into() }),
+    let pg_client: Box<dyn PostgresClient> = match SqlxPostgresClient::connect(&config.postgres.url).await {
+        Ok(c) => Box::new(c),
+        Err(e) => Box::new(InactivePostgresClient { reason: format!("connect failed: {e}") }),
     };
 
     let k8s_client: Box<dyn K8sClient> = match KubeRsK8sClient::try_default().await {
@@ -307,14 +322,12 @@ async fn main() {
         Err(e) => Box::new(InactiveK8sClient { reason: format!("kubeconfig unavailable: {e}") }),
     };
 
-    let temporal_client: Box<dyn TemporalClient> = match std::env::var("NICO_TEMPORAL_ADDRESS") {
-        Ok(addr) => {
-            let ns = std::env::var("NICO_TEMPORAL_NAMESPACE").unwrap_or_else(|_| "default".into());
-            Box::new(GrpcTemporalClient::new(addr, ns))
-        }
-        Err(_) => Box::new(InactiveTemporalClient { reason: "NICO_TEMPORAL_ADDRESS not set".into() }),
-    };
+    let temporal_client: Box<dyn TemporalClient> = Box::new(GrpcTemporalClient::new(
+        config.temporal.address.clone(),
+        config.temporal.namespace.clone(),
+    ));
 
+    // Loki URL is not a Config field — read from env directly.
     let loki_client: Box<dyn LokiClient> = match std::env::var("LOKI_URL") {
         Ok(url) => Box::new(RealLokiClient::new(url)),
         Err(_) => Box::new(InactiveLokiClient { reason: "LOKI_URL not set".into() }),
@@ -325,16 +338,14 @@ async fn main() {
         Err(e) => Box::new(InactiveK8sLogStreamClient { reason: format!("kubeconfig unavailable: {e}") }),
     };
 
+    // Redfish and its BMC URL are not Config fields — read from env directly.
     let redfish_client: Box<dyn RedfishClient> = match std::env::var("REDFISH_BMC_BASE_URL") {
         Ok(bmc_url) => {
-            let pg_pool = match std::env::var("NICO_POSTGRES_URL") {
-                Ok(pg_url) => sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(1)
-                    .acquire_timeout(std::time::Duration::from_secs(5))
-                    .connect(&pg_url)
-                    .await.ok(),
-                Err(_) => None,
-            };
+            let pg_pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(std::time::Duration::from_secs(5))
+                .connect(&config.postgres.url)
+                .await.ok();
             Box::new(RealRedfishClient::new(bmc_url, pg_pool))
         }
         Err(_) => Box::new(InactiveRedfishClient { reason: "REDFISH_BMC_BASE_URL not set".into() }),
@@ -388,11 +399,15 @@ async fn main() {
     let code = exit_code(Some(&id_type), &all_results);
 
     let mode = OutputMode {
-        color: !cli.no_color && std::env::var("NO_COLOR").is_err(),
+        color: match config.output.color {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => std::env::var("NO_COLOR").is_err(),
+        },
         ascii: cli.ascii,
     };
 
-    if cli.json {
+    if matches!(config.output.format, OutputFormat::Json) {
         let out = JsonOutput {
             version: 1,
             id: &cli.id,
