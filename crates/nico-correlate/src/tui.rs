@@ -8,7 +8,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use crossterm::{
     event::{self, Event as CrosstermEvent, KeyCode, KeyModifiers},
@@ -90,6 +90,8 @@ struct IncrementalState {
     // Cursor — pinned to the selected event by identity, not row index.
     selected_key: Option<EventKey>,
     list_state: ListState,
+
+    help_open: bool,
 }
 
 impl IncrementalState {
@@ -112,6 +114,7 @@ impl IncrementalState {
             has_unavailable: false,
             selected_key: None,
             list_state: ListState::default(),
+            help_open: false,
         }
     }
 
@@ -272,16 +275,27 @@ fn event_loop<B: ratatui::backend::Backend>(
         if event::poll(std::time::Duration::from_millis(50)).expect("poll")
             && let Ok(CrosstermEvent::Key(key)) = event::read()
         {
-            match key.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Up => state.select_prev(),
-                KeyCode::Down => state.select_next(),
-                KeyCode::PageUp => state.select_prev_page(PAGE_SIZE),
-                KeyCode::PageDown => state.select_next_page(PAGE_SIZE),
-                KeyCode::Char('g') => state.select_first(),
-                KeyCode::Char('G') | KeyCode::End => state.select_last(),
-                _ => {}
+            if state.help_open {
+                match key.code {
+                    KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                        state.help_open = false;
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('?') => state.help_open = true,
+                    KeyCode::Up => state.select_prev(),
+                    KeyCode::Down => state.select_next(),
+                    KeyCode::PageUp => state.select_prev_page(PAGE_SIZE),
+                    KeyCode::PageDown => state.select_next_page(PAGE_SIZE),
+                    KeyCode::Char('g') => state.select_first(),
+                    KeyCode::Char('G') | KeyCode::End => state.select_last(),
+                    _ => {}
+                }
             }
         }
 
@@ -342,6 +356,10 @@ fn render(
     render_timeline(frame, ctx, state, panes[0]);
     render_detail(frame, ctx, state, panes[1]);
     render_status_bar(frame, ctx, state, config, rows[1]);
+
+    if state.help_open {
+        render_help_overlay(frame, ctx, area);
+    }
 }
 
 fn render_timeline(
@@ -488,6 +506,45 @@ fn render_status_bar(
         Paragraph::new("?:help  q:quit").alignment(Alignment::Right),
         cols[2],
     );
+}
+
+fn center_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width.min(area.width), height.min(area.height))
+}
+
+fn render_help_overlay(frame: &mut Frame, ctx: &TuiContext, area: Rect) {
+    let ascii = ctx.mode.ascii;
+    let overlay_rect = center_rect(62, 16, area);
+
+    frame.render_widget(Clear, overlay_rect);
+
+    let block = make_block(" Keybindings  \u{2014}  ? or Esc to close ", ascii);
+    let inner = block.inner(overlay_rect);
+    frame.render_widget(block, overlay_rect);
+
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let rows: &[(&str, &str)] = &[
+        ("\u{2191} / \u{2193}",      "Move selection"),
+        ("PgUp / PgDn", "Fast scroll"),
+        ("g",           "Jump to first row"),
+        ("G / End",     "Jump to last row"),
+        ("f",           "Toggle auto-follow (tail mode)"),
+        ("/",           "Open filter bar"),
+        ("Escape",      "Clear filter / dismiss overlay"),
+        ("Enter",       "Open full-screen event detail"),
+        ("?",           "Toggle this help overlay"),
+        ("q / Ctrl-C",  "Exit"),
+    ];
+    let lines: Vec<Line> = rows.iter().map(|(key, action)| {
+        Line::from(vec![
+            Span::styled(format!("  {:<14}", key), dim),
+            Span::raw(*action),
+        ])
+    }).collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -864,6 +921,60 @@ mod tests {
     fn panic_hook_restores_terminal() {
         install_panic_hook();
         let _ = std::panic::catch_unwind(|| panic!("tui scaffold test panic"));
+    }
+
+    // ─── Help overlay ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn help_overlay_renders_keybindings() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+        state.help_open = true;
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join("\n");
+
+        assert!(all_rows.contains("Keybindings"), "Expected overlay title: {all_rows}");
+        assert!(all_rows.contains("Move selection"), "Expected 'Move selection': {all_rows}");
+        assert!(all_rows.contains("Fast scroll"), "Expected 'Fast scroll': {all_rows}");
+        assert!(all_rows.contains("Jump to first row"), "Expected 'Jump to first row': {all_rows}");
+        assert!(all_rows.contains("auto-follow"), "Expected 'auto-follow': {all_rows}");
+        assert!(all_rows.contains("filter bar"), "Expected 'filter bar': {all_rows}");
+        assert!(all_rows.contains("dismiss overlay"), "Expected 'dismiss overlay': {all_rows}");
+        assert!(all_rows.contains("full-screen"), "Expected 'full-screen': {all_rows}");
+        assert!(all_rows.contains("Toggle this help overlay"), "Expected help overlay entry: {all_rows}");
+        assert!(all_rows.contains("q / Ctrl-C"), "Expected 'q / Ctrl-C': {all_rows}");
+    }
+
+    #[test]
+    fn help_overlay_dismissed_by_question_mark() {
+        let config = sample_config();
+        let mut state = sample_state(&config);
+        state.help_open = true;
+        assert!(state.help_open);
+        state.help_open = false;
+        assert!(!state.help_open);
+    }
+
+    #[test]
+    fn help_overlay_not_shown_by_default() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+        // help_open defaults to false
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let all_rows: String = (0..24).map(|y| row_str(&buf, y, 120)).collect::<Vec<_>>().join("\n");
+        assert!(!all_rows.contains("Keybindings"), "Overlay should not appear by default: {all_rows}");
     }
 
     #[test]
