@@ -1,9 +1,11 @@
+#![allow(dead_code)]
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 use clap::Parser;
 use nico_common::output::{OutputMode, Status};
 
+mod formatter;
 mod grpc;
 mod http;
 mod k8s;
@@ -15,7 +17,8 @@ mod runner;
 mod temporal;
 
 use layer::RunOpts;
-use runner::Report;
+
+const LAYER_ORDER: &[&str] = &["cluster", "logs", "workflows", "health", "grpc", "postgres"];
 
 #[derive(Parser)]
 #[command(name = "nico-doctor", about = "Read-only health check for nico/ncx clusters")]
@@ -51,54 +54,7 @@ struct Cli {
     postgres_url: Option<String>,
 }
 
-fn print_report(report: &Report, mode: &OutputMode) {
-    for layer in &report.layers {
-        let icon = layer.status.icon(mode);
-        let styled_icon = layer.status.style(icon, mode);
-        let summary = layer.checks.iter()
-            .map(|c| c.value.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  {styled_icon} {:<12} {summary}", layer.name);
-    }
-
-    let has_findings = report.layers.iter().any(|l| {
-        l.checks.iter().any(|c| c.status != Status::Ok)
-    });
-
-    if has_findings {
-        println!();
-        for layer in &report.layers {
-            let bad: Vec<_> = layer.checks.iter()
-                .filter(|c| c.status != Status::Ok)
-                .collect();
-            if bad.is_empty() { continue; }
-            println!("{}:", layer.name);
-            for check in bad {
-                println!("  • {} ({})", check.value, check.name);
-                if let Some(cmd) = &check.next_command {
-                    println!("    → {cmd}");
-                }
-            }
-        }
-    }
-
-    println!();
-    let status = report.summary_status();
-    let icon = status.icon(mode);
-    let warn_count = report.layers.iter()
-        .flat_map(|l| &l.checks)
-        .filter(|c| c.status == Status::Warn)
-        .count();
-    let fail_count = report.layers.iter()
-        .flat_map(|l| &l.checks)
-        .filter(|c| c.status == Status::Fail)
-        .count();
-    println!("Summary: {icon}  {warn_count} warnings, {fail_count} failures");
-    println!("Hint: --verbose for details on passing checks, --json for machine output");
-}
-
-fn exit_code(report: &Report) -> i32 {
+fn exit_code(report: &runner::Report) -> i32 {
     match report.summary_status() {
         Status::Ok | Status::Skipped => 0,
         Status::Warn => 1,
@@ -123,40 +79,30 @@ async fn main() {
 
     let mut layers: Vec<Box<dyn layer::Layer>> = vec![];
 
-    if let Some(ref url) = cli.postgres_url {
-        if !cli.skip.iter().any(|s| s == "postgres") {
-            match postgres::SqlxPostgresClient::new(url) {
-                Ok(pg) => layers.push(Box::new(layers::postgres::PostgresLayer::new(Arc::new(pg)))),
-                Err(e) => eprintln!("warning: postgres layer disabled: {e}"),
+    for &name in LAYER_ORDER {
+        if cli.skip.iter().any(|s| s.as_str() == name) {
+            layers.push(layer::SkippedLayer::new(name));
+            continue;
+        }
+        match name {
+            "postgres" => {
+                if let Some(ref url) = cli.postgres_url {
+                    match postgres::SqlxPostgresClient::new(url) {
+                        Ok(pg) => layers.push(Box::new(layers::postgres::PostgresLayer::new(Arc::new(pg)))),
+                        Err(e) => eprintln!("warning: postgres layer disabled: {e}"),
+                    }
+                }
             }
+            _ => {}
         }
     }
 
     let report = runner::run(&layers, &opts).await;
 
     if cli.json {
-        println!("{}", serde_json::json!({
-            "version": 1,
-            "namespace": cli.namespace,
-            "summary": {
-                "ok": report.layers.iter().filter(|l| l.status == Status::Ok).count(),
-                "warn": report.layers.iter().filter(|l| l.status == Status::Warn).count(),
-                "fail": report.layers.iter().filter(|l| l.status == Status::Fail).count(),
-                "unknown": report.layers.iter().filter(|l| l.status == Status::Unknown).count(),
-            },
-            "layers": report.layers.iter().map(|l| serde_json::json!({
-                "name": l.name,
-                "status": format!("{:?}", l.status).to_lowercase(),
-                "duration_ms": l.duration_ms,
-                "checks": l.checks.iter().map(|c| serde_json::json!({
-                    "name": c.name,
-                    "status": format!("{:?}", c.status).to_lowercase(),
-                    "value": c.value,
-                })).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-        }));
+        println!("{}", formatter::format_json(&report, &cli.namespace));
     } else {
-        print_report(&report, &mode);
+        print!("{}", formatter::format_report(&report, &mode, cli.verbose));
     }
 
     process::exit(exit_code(&report));

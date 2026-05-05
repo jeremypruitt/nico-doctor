@@ -48,7 +48,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use async_trait::async_trait;
-    use crate::layer::{Check, RunOpts};
+    use crate::layer::RunOpts;
 
     struct StubLayer {
         name: &'static str,
