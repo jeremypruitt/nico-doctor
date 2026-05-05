@@ -2,6 +2,43 @@
 
 Diagnostic CLI tooling for NICO/carbide/NCX installations. Read-only — never modifies cluster state.
 
+## Configuration file
+
+Both `nico-doctor` and `nico-correlate` load `~/.config/nico-tools/config.toml` automatically if it exists. Write it once and stop juggling environment variables every session.
+
+**Precedence:** CLI flag > environment variable > config file > built-in default
+
+```toml
+# ~/.config/nico-tools/config.toml
+
+[cluster]
+namespace = "nico"
+context   = "my-cluster"      # optional — omit to use current kubeconfig context
+
+[temporal]
+address          = "localhost:7233"
+namespace        = "default"
+stuck_threshold  = "30m"
+
+[postgres]
+url = "postgres://nico:secret@db:5432/nico"
+
+[output]
+color  = "auto"   # auto | always | never
+format = "human"  # human | json
+```
+
+Use `--config <path>` on either binary to load a different file:
+
+```bash
+nico-doctor --config /etc/nico/config.toml
+nico-correlate --config ~/my-cluster.toml host-r12u5
+```
+
+Environment variables (`NICO_TEMPORAL_ADDRESS`, `NICO_POSTGRES_URL`, `NICO_NAMESPACE`, etc.) still work and override the config file. CLI flags override everything.
+
+---
+
 ## Crates
 
 | Crate | Binary | Purpose |
