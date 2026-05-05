@@ -7,6 +7,7 @@ pub struct GrpcServiceInfo {
     pub method_count: usize,
 }
 
+#[allow(dead_code)]
 pub enum GrpcInspectResult {
     Reachable { services: Vec<GrpcServiceInfo> },
     Unreachable,

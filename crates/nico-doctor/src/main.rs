@@ -1,7 +1,7 @@
-#![allow(dead_code)]
 use std::process;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+use async_trait::async_trait;
 use clap::Parser;
 use nico_common::output::{OutputMode, Status};
 
@@ -26,7 +26,7 @@ struct Cli {
     #[arg(short, long, help = "Kubernetes namespace", default_value = "nico")]
     namespace: String,
 
-    #[arg(long, help = "Kubernetes context [env: NICO_CONTEXT]")]
+    #[arg(long, env = "NICO_CONTEXT", help = "Kubernetes context")]
     context: Option<String>,
 
     #[arg(long, value_delimiter = ',', help = "Layers to skip")]
@@ -52,6 +52,77 @@ struct Cli {
 
     #[arg(long, env = "NICO_POSTGRES_URL", help = "Postgres connection URL")]
     postgres_url: Option<String>,
+}
+
+// --- Inactive client stubs ---
+// Each stub implements a client trait with an immediate Err so its layer shows
+// Unknown/degraded status when the backing service is absent. Swap for real
+// implementations in follow-on issues #25 (k8s), #26 (loki), #27 (temporal/grpc).
+
+struct InactiveK8sClient { reason: &'static str }
+
+#[async_trait]
+impl k8s::K8sClient for InactiveK8sClient {
+    async fn list_pods(&self, _ns: &str) -> anyhow::Result<Vec<k8s::PodInfo>> {
+        Err(anyhow::anyhow!("{}", self.reason))
+    }
+    async fn list_events(&self, _ns: &str, _since: Duration) -> anyhow::Result<Vec<k8s::EventInfo>> {
+        Err(anyhow::anyhow!("{}", self.reason))
+    }
+    async fn pod_logs(&self, _ns: &str, _pod: &str, _since: Duration) -> anyhow::Result<Vec<String>> {
+        Err(anyhow::anyhow!("{}", self.reason))
+    }
+}
+
+struct InactiveLokiClient { reason: &'static str }
+
+#[async_trait]
+impl loki::LokiClient for InactiveLokiClient {
+    async fn query_errors(&self, _ns: &str, _since: Duration, _limit: usize) -> anyhow::Result<loki::LokiQueryResult> {
+        Err(anyhow::anyhow!("{}", self.reason))
+    }
+}
+
+struct InactiveTemporalClient { reason: &'static str }
+
+#[async_trait]
+impl temporal::TemporalClient for InactiveTemporalClient {
+    async fn list_stuck(&self, _ns: &str, _before: SystemTime) -> anyhow::Result<Vec<temporal::RunningWorkflow>> {
+        Err(anyhow::anyhow!("{}", self.reason))
+    }
+    async fn list_failed(&self, _ns: &str, _since: SystemTime) -> anyhow::Result<Vec<temporal::FailedWorkflow>> {
+        Err(anyhow::anyhow!("{}", self.reason))
+    }
+}
+
+struct InactiveHttpClient { reason: &'static str }
+
+#[async_trait]
+impl http::HttpClient for InactiveHttpClient {
+    async fn get_status(&self, _url: &str) -> anyhow::Result<u16> {
+        Err(anyhow::anyhow!("{}", self.reason))
+    }
+}
+
+struct InactiveGrpcInspector { reason: &'static str }
+
+#[async_trait]
+impl grpc::GrpcInspector for InactiveGrpcInspector {
+    async fn inspect(&self, _addr: &str) -> anyhow::Result<grpc::GrpcInspectResult> {
+        Err(anyhow::anyhow!("{}", self.reason))
+    }
+}
+
+struct InactivePostgresClient { reason: &'static str }
+
+#[async_trait]
+impl postgres::PostgresClient for InactivePostgresClient {
+    async fn pool_stats(&self) -> anyhow::Result<postgres::PoolStats> {
+        Err(anyhow::anyhow!("{}", self.reason))
+    }
+    async fn lock_waits(&self) -> anyhow::Result<Vec<postgres::LockWait>> {
+        Err(anyhow::anyhow!("{}", self.reason))
+    }
 }
 
 fn exit_code(report: &runner::Report) -> i32 {
@@ -85,12 +156,92 @@ async fn main() {
             continue;
         }
         match name {
-            "postgres" => {
-                if let Some(ref url) = cli.postgres_url {
-                    match postgres::SqlxPostgresClient::new(url) {
-                        Ok(pg) => layers.push(Box::new(layers::postgres::PostgresLayer::new(Arc::new(pg)))),
-                        Err(e) => eprintln!("warning: postgres layer disabled: {e}"),
+            "cluster" => {
+                match cli.context.as_deref() {
+                    Some(_) => layers.push(Box::new(layers::cluster::ClusterLayer::new(
+                        // TODO #25: replace with real kube-rs client
+                        Arc::new(InactiveK8sClient { reason: "k8s client not yet wired (see #25)" }),
+                    ))),
+                    None => layers.push(layer::UnconfiguredLayer::new(
+                        "cluster", "set --context or NICO_CONTEXT to enable",
+                    )),
+                }
+            }
+            "logs" => {
+                let has_loki = std::env::var("LOKI_URL").is_ok();
+                if has_loki || cli.context.is_some() {
+                    layers.push(Box::new(layers::logs::LogsLayer::new(
+                        // TODO #26: replace with real LokiClient
+                        Arc::new(InactiveLokiClient { reason: "loki client not yet wired (see #26)" }),
+                        // TODO #25: replace with real K8sClient
+                        Arc::new(InactiveK8sClient { reason: "k8s client not yet wired (see #25)" }),
+                    )));
+                } else {
+                    layers.push(layer::UnconfiguredLayer::new(
+                        "logs", "set LOKI_URL or NICO_CONTEXT to enable",
+                    ));
+                }
+            }
+            "workflows" => {
+                match std::env::var("NICO_TEMPORAL_ADDRESS") {
+                    Ok(_) => layers.push(Box::new(layers::workflows::WorkflowsLayer::new(
+                        // TODO #27: replace with real gRPC Temporal client
+                        Arc::new(InactiveTemporalClient { reason: "temporal client not yet wired (see #27)" }),
+                        Duration::from_secs(30 * 60),
+                    ))),
+                    Err(_) => layers.push(layer::UnconfiguredLayer::new(
+                        "workflows", "set NICO_TEMPORAL_ADDRESS to enable",
+                    )),
+                }
+            }
+            "health" => {
+                let endpoints_str = std::env::var("NICO_HEALTH_ENDPOINTS").ok();
+                match endpoints_str.as_deref() {
+                    Some(s) if !s.is_empty() => {
+                        let services: Vec<http::ServiceEndpoint> = s.split(',')
+                            .map(|u| u.trim().to_string())
+                            .filter(|u| !u.is_empty())
+                            .map(|url| http::ServiceEndpoint { name: url.clone(), base_url: url })
+                            .collect();
+                        layers.push(Box::new(layers::health::HealthLayer::new(
+                            // TODO: replace with real reqwest-based HttpClient
+                            Arc::new(InactiveHttpClient { reason: "http client not yet wired" }),
+                            services,
+                        )));
                     }
+                    _ => layers.push(layer::UnconfiguredLayer::new(
+                        "health", "set NICO_HEALTH_ENDPOINTS to enable",
+                    )),
+                }
+            }
+            "grpc" => {
+                let grpc_addr = std::env::var("NICO_GRPC_ADDRESS").ok()
+                    .or_else(|| std::env::var("NICO_TEMPORAL_ADDRESS").ok());
+                match grpc_addr {
+                    Some(addr) => layers.push(Box::new(layers::grpc::GrpcLayer::new(
+                        // TODO #27: replace with real tonic-based GrpcInspector
+                        Arc::new(InactiveGrpcInspector { reason: "grpc inspector not yet wired (see #27)" }),
+                        addr,
+                    ))),
+                    None => layers.push(layer::UnconfiguredLayer::new(
+                        "grpc", "set NICO_GRPC_ADDRESS or NICO_TEMPORAL_ADDRESS to enable",
+                    )),
+                }
+            }
+            "postgres" => {
+                match cli.postgres_url.as_deref() {
+                    Some(url) => match postgres::SqlxPostgresClient::new(url) {
+                        Ok(pg) => layers.push(Box::new(layers::postgres::PostgresLayer::new(Arc::new(pg)))),
+                        Err(e) => {
+                            eprintln!("warning: postgres URL invalid: {e}");
+                            layers.push(Box::new(layers::postgres::PostgresLayer::new(
+                                Arc::new(InactivePostgresClient { reason: "invalid postgres URL" }),
+                            )));
+                        }
+                    },
+                    None => layers.push(Box::new(layers::postgres::PostgresLayer::new(
+                        Arc::new(InactivePostgresClient { reason: "NICO_POSTGRES_URL not set" }),
+                    ))),
                 }
             }
             _ => {}

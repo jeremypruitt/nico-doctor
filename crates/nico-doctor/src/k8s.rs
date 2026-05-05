@@ -9,7 +9,9 @@ pub struct PodInfo {
 }
 
 pub struct EventInfo {
+    #[allow(dead_code)]
     pub message: String,
+    #[allow(dead_code)]
     pub reason: String,
 }
 

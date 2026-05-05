@@ -18,6 +18,7 @@ impl Report {
         }
     }
 
+    #[allow(dead_code)]
     pub fn layer(&self, name: &str) -> Option<&LayerResult> {
         self.layers.iter().find(|l| l.name == name)
     }

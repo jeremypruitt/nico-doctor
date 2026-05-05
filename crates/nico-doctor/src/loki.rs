@@ -7,6 +7,7 @@ pub struct LokiLine {
     pub text: String,
 }
 
+#[allow(dead_code)]
 pub enum LokiQueryResult {
     Lines(Vec<LokiLine>),
     Unreachable,

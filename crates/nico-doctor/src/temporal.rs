@@ -12,6 +12,7 @@ pub struct RunningWorkflow {
 pub struct FailedWorkflow {
     pub workflow_id: String,
     pub workflow_type: String,
+    #[allow(dead_code)]
     pub close_time: SystemTime,
 }
 

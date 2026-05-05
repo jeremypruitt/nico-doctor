@@ -50,3 +50,32 @@ impl Layer for SkippedLayer {
         }
     }
 }
+
+pub struct UnconfiguredLayer {
+    name: &'static str,
+    reason: String,
+}
+
+impl UnconfiguredLayer {
+    pub fn new(name: &'static str, reason: impl Into<String>) -> Box<dyn Layer> {
+        Box::new(Self { name, reason: reason.into() })
+    }
+}
+
+#[async_trait]
+impl Layer for UnconfiguredLayer {
+    fn name(&self) -> &'static str { self.name }
+    async fn run(&self, _opts: &RunOpts) -> LayerResult {
+        LayerResult {
+            name: self.name,
+            status: Status::Unknown,
+            checks: vec![Check {
+                name: "config",
+                status: Status::Unknown,
+                value: self.reason.clone(),
+                next_command: None,
+            }],
+            duration_ms: 0,
+        }
+    }
+}
