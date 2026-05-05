@@ -160,6 +160,7 @@ struct JsonOutput<'a> {
     id: &'a str,
     id_type: &'a str,
     events: Vec<JsonEvent<'a>>,
+    sources_restricted: Vec<&'a str>,
     sources_unavailable: Vec<&'a str>,
     state: Vec<JsonStateEntry<'a>>,
 }
@@ -178,6 +179,8 @@ struct JsonStateEntry<'a> {
     key: &'a str,
     value: &'a str,
 }
+
+const KNOWN_SOURCES: &[&str] = &["temporal", "postgres", "k8s", "loki", "redfish"];
 
 fn id_type_str(t: &IdType) -> &'static str {
     match t {
@@ -208,6 +211,31 @@ async fn main() {
             eprintln!("error: --since {e}");
             std::process::exit(1);
         }
+    };
+
+    let use_all = cli.sources.is_empty() || cli.sources.iter().any(|s| s == "all");
+
+    if !use_all {
+        for s in &cli.sources {
+            if !KNOWN_SOURCES.contains(&s.as_str()) {
+                eprintln!(
+                    "error: unknown source {:?}; valid sources: {} or \"all\"",
+                    s,
+                    KNOWN_SOURCES.join(", ")
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let restricted_names: Vec<&str> = if use_all {
+        vec![]
+    } else {
+        KNOWN_SOURCES
+            .iter()
+            .copied()
+            .filter(|&name| !cli.sources.iter().any(|s| s == name))
+            .collect()
     };
 
     let id_type = if let Some(ref t) = cli.r#type {
@@ -296,10 +324,11 @@ async fn main() {
         ("redfish", Box::new(RedfishSource::new(redfish_client))),
     ];
 
-    let sources: Vec<Box<dyn Source>> = if cli.sources.is_empty() {
+    let sources: Vec<Box<dyn Source>> = if use_all {
         all_sources.into_iter().map(|(_, s)| s).collect()
     } else {
-        all_sources.into_iter()
+        all_sources
+            .into_iter()
             .filter(|(name, _)| cli.sources.iter().any(|s| s == name))
             .map(|(_, s)| s)
             .collect()
@@ -343,6 +372,7 @@ async fn main() {
                     crate::event::Severity::Error => "error",
                 },
             }).collect(),
+            sources_restricted: restricted_names.clone(),
             sources_unavailable: unavailable.clone(),
             state: state.iter().map(|s| JsonStateEntry {
                 source: s.source,
@@ -385,6 +415,9 @@ async fn main() {
             println!("{}", s.value);
         }
 
+        for name in &restricted_names {
+            println!("[source restricted: {name}]");
+        }
         for name in &unavailable {
             println!("[source unavailable: {name}]");
         }
