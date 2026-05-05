@@ -50,13 +50,7 @@ impl KubeRsK8sClient {
 #[async_trait]
 impl K8sClient for KubeRsK8sClient {
     async fn find_pods_with_events(&self, id: &str, id_type: &IdType) -> Result<Vec<K8sPodData>> {
-        let label_key = match id_type {
-            IdType::Workflow => "workflow_id",
-            IdType::Host => "host_id",
-            IdType::Dpu => "dpu_id",
-            IdType::Request => "request_id",
-        };
-        let label_selector = format!("{label_key}={id}");
+        let label_selector = format!("{}={id}", id_type.label_key());
 
         let pods: Api<Pod> = Api::all(self.client.clone());
         let pod_list = pods.list(&ListParams::default().labels(&label_selector)).await

@@ -207,25 +207,6 @@ struct JsonStateEntry<'a> {
 
 const KNOWN_SOURCES: &[&str] = &["temporal", "postgres", "k8s", "loki", "redfish"];
 
-fn id_type_str(t: &IdType) -> &'static str {
-    match t {
-        IdType::Workflow => "workflow",
-        IdType::Host => "host",
-        IdType::Dpu => "dpu",
-        IdType::Request => "request",
-    }
-}
-
-fn parse_id_type(s: &str) -> Option<IdType> {
-    match s {
-        "workflow" => Some(IdType::Workflow),
-        "host" => Some(IdType::Host),
-        "dpu" => Some(IdType::Dpu),
-        "request" => Some(IdType::Request),
-        _ => None,
-    }
-}
-
 fn severity_to_status(s: &crate::event::Severity) -> Status {
     match s {
         crate::event::Severity::Info => Status::Ok,
@@ -340,7 +321,7 @@ async fn main() {
         .collect();
 
     let id_type = if let Some(ref t) = cli.r#type {
-        match parse_id_type(t) {
+        match IdType::from_cli_name(t) {
             Some(it) => Some(it),
             None => {
                 eprintln!("error: unknown --type {t:?}; use workflow|host|dpu|request");
@@ -551,7 +532,7 @@ async fn main() {
         let out = JsonOutput {
             version: 1,
             id: &cli.id,
-            id_type: id_type_str(&id_type),
+            id_type: id_type.cli_name(),
             events: filtered.iter().map(|e| JsonEvent {
                 ts: e.ts.to_rfc3339(),
                 source: &e.source,
