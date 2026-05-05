@@ -1,6 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use reqwest::Client as HttpClient;
+use serde::Deserialize;
 use crate::event::{Event, Severity};
 use crate::id::IdType;
 use crate::source::{Source, SourceResult, SourceOutput, SourceUnavailable, StateEntry};
@@ -93,6 +95,159 @@ impl Source for RedfishSource {
                 reason: e.to_string(),
             }),
         }
+    }
+}
+
+// Private serde structs for Redfish JSON responses.
+
+#[derive(Deserialize)]
+struct RedfishSystemResp {
+    #[serde(rename = "PowerState")]
+    power_state: Option<String>,
+    #[serde(rename = "Boot")]
+    boot: Option<BootResp>,
+    #[serde(rename = "Status")]
+    status: Option<StatusResp>,
+}
+
+#[derive(Deserialize)]
+struct BootResp {
+    #[serde(rename = "BootSourceOverrideTarget")]
+    boot_source_override_target: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StatusResp {
+    #[serde(rename = "Health")]
+    health: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LogEntriesResp {
+    #[serde(rename = "Members")]
+    members: Option<Vec<LogEntryResp>>,
+}
+
+#[derive(Deserialize)]
+struct LogEntryResp {
+    #[serde(rename = "Created")]
+    created: Option<String>,
+    /// Structured ID like "Drive.1.0.DriveFault" — last segment used as event type name.
+    #[serde(rename = "MessageId")]
+    message_id: Option<String>,
+    #[serde(rename = "Severity")]
+    severity: Option<String>,
+    #[serde(rename = "Message")]
+    message: Option<String>,
+}
+
+fn parse_log_entry(entry: LogEntryResp) -> Option<RedfishRawEvent> {
+    let event_type = entry.message_id
+        .as_deref()
+        .and_then(|mid| mid.rsplit('.').next())
+        .map(|s| s.to_string())
+        .or(entry.severity)
+        .unwrap_or_else(|| "Event".into());
+    let detail = entry.message.unwrap_or_default();
+    let ts = entry.created
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        .unwrap_or_else(Utc::now);
+    Some(RedfishRawEvent { ts, event_type, detail })
+}
+
+/// Real Redfish client. Queries the BMC via read-only GETs (ADR-002).
+/// `bmc_base_url` may contain `{host}` which is replaced with the resolved host ID.
+/// For DPU entities, the host ID is resolved via `SELECT id FROM hosts WHERE dpu_id = $1`.
+/// Set `REDFISH_SKIP_TLS_VERIFY=1` for BMCs with self-signed certificates.
+pub struct RealRedfishClient {
+    http: HttpClient,
+    bmc_base_url: String,
+    pg_pool: Option<sqlx::PgPool>,
+}
+
+impl RealRedfishClient {
+    pub fn new(bmc_base_url: String, pg_pool: Option<sqlx::PgPool>) -> Self {
+        let skip_tls = std::env::var("REDFISH_SKIP_TLS_VERIFY").as_deref() == Ok("1");
+        let http = HttpClient::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .danger_accept_invalid_certs(skip_tls)
+            .build()
+            .expect("failed to build reqwest client");
+        Self {
+            http,
+            bmc_base_url: bmc_base_url.trim_end_matches('/').to_string(),
+            pg_pool,
+        }
+    }
+
+    fn bmc_url_for_host(&self, host_id: &str) -> String {
+        self.bmc_base_url.replace("{host}", host_id)
+    }
+
+    async fn resolve_host_id(&self, id: &str, id_type: &IdType) -> Result<String> {
+        if !matches!(id_type, IdType::Dpu) {
+            return Ok(id.to_string());
+        }
+        let pool = self.pg_pool.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DPU resolution requires Postgres — set NICO_POSTGRES_URL"))?;
+        let host_id: String = sqlx::query_scalar("SELECT id FROM hosts WHERE dpu_id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("DPU host lookup failed for {id}: {e}"))?;
+        Ok(host_id)
+    }
+}
+
+#[async_trait]
+impl RedfishClient for RealRedfishClient {
+    async fn query(&self, id: &str, id_type: &IdType) -> Result<RedfishData> {
+        let host_id = self.resolve_host_id(id, id_type).await?;
+        let bmc_url = self.bmc_url_for_host(&host_id);
+
+        let system: RedfishSystemResp = self.http
+            .get(format!("{bmc_url}/redfish/v1/Systems/1"))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("BMC unreachable at {bmc_url}: {e}"))?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("BMC returned error: {e}"))?
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("BMC response parse error: {e}"))?;
+
+        // Event log is optional — degrade to empty events rather than failing the whole query.
+        let events: Vec<RedfishRawEvent> = match self.http
+            .get(format!("{bmc_url}/redfish/v1/Systems/1/LogServices/Log1/Entries"))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(resp) => resp
+                .json::<LogEntriesResp>()
+                .await
+                .unwrap_or(LogEntriesResp { members: None })
+                .members
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(parse_log_entry)
+                .collect(),
+            Err(_) => vec![],
+        };
+
+        Ok(RedfishData {
+            system_state: RedfishSystemState {
+                host_id,
+                power_state: system.power_state.unwrap_or_else(|| "Unknown".into()),
+                boot_source: system.boot
+                    .and_then(|b| b.boot_source_override_target)
+                    .unwrap_or_else(|| "Unknown".into()),
+                health: system.status
+                    .and_then(|s| s.health)
+                    .unwrap_or_else(|| "Unknown".into()),
+            },
+            events,
+        })
     }
 }
 

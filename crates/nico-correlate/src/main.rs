@@ -15,7 +15,7 @@ use crate::sources::temporal_grpc::GrpcTemporalClient;
 use crate::sources::postgres::{PostgresSource, PostgresClient, PgEntityData, SqlxPostgresClient};
 use crate::sources::k8s::{K8sSource, K8sClient, K8sPodData, KubeRsK8sClient};
 use crate::sources::loki::{LokiSource, LokiClient, LokiLogLine, K8sLogStreamClient, K8sLogLine, RealLokiClient, RealK8sLogStreamClient};
-use crate::sources::redfish::{RedfishSource, RedfishClient, RedfishData};
+use crate::sources::redfish::{RedfishSource, RedfishClient, RedfishData, RealRedfishClient};
 use crate::timeline::filter_timeline;
 use crate::correlate::exit_code;
 use crate::event::Event;
@@ -143,14 +143,14 @@ impl K8sLogStreamClient for InactiveK8sLogStreamClient {
     }
 }
 
-// Real Redfish client resolves DPU entities via Postgres hosts.dpu_id, then
-// queries the host BMC with read-only GETs (ADR-002).
-struct TodoRedfishClient;
+struct InactiveRedfishClient {
+    reason: String,
+}
 
 #[async_trait]
-impl RedfishClient for TodoRedfishClient {
+impl RedfishClient for InactiveRedfishClient {
     async fn query(&self, _id: &str, _id_type: &IdType) -> Result<RedfishData> {
-        Err(anyhow::anyhow!("not implemented: real Redfish client — resolve host via Postgres hosts.dpu_id for DPU entities, query BMC GET endpoints via REDFISH_BMC_BASE_URL"))
+        Err(anyhow::anyhow!("{}", self.reason))
     }
 }
 
@@ -264,6 +264,25 @@ async fn main() {
         Err(e) => Box::new(InactiveK8sLogStreamClient { reason: format!("kubeconfig unavailable: {e}") }),
     };
 
+    let redfish_client: Box<dyn RedfishClient> = match std::env::var("REDFISH_BMC_BASE_URL") {
+        Ok(bmc_url) => {
+            let pg_pool = match std::env::var("NICO_POSTGRES_URL") {
+                Ok(pg_url) => match sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(std::time::Duration::from_secs(5))
+                    .connect(&pg_url)
+                    .await
+                {
+                    Ok(pool) => Some(pool),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            };
+            Box::new(RealRedfishClient::new(bmc_url, pg_pool))
+        }
+        Err(_) => Box::new(InactiveRedfishClient { reason: "REDFISH_BMC_BASE_URL not set".into() }),
+    };
+
     let all_sources: Vec<(&str, Box<dyn Source>)> = vec![
         ("temporal", Box::new(TemporalSource::new(temporal_client))),
         ("postgres", Box::new(PostgresSource::new(pg_client))),
@@ -274,7 +293,7 @@ async fn main() {
             cli.pod.clone(),
             since,
         ))),
-        ("redfish", Box::new(RedfishSource::new(Box::new(TodoRedfishClient)))),
+        ("redfish", Box::new(RedfishSource::new(redfish_client))),
     ];
 
     let sources: Vec<Box<dyn Source>> = if cli.sources.is_empty() {
