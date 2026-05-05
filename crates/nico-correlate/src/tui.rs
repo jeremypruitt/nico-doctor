@@ -165,6 +165,7 @@ impl IncrementalState {
         if self.has_unavailable { 2 } else { 0 }
     }
 
+    #[cfg(test)]
     fn selected(&self) -> Option<usize> {
         self.list_state.selected()
     }
