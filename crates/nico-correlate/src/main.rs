@@ -14,19 +14,18 @@ use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat, Reac
 use nico_common::output::{OutputMode, Status};
 use nico_common::reach::ReachManager;
 use crate::id::{IdType, detect_id_type};
-use crate::source::{Source, SourceResult, StateEntry};
+use crate::source::{Source, SourceResult, StateEntry, UnavailableSource};
 use crate::sources::temporal::{TemporalSource, TemporalClient};
 use crate::sources::temporal_grpc::GrpcTemporalClient;
-use crate::sources::postgres::{PostgresSource, PostgresClient, PgEntityData, SqlxPostgresClient};
-use crate::sources::k8s::{K8sSource, K8sClient, K8sPodData, KubeRsK8sClient};
-use crate::sources::loki::{LokiSource, LokiClient, LokiLogLine, K8sLogStreamClient, K8sLogLine, RealLokiClient, RealK8sLogStreamClient};
-use crate::sources::redfish::{RedfishSource, RedfishClient, RedfishData, RealRedfishClient};
+use crate::sources::postgres::{PostgresSource, SqlxPostgresClient};
+use crate::sources::k8s::{K8sSource, KubeRsK8sClient};
+use crate::sources::loki::{LokiSource, LokiClient, K8sLogStreamClient, RealLokiClient, RealK8sLogStreamClient};
+use crate::sources::redfish::{RedfishSource, RealRedfishClient};
 use crate::timeline::filter_timeline;
 use crate::correlate::exit_code;
 use crate::diagnosis::diagnose;
 use crate::event::Event;
 use anyhow::Result;
-use async_trait::async_trait;
 
 #[derive(Parser)]
 #[command(name = "nico-correlate", about = "Correlate all events for a given entity ID")]
@@ -102,72 +101,6 @@ fn parse_since(s: &str) -> Result<Duration, String> {
     Ok(total)
 }
 
-struct InactivePostgresClient {
-    reason: String,
-}
-
-#[async_trait]
-impl PostgresClient for InactivePostgresClient {
-    async fn query_entity(&self, _id: &str, _id_type: &IdType) -> Result<PgEntityData> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
-}
-
-struct InactiveK8sClient {
-    reason: String,
-}
-
-#[async_trait]
-impl K8sClient for InactiveK8sClient {
-    async fn find_pods_with_events(&self, _id: &str, _id_type: &IdType) -> Result<Vec<K8sPodData>> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
-}
-
-struct InactiveLokiClient {
-    reason: String,
-}
-
-#[async_trait]
-impl LokiClient for InactiveLokiClient {
-    async fn query_range(
-        &self,
-        _id: &str,
-        _id_type: &IdType,
-        _since: Duration,
-        _pod_pattern: Option<&str>,
-    ) -> Result<Vec<LokiLogLine>> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
-}
-
-struct InactiveK8sLogStreamClient {
-    reason: String,
-}
-
-#[async_trait]
-impl K8sLogStreamClient for InactiveK8sLogStreamClient {
-    async fn stream_logs(
-        &self,
-        _id: &str,
-        _id_type: &IdType,
-        _since: Duration,
-        _pod_pattern: Option<&str>,
-    ) -> Result<Vec<K8sLogLine>> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
-}
-
-struct InactiveRedfishClient {
-    reason: String,
-}
-
-#[async_trait]
-impl RedfishClient for InactiveRedfishClient {
-    async fn query(&self, _id: &str, _id_type: &IdType) -> Result<RedfishData> {
-        Err(anyhow::anyhow!("{}", self.reason))
-    }
-}
 
 #[derive(Serialize)]
 struct JsonDiagnosis {
@@ -384,14 +317,14 @@ async fn main() {
         config.postgres.url.clone()
     };
 
-    let pg_client: Box<dyn PostgresClient> = match SqlxPostgresClient::connect(&postgres_url).await {
-        Ok(c) => Box::new(c),
-        Err(e) => Box::new(InactivePostgresClient { reason: format!("connect failed: {e}") }),
+    let pg_source: Box<dyn Source> = match SqlxPostgresClient::connect(&postgres_url).await {
+        Ok(c) => Box::new(PostgresSource::new(Box::new(c))),
+        Err(e) => Box::new(UnavailableSource::new("postgres", format!("connect failed: {e}"))),
     };
 
-    let k8s_client: Box<dyn K8sClient> = match KubeRsK8sClient::try_default().await {
-        Ok(c) => Box::new(c),
-        Err(e) => Box::new(InactiveK8sClient { reason: format!("kubeconfig unavailable: {e}") }),
+    let k8s_source: Box<dyn Source> = match KubeRsK8sClient::try_default().await {
+        Ok(c) => Box::new(K8sSource::new(Box::new(c))),
+        Err(e) => Box::new(UnavailableSource::new("k8s", format!("kubeconfig unavailable: {e}"))),
     };
 
     let temporal_client: Box<dyn TemporalClient> = Box::new(GrpcTemporalClient::new(
@@ -400,54 +333,52 @@ async fn main() {
     ));
 
     // Loki: explicit env var wins, then reach manager discovery.
-    let loki_client: Box<dyn LokiClient> = match std::env::var("LOKI_URL") {
-        Ok(url) => Box::new(RealLokiClient::new(url)),
+    let loki_result: Result<Box<dyn LokiClient>, &'static str> = match std::env::var("LOKI_URL") {
+        Ok(url) => Ok(Box::new(RealLokiClient::new(url))),
         Err(_) => {
             if let Some(ref mgr) = reach_mgr {
                 match mgr.loki_url().await {
                     Ok((url, guard)) => {
                         _pf_guards.extend(guard);
-                        Box::new(RealLokiClient::new(url))
+                        Ok(Box::new(RealLokiClient::new(url)))
                     }
-                    Err(_) => Box::new(InactiveLokiClient {
-                        reason: "Loki service not found in namespace".into(),
-                    }),
+                    Err(_) => Err("Loki service not found in namespace"),
                 }
             } else {
-                Box::new(InactiveLokiClient { reason: "LOKI_URL not set".into() })
+                Err("LOKI_URL not set")
             }
         }
     };
 
-    let k8s_log_client: Box<dyn K8sLogStreamClient> = match kube_client_result {
-        Ok(c) => Box::new(RealK8sLogStreamClient::new(c)),
-        Err(e) => Box::new(InactiveK8sLogStreamClient { reason: format!("kubeconfig unavailable: {e}") }),
+    let k8s_log_opt: Option<Box<dyn K8sLogStreamClient>> = match kube_client_result {
+        Ok(c) => Some(Box::new(RealK8sLogStreamClient::new(c))),
+        Err(_) => None,
+    };
+
+    let loki_source: Box<dyn Source> = match loki_result {
+        Ok(loki) => Box::new(LokiSource::new(loki, k8s_log_opt, cli.pod.clone(), since)),
+        Err(reason) => Box::new(UnavailableSource::new("loki", reason)),
     };
 
     // Redfish and its BMC URL are not Config fields — read from env directly.
-    let redfish_client: Box<dyn RedfishClient> = match std::env::var("REDFISH_BMC_BASE_URL") {
+    let redfish_source: Box<dyn Source> = match std::env::var("REDFISH_BMC_BASE_URL") {
         Ok(bmc_url) => {
             let pg_pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(1)
                 .acquire_timeout(std::time::Duration::from_secs(5))
                 .connect(&config.postgres.url)
                 .await.ok();
-            Box::new(RealRedfishClient::new(bmc_url, pg_pool))
+            Box::new(RedfishSource::new(Box::new(RealRedfishClient::new(bmc_url, pg_pool))))
         }
-        Err(_) => Box::new(InactiveRedfishClient { reason: "REDFISH_BMC_BASE_URL not set".into() }),
+        Err(_) => Box::new(UnavailableSource::new("redfish", "REDFISH_BMC_BASE_URL not set")),
     };
 
     let all_sources: Vec<(&'static str, Box<dyn Source>)> = vec![
         ("temporal", Box::new(TemporalSource::new(temporal_client))),
-        ("postgres", Box::new(PostgresSource::new(pg_client))),
-        ("k8s", Box::new(K8sSource::new(k8s_client))),
-        ("loki", Box::new(LokiSource::new(
-            loki_client,
-            k8s_log_client,
-            cli.pod.clone(),
-            since,
-        ))),
-        ("redfish", Box::new(RedfishSource::new(redfish_client))),
+        ("postgres", pg_source),
+        ("k8s", k8s_source),
+        ("loki", loki_source),
+        ("redfish", redfish_source),
     ];
 
     let named_sources: Vec<(&'static str, Box<dyn Source>)> = if use_all {
