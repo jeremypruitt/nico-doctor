@@ -44,6 +44,10 @@ impl KubeRsK8sClient {
         };
         Ok(Self { client })
     }
+
+    pub fn raw_client(&self) -> &Client {
+        &self.client
+    }
 }
 
 #[async_trait]

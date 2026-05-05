@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use anyhow::Result;
 use reqwest::redirect::Policy;
 
+#[derive(Clone)]
 pub struct ServiceEndpoint {
     pub name: String,
     pub base_url: String,
