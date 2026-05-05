@@ -1,6 +1,18 @@
+use std::time::Duration;
 use chrono::Utc;
 use crate::event::{Event, Severity};
 use crate::source::StateEntry;
+
+#[derive(Clone)]
+pub struct DiagnosisConfig {
+    pub stuck_threshold: Duration,
+}
+
+impl Default for DiagnosisConfig {
+    fn default() -> Self {
+        Self { stuck_threshold: Duration::from_secs(30 * 60) }
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub struct Diagnosis {
@@ -10,18 +22,32 @@ pub struct Diagnosis {
     pub next_commands: Vec<String>,
 }
 
-pub fn diagnose(events: &[Event], state: &[StateEntry]) -> Option<Diagnosis> {
-    match_k8s_crash_loop(state)
-        .or_else(|| match_provisioning_timeout(events))
-        .or_else(|| activity_retry_exhaustion(events))
-        .or_else(|| match_stuck_workflow(events))
+const K8S_RESTART_THRESHOLD: u32 = 5;
+
+pub struct DiagnosisRule {
+    pub matcher: fn(&[Event], &[StateEntry], &DiagnosisConfig) -> Option<Diagnosis>,
 }
 
-fn match_k8s_crash_loop(state: &[StateEntry]) -> Option<Diagnosis> {
+static RULES: &[DiagnosisRule] = &[
+    DiagnosisRule { matcher: match_k8s_crash_loop },
+    DiagnosisRule { matcher: match_provisioning_timeout },
+    DiagnosisRule { matcher: activity_retry_exhaustion },
+    DiagnosisRule { matcher: match_stuck_workflow },
+];
+
+pub fn diagnose(events: &[Event], state: &[StateEntry], config: &DiagnosisConfig) -> Option<Diagnosis> {
+    RULES.iter().find_map(|rule| (rule.matcher)(events, state, config))
+}
+
+fn match_k8s_crash_loop(
+    _events: &[Event],
+    state: &[StateEntry],
+    _config: &DiagnosisConfig,
+) -> Option<Diagnosis> {
     let crash_pod = state.iter()
         .filter(|s| s.source == "k8s")
         .find(|s| {
-            s.value.starts_with("CrashLoopBackOff") || restart_count_from_value(&s.value) > 5
+            s.value.starts_with("CrashLoopBackOff") || restart_count_from_value(&s.value) > K8S_RESTART_THRESHOLD
         })?;
 
     let restart_count = restart_count_from_value(&crash_pod.value);
@@ -49,7 +75,11 @@ fn restart_count_from_value(value: &str) -> u32 {
         .unwrap_or(0)
 }
 
-fn match_provisioning_timeout(events: &[Event]) -> Option<Diagnosis> {
+fn match_provisioning_timeout(
+    events: &[Event],
+    _state: &[StateEntry],
+    _config: &DiagnosisConfig,
+) -> Option<Diagnosis> {
     let matching: Vec<&Event> = events
         .iter()
         .filter(|e| {
@@ -80,7 +110,11 @@ fn match_provisioning_timeout(events: &[Event]) -> Option<Diagnosis> {
     })
 }
 
-fn match_stuck_workflow(events: &[Event]) -> Option<Diagnosis> {
+fn match_stuck_workflow(
+    events: &[Event],
+    _state: &[StateEntry],
+    config: &DiagnosisConfig,
+) -> Option<Diagnosis> {
     let temporal_events: Vec<&Event> = events.iter().filter(|e| e.source == "temporal").collect();
 
     if temporal_events.is_empty() {
@@ -94,16 +128,19 @@ fn match_stuck_workflow(events: &[Event]) -> Option<Diagnosis> {
         return None;
     }
 
-    let threshold = Utc::now() - chrono::Duration::minutes(30);
+    let chrono_threshold = chrono::Duration::from_std(config.stuck_threshold)
+        .unwrap_or_else(|_| chrono::Duration::minutes(30));
+    let threshold = Utc::now() - chrono_threshold;
     let all_old = temporal_events.iter().all(|e| e.ts < threshold);
     if !all_old {
         return None;
     }
 
+    let minutes = config.stuck_threshold.as_secs() / 60;
     Some(Diagnosis {
         pattern: "stuck_workflow".to_string(),
         activity: "(none — workflow itself is stuck, no recent activity events)".to_string(),
-        error_signature: "no events in the last 30m; workflow still Running".to_string(),
+        error_signature: format!("no events in the last {minutes}m; workflow still Running"),
         next_commands: vec![
             "nico-doctor --skip cluster,logs,health,grpc,postgres".to_string(),
             "temporal workflow describe --workflow-id <id>".to_string(),
@@ -111,7 +148,11 @@ fn match_stuck_workflow(events: &[Event]) -> Option<Diagnosis> {
     })
 }
 
-fn activity_retry_exhaustion(events: &[Event]) -> Option<Diagnosis> {
+fn activity_retry_exhaustion(
+    events: &[Event],
+    _state: &[StateEntry],
+    _config: &DiagnosisConfig,
+) -> Option<Diagnosis> {
     let exhausted: Vec<(&str, &str)> = events
         .iter()
         .filter(|e| e.tags.get("at_max_retries").map(|v| v == "true").unwrap_or(false))
@@ -161,6 +202,15 @@ mod tests {
     use crate::event::Severity;
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
+    use std::time::Duration;
+
+    fn default_config() -> DiagnosisConfig {
+        DiagnosisConfig::default()
+    }
+
+    fn config_with_threshold_minutes(minutes: u64) -> DiagnosisConfig {
+        DiagnosisConfig { stuck_threshold: Duration::from_secs(minutes * 60) }
+    }
 
     fn failed_event(activity: &str, error: &str, at_max: bool) -> Event {
         let mut tags = HashMap::new();
@@ -207,9 +257,7 @@ mod tests {
             failed_event("FirmwareUpdate", "Redfish 503", false),
             failed_event("FirmwareUpdate", "Redfish 503", true),
         ];
-        let diag = diagnose(&events, &no_state());
-        assert!(diag.is_some());
-        let d = diag.unwrap();
+        let d = diagnose(&events, &no_state(), &default_config()).unwrap();
         assert_eq!(d.pattern, "activity_retry_exhaustion");
         assert_eq!(d.activity, "FirmwareUpdate");
         assert_eq!(d.error_signature, "Redfish 503");
@@ -219,7 +267,7 @@ mod tests {
     #[test]
     fn does_not_fire_without_activity_failures() {
         let events = vec![temporal_event_at(Utc::now().timestamp(), "WorkflowExecutionStarted")];
-        assert!(diagnose(&events, &no_state()).is_none());
+        assert!(diagnose(&events, &no_state(), &default_config()).is_none());
     }
 
     #[test]
@@ -228,7 +276,7 @@ mod tests {
             failed_event("FirmwareUpdate", "Redfish 503", false),
             failed_event("FirmwareUpdate", "Redfish 503", false),
         ];
-        assert!(diagnose(&events, &no_state()).is_none());
+        assert!(diagnose(&events, &no_state(), &default_config()).is_none());
     }
 
     #[test]
@@ -237,7 +285,7 @@ mod tests {
             failed_event("FirmwareUpdate", "Redfish 503", false),
             failed_event("FirmwareUpdate", "Timeout", true),
         ];
-        assert!(diagnose(&events, &no_state()).is_none());
+        assert!(diagnose(&events, &no_state(), &default_config()).is_none());
     }
 
     // --- stuck_workflow ---
@@ -248,9 +296,25 @@ mod tests {
             temporal_event_at(0, "WorkflowExecutionStarted"),
             temporal_event_at(60, "ActivityTaskScheduled"),
         ];
-        let d = diagnose(&events, &no_state()).unwrap();
+        let d = diagnose(&events, &no_state(), &default_config()).unwrap();
         assert_eq!(d.pattern, "stuck_workflow");
         assert_eq!(d.next_commands.len(), 2);
+    }
+
+    #[test]
+    fn stuck_workflow_uses_config_threshold() {
+        let now = Utc::now().timestamp();
+        // Events are roughly 10 minutes old
+        let ten_min_ago = now - 10 * 60;
+        let events = vec![
+            temporal_event_at(ten_min_ago - 60, "WorkflowExecutionStarted"),
+            temporal_event_at(ten_min_ago, "ActivityTaskScheduled"),
+        ];
+        // 5-minute threshold: events at 10+ min old are past it → fires
+        let d = diagnose(&events, &no_state(), &config_with_threshold_minutes(5)).unwrap();
+        assert_eq!(d.pattern, "stuck_workflow");
+        // 20-minute threshold: events at 10 min old are not old enough → silent
+        assert!(diagnose(&events, &no_state(), &config_with_threshold_minutes(20)).is_none());
     }
 
     #[test]
@@ -260,7 +324,7 @@ mod tests {
             temporal_event_at(0, "WorkflowExecutionStarted"),
             temporal_event_at(now, "ActivityTaskScheduled"),
         ];
-        assert!(diagnose(&events, &no_state()).is_none());
+        assert!(diagnose(&events, &no_state(), &default_config()).is_none());
     }
 
     #[test]
@@ -269,7 +333,7 @@ mod tests {
             temporal_event_at(0, "WorkflowExecutionStarted"),
             temporal_event_at(60, "WorkflowExecutionCompleted"),
         ];
-        assert!(diagnose(&events, &no_state()).is_none());
+        assert!(diagnose(&events, &no_state(), &default_config()).is_none());
     }
 
     #[test]
@@ -278,12 +342,12 @@ mod tests {
             temporal_event_at(0, "WorkflowExecutionStarted"),
             temporal_event_at(60, "WorkflowExecutionFailed"),
         ];
-        assert!(diagnose(&events, &no_state()).is_none());
+        assert!(diagnose(&events, &no_state(), &default_config()).is_none());
     }
 
     #[test]
     fn stuck_workflow_does_not_fire_without_temporal_events() {
-        assert!(diagnose(&[], &no_state()).is_none());
+        assert!(diagnose(&[], &no_state(), &default_config()).is_none());
     }
 
     // --- provisioning_timeout ---
@@ -294,7 +358,7 @@ mod tests {
             failed_event("ProvisionHost", "deadline exceeded", false),
             failed_event("ProvisionHost", "deadline exceeded", false),
         ];
-        let d = diagnose(&events, &no_state()).unwrap();
+        let d = diagnose(&events, &no_state(), &default_config()).unwrap();
         assert_eq!(d.pattern, "provisioning_timeout");
         assert_eq!(d.activity, "ProvisionHost");
         assert_eq!(d.next_commands.len(), 2);
@@ -306,14 +370,14 @@ mod tests {
             failed_event("provisionDpu", "timeout waiting for BMC", false),
             failed_event("provisionDpu", "timeout waiting for BMC", false),
         ];
-        let d = diagnose(&events, &no_state()).unwrap();
+        let d = diagnose(&events, &no_state(), &default_config()).unwrap();
         assert_eq!(d.pattern, "provisioning_timeout");
     }
 
     #[test]
     fn provisioning_timeout_does_not_fire_on_single_failure() {
         let events = vec![failed_event("ProvisionHost", "timeout", false)];
-        assert!(diagnose(&events, &no_state()).is_none());
+        assert!(diagnose(&events, &no_state(), &default_config()).is_none());
     }
 
     #[test]
@@ -322,7 +386,7 @@ mod tests {
             failed_event("FirmwareUpdate", "timeout", false),
             failed_event("FirmwareUpdate", "timeout", false),
         ];
-        assert!(diagnose(&events, &no_state()).is_none());
+        assert!(diagnose(&events, &no_state(), &default_config()).is_none());
     }
 
     #[test]
@@ -331,7 +395,7 @@ mod tests {
             failed_event("ProvisionHost", "Redfish 503", false),
             failed_event("ProvisionHost", "Redfish 503", false),
         ];
-        assert!(diagnose(&events, &no_state()).is_none());
+        assert!(diagnose(&events, &no_state(), &default_config()).is_none());
     }
 
     // --- k8s_crash_loop ---
@@ -339,7 +403,7 @@ mod tests {
     #[test]
     fn k8s_crash_loop_fires_on_crash_loop_back_off_status() {
         let state = vec![k8s_state("worker-xyz", "CrashLoopBackOff (3 restarts)")];
-        let d = diagnose(&[], &state).unwrap();
+        let d = diagnose(&[], &state, &default_config()).unwrap();
         assert_eq!(d.pattern, "k8s_crash_loop");
         assert!(d.error_signature.contains("worker-xyz"));
         assert_eq!(d.next_commands.len(), 2);
@@ -348,7 +412,7 @@ mod tests {
     #[test]
     fn k8s_crash_loop_fires_on_high_restart_count() {
         let state = vec![k8s_state("worker-abc", "Running (6 restarts)")];
-        let d = diagnose(&[], &state).unwrap();
+        let d = diagnose(&[], &state, &default_config()).unwrap();
         assert_eq!(d.pattern, "k8s_crash_loop");
         assert!(d.error_signature.contains("worker-abc"));
     }
@@ -356,7 +420,7 @@ mod tests {
     #[test]
     fn k8s_crash_loop_does_not_fire_on_low_restart_count() {
         let state = vec![k8s_state("worker-abc", "Running (5 restarts)")];
-        assert!(diagnose(&[], &state).is_none());
+        assert!(diagnose(&[], &state, &default_config()).is_none());
     }
 
     #[test]
@@ -366,13 +430,13 @@ mod tests {
             key: "worker-xyz".into(),
             value: "CrashLoopBackOff (3 restarts)".into(),
         }];
-        assert!(diagnose(&[], &state).is_none());
+        assert!(diagnose(&[], &state, &default_config()).is_none());
     }
 
     #[test]
     fn k8s_crash_loop_next_commands_include_pod_name() {
         let state = vec![k8s_state("my-pod-123", "CrashLoopBackOff (2 restarts)")];
-        let d = diagnose(&[], &state).unwrap();
+        let d = diagnose(&[], &state, &default_config()).unwrap();
         assert!(d.next_commands[0].contains("my-pod-123"));
         assert!(d.next_commands[1].contains("my-pod-123"));
     }
