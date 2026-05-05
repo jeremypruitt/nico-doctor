@@ -13,6 +13,7 @@ pub struct Config {
 pub struct ClusterConfig {
     pub context: Option<String>,
     pub namespace: String,
+    pub reach_mode: ReachMode,
 }
 
 pub struct PostgresConfig {
@@ -36,6 +37,35 @@ pub enum ColorMode { Auto, Always, Never }
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum OutputFormat { Human, Json }
 
+/// How the tools reach cluster services.
+///
+/// Auto-detected from `KUBERNETES_SERVICE_HOST`: present → InCluster, absent → PortForward.
+/// Override with `--mode port-forward|in-cluster` or `reach_mode` in `[cluster]` of config.toml.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum ReachMode {
+    /// Open in-process kube port-forwards for each service (laptop / CI with kubeconfig).
+    PortForward,
+    /// Use cluster-DNS `<svc>.<ns>.svc.cluster.local` directly (debug pod / in-cluster).
+    InCluster,
+}
+
+impl ReachMode {
+    pub fn auto_detect(env: &HashMap<String, String>) -> Self {
+        if env.contains_key("KUBERNETES_SERVICE_HOST") {
+            Self::InCluster
+        } else {
+            Self::PortForward
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PortForward => "port-forward",
+            Self::InCluster => "in-cluster",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ConfigOverrides {
     pub context: Option<String>,
@@ -46,6 +76,7 @@ pub struct ConfigOverrides {
     pub stuck_threshold: Option<Duration>,
     pub color: Option<ColorMode>,
     pub format: Option<OutputFormat>,
+    pub reach_mode: Option<ReachMode>,
 }
 
 /// Intermediate deserialization shape — all fields optional so missing fields fall back to defaults.
@@ -61,6 +92,7 @@ struct FileConfig {
 struct FileClusterConfig {
     context: Option<String>,
     namespace: Option<String>,
+    reach_mode: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -131,6 +163,17 @@ impl Config {
             _ => OutputFormat::Human,
         };
 
+        let reach_mode_str = env.get("NICO_REACH_MODE").cloned()
+            .or(cluster.reach_mode);
+        let reach_mode = match reach_mode_str.as_deref() {
+            Some("port-forward") => ReachMode::PortForward,
+            Some("in-cluster") => ReachMode::InCluster,
+            Some(other) => return Err(anyhow::anyhow!(
+                "invalid reach_mode {:?}; use port-forward or in-cluster", other
+            )),
+            None => ReachMode::auto_detect(env),
+        };
+
         // Flag override layer — highest precedence
         let context = overrides.context.clone().or(context);
         let namespace = overrides.namespace.clone().unwrap_or(namespace);
@@ -140,9 +183,10 @@ impl Config {
         let stuck_threshold = overrides.stuck_threshold.unwrap_or(stuck_threshold);
         let color = overrides.color.unwrap_or(color);
         let format = overrides.format.unwrap_or(format);
+        let reach_mode = overrides.reach_mode.unwrap_or(reach_mode);
 
         Ok(Config {
-            cluster: ClusterConfig { context, namespace },
+            cluster: ClusterConfig { context, namespace, reach_mode },
             postgres: PostgresConfig { url: postgres_url },
             temporal: TemporalConfig {
                 address: temporal_address,
@@ -218,5 +262,47 @@ url = "postgres://prod:secret@db:5432/prod"
         assert_eq!(config.temporal.stuck_threshold, Duration::from_secs(30 * 60));
         assert_eq!(config.output.color, ColorMode::Auto);
         assert_eq!(config.output.format, OutputFormat::Human);
+        // no KUBERNETES_SERVICE_HOST in test env → PortForward
+        assert_eq!(config.cluster.reach_mode, ReachMode::PortForward);
+    }
+
+    #[test]
+    fn reach_mode_env_override() {
+        let mut env = HashMap::new();
+        env.insert("NICO_REACH_MODE".to_string(), "in-cluster".to_string());
+        let config = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.cluster.reach_mode, ReachMode::InCluster);
+    }
+
+    #[test]
+    fn reach_mode_flag_override() {
+        let overrides = ConfigOverrides {
+            reach_mode: Some(ReachMode::InCluster),
+            ..Default::default()
+        };
+        let config = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        assert_eq!(config.cluster.reach_mode, ReachMode::InCluster);
+    }
+
+    #[test]
+    fn reach_mode_file_override() {
+        let toml = "[cluster]\nreach_mode = \"in-cluster\"";
+        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.cluster.reach_mode, ReachMode::InCluster);
+    }
+
+    #[test]
+    fn kubernetes_service_host_selects_in_cluster() {
+        let mut env = HashMap::new();
+        env.insert("KUBERNETES_SERVICE_HOST".to_string(), "10.0.0.1".to_string());
+        let config = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.cluster.reach_mode, ReachMode::InCluster);
+    }
+
+    #[test]
+    fn invalid_reach_mode_errors() {
+        let mut env = HashMap::new();
+        env.insert("NICO_REACH_MODE".to_string(), "bogus".to_string());
+        assert!(Config::load(None, &env, &ConfigOverrides::default()).is_err());
     }
 }

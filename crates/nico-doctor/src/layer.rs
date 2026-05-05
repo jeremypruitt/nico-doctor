@@ -33,6 +33,7 @@ pub struct SkippedLayer {
 }
 
 impl SkippedLayer {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(name: &'static str) -> Box<dyn Layer> {
         Box::new(Self { name })
     }
@@ -57,6 +58,7 @@ pub struct UnconfiguredLayer {
 }
 
 impl UnconfiguredLayer {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(name: &'static str, reason: impl Into<String>) -> Box<dyn Layer> {
         Box::new(Self { name, reason: reason.into() })
     }

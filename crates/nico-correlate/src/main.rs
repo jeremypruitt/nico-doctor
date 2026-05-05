@@ -9,8 +9,9 @@ mod timeline;
 use clap::Parser;
 use chrono::Duration;
 use serde::Serialize;
-use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat};
+use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat, ReachMode};
 use nico_common::output::{OutputMode, Status};
+use nico_common::reach::ReachManager;
 use crate::id::{IdType, detect_id_type};
 use crate::source::{Source, SourceResult, StateEntry};
 use crate::sources::temporal::{TemporalSource, TemporalClient};
@@ -63,6 +64,10 @@ struct Cli {
     /// Config file path (default: ~/.config/nico-tools/config.toml)
     #[arg(long, value_name = "PATH")]
     config: Option<String>,
+
+    /// Reach mode: port-forward or in-cluster (default: auto-detect from KUBERNETES_SERVICE_HOST)
+    #[arg(long, value_name = "MODE")]
+    mode: Option<String>,
 }
 
 fn parse_since(s: &str) -> Result<Duration, String> {
@@ -237,9 +242,21 @@ async fn main() {
         });
     let file_toml = std::fs::read_to_string(&config_path).ok();
 
+    // Parse --mode flag into a ReachMode override.
+    let mode_override = match cli.mode.as_deref() {
+        Some("port-forward") => Some(ReachMode::PortForward),
+        Some("in-cluster") => Some(ReachMode::InCluster),
+        Some(other) => {
+            eprintln!("error: unknown --mode {other:?}; use port-forward or in-cluster");
+            std::process::exit(1);
+        }
+        None => None,
+    };
+
     let overrides = ConfigOverrides {
         color: if cli.no_color { Some(ColorMode::Never) } else { None },
         format: if cli.json { Some(OutputFormat::Json) } else { None },
+        reach_mode: mode_override,
         ..Default::default()
     };
 
@@ -251,6 +268,16 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    let reach_mode = config.cluster.reach_mode;
+    eprintln!(
+        "nico: reach mode: {} ({})",
+        reach_mode.as_str(),
+        if mode_override.is_some() { "--mode flag" }
+        else if env.contains_key("NICO_REACH_MODE") { "NICO_REACH_MODE" }
+        else if env.contains_key("KUBERNETES_SERVICE_HOST") { "auto-detected: in-cluster" }
+        else { "auto-detected: no KUBERNETES_SERVICE_HOST" }
+    );
 
     let since = match parse_since(&cli.since) {
         Ok(d) => d,
@@ -312,7 +339,50 @@ async fn main() {
     }
     let id_type = id_type.unwrap();
 
-    let pg_client: Box<dyn PostgresClient> = match SqlxPostgresClient::connect(&config.postgres.url).await {
+    // Build raw kube client once; share across k8s source, log stream, and reach manager.
+    let kube_client_result = kube::Client::try_default().await;
+
+    let reach_mgr: Option<ReachManager> = match kube_client_result.as_ref() {
+        Ok(c) => Some(ReachManager::new(reach_mode, c.clone(), config.cluster.namespace.clone())),
+        Err(_) => None,
+    };
+
+    // Port-forward guards — kept alive until after all sources have been collected.
+    let mut _pf_guards: Vec<nico_common::reach::ForwardedEndpoint> = vec![];
+
+    // --- Temporal address ---
+    let temporal_address = if let Some(ref mgr) = reach_mgr {
+        match mgr.temporal_address().await {
+            Ok((addr, guard)) => {
+                _pf_guards.extend(guard);
+                addr
+            }
+            Err(e) => {
+                eprintln!("nico: warn: temporal port-forward failed ({e}); using config address");
+                config.temporal.address.clone()
+            }
+        }
+    } else {
+        config.temporal.address.clone()
+    };
+
+    // --- Postgres URL ---
+    let postgres_url = if let Some(ref mgr) = reach_mgr {
+        match mgr.postgres_url(&config.postgres.url).await {
+            Ok((url, guard)) => {
+                _pf_guards.extend(guard);
+                url
+            }
+            Err(e) => {
+                eprintln!("nico: warn: postgres port-forward failed ({e}); using config URL");
+                config.postgres.url.clone()
+            }
+        }
+    } else {
+        config.postgres.url.clone()
+    };
+
+    let pg_client: Box<dyn PostgresClient> = match SqlxPostgresClient::connect(&postgres_url).await {
         Ok(c) => Box::new(c),
         Err(e) => Box::new(InactivePostgresClient { reason: format!("connect failed: {e}") }),
     };
@@ -323,17 +393,31 @@ async fn main() {
     };
 
     let temporal_client: Box<dyn TemporalClient> = Box::new(GrpcTemporalClient::new(
-        config.temporal.address.clone(),
+        temporal_address,
         config.temporal.namespace.clone(),
     ));
 
-    // Loki URL is not a Config field — read from env directly.
+    // Loki: explicit env var wins, then reach manager discovery.
     let loki_client: Box<dyn LokiClient> = match std::env::var("LOKI_URL") {
         Ok(url) => Box::new(RealLokiClient::new(url)),
-        Err(_) => Box::new(InactiveLokiClient { reason: "LOKI_URL not set".into() }),
+        Err(_) => {
+            if let Some(ref mgr) = reach_mgr {
+                match mgr.loki_url().await {
+                    Ok((url, guard)) => {
+                        _pf_guards.extend(guard);
+                        Box::new(RealLokiClient::new(url))
+                    }
+                    Err(_) => Box::new(InactiveLokiClient {
+                        reason: "Loki service not found in namespace".into(),
+                    }),
+                }
+            } else {
+                Box::new(InactiveLokiClient { reason: "LOKI_URL not set".into() })
+            }
+        }
     };
 
-    let k8s_log_client: Box<dyn K8sLogStreamClient> = match kube::Client::try_default().await {
+    let k8s_log_client: Box<dyn K8sLogStreamClient> = match kube_client_result {
         Ok(c) => Box::new(RealK8sLogStreamClient::new(c)),
         Err(e) => Box::new(InactiveK8sLogStreamClient { reason: format!("kubeconfig unavailable: {e}") }),
     };
@@ -378,6 +462,9 @@ async fn main() {
     for source in &sources {
         all_results.push(source.collect(&cli.id, &id_type).await);
     }
+
+    // Port-forward guards can be dropped once all source data has been collected.
+    drop(_pf_guards);
 
     let events: Vec<Event> = all_results.iter()
         .filter_map(|r| if let SourceResult::Output(o) = r { Some(o.events.clone()) } else { None })

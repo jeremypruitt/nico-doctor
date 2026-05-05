@@ -43,6 +43,7 @@ impl KubeRsK8sClient {
         let client = Client::try_default().await?;
         Ok(Self { client })
     }
+
 }
 
 #[async_trait]
