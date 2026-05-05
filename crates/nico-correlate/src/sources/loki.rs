@@ -138,12 +138,7 @@ struct LokiStream {
 }
 
 fn loki_label_query(id: &str, id_type: &IdType, pod_pattern: Option<&str>) -> String {
-    let label_key = match id_type {
-        IdType::Workflow => "workflow_id",
-        IdType::Host => "host_id",
-        IdType::Dpu => "dpu_id",
-        IdType::Request => "request_id",
-    };
+    let label_key = id_type.label_key();
     let mut q = format!("{{{label_key}=\"{id}\"");
     if let Some(pattern) = pod_pattern {
         let rx = pattern.replace('*', ".*");
@@ -251,13 +246,7 @@ impl K8sLogStreamClient for RealK8sLogStreamClient {
         since: Duration,
         pod_pattern: Option<&str>,
     ) -> Result<Vec<K8sLogLine>> {
-        let label_key = match id_type {
-            IdType::Workflow => "workflow_id",
-            IdType::Host => "host_id",
-            IdType::Dpu => "dpu_id",
-            IdType::Request => "request_id",
-        };
-        let label_selector = format!("{label_key}={id}");
+        let label_selector = format!("{}={id}", id_type.label_key());
 
         let pods: Api<Pod> = Api::all(self.client.clone());
         let pod_list = pods
