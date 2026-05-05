@@ -456,7 +456,7 @@ async fn main() {
         Err(_) => Box::new(InactiveRedfishClient { reason: "REDFISH_BMC_BASE_URL not set".into() }),
     };
 
-    let all_sources: Vec<(&str, Box<dyn Source>)> = vec![
+    let all_sources: Vec<(&'static str, Box<dyn Source>)> = vec![
         ("temporal", Box::new(TemporalSource::new(temporal_client))),
         ("postgres", Box::new(PostgresSource::new(pg_client))),
         ("k8s", Box::new(K8sSource::new(k8s_client))),
@@ -469,18 +469,59 @@ async fn main() {
         ("redfish", Box::new(RedfishSource::new(redfish_client))),
     ];
 
-    let sources: Vec<Box<dyn Source>> = if use_all {
-        all_sources.into_iter().map(|(_, s)| s).collect()
+    let named_sources: Vec<(&'static str, Box<dyn Source>)> = if use_all {
+        all_sources
     } else {
         all_sources
             .into_iter()
             .filter(|(name, _)| cli.sources.iter().any(|s| s == name))
-            .map(|(_, s)| s)
             .collect()
     };
 
+    let mode = OutputMode {
+        color: match config.output.color {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => std::env::var("NO_COLOR").is_err(),
+        },
+        ascii: cli.ascii,
+    };
+
+    // --- TUI mode: render immediately, stream source results as they arrive ---
+    if cli.tui {
+        let source_names: Vec<&'static str> = named_sources.iter().map(|(n, _)| *n).collect();
+        let (tx, rx) = std::sync::mpsc::channel::<tui::TuiUpdate>();
+        let tui_config = tui::TuiConfig {
+            id: cli.id.clone(),
+            source_names,
+            restricted: restricted_names.iter().map(|s| s.to_string()).collect(),
+        };
+        let id_clone = cli.id.clone();
+        let id_type_clone = id_type.clone();
+        let mut join_set = tokio::task::JoinSet::new();
+        for (name, source) in named_sources {
+            let tx = tx.clone();
+            let id = id_clone.clone();
+            let idt = id_type_clone.clone();
+            join_set.spawn(async move {
+                let result = source.collect(&id, &idt).await;
+                let _ = tx.send(tui::TuiUpdate::SourceDone { name: name.to_string(), result });
+            });
+        }
+        drop(tx); // rx signals EOF when all tasks have sent their result and dropped their tx clone
+        let ctx = tui::TuiContext { mode };
+        let tui_exit = tokio::task::block_in_place(|| {
+            tui::run_tui_incremental(tui_config, rx, ctx)
+        });
+        // Wait for any tasks that outlived the TUI (user quit early).
+        while join_set.join_next().await.is_some() {}
+        drop(_pf_guards);
+        std::process::exit(tui_exit);
+    }
+
+    // --- Non-TUI path: collect sources sequentially ---
     let mut all_results: Vec<SourceResult> = Vec::new();
-    for source in &sources {
+    for (_, source) in &named_sources {
         all_results.push(source.collect(&cli.id, &id_type).await);
     }
 
@@ -505,31 +546,6 @@ async fn main() {
     let diag = diagnose(&filtered, &state);
 
     let code = exit_code(Some(&id_type), &all_results);
-
-    let mode = OutputMode {
-        color: match config.output.color {
-            ColorMode::Always => true,
-            ColorMode::Never => false,
-            ColorMode::Auto => std::env::var("NO_COLOR").is_err(),
-        },
-        ascii: cli.ascii,
-    };
-
-    if cli.tui {
-        let output = tui::CorrelateOutput {
-            id: cli.id.clone(),
-            id_type: id_type_str(&id_type).to_string(),
-            events: filtered,
-            state,
-            diagnosis: diag,
-            restricted: restricted_names.iter().map(|s| s.to_string()).collect(),
-            unavailable: unavailable.iter().map(|s| s.to_string()).collect(),
-            exit_code: code,
-        };
-        let ctx = tui::TuiContext { mode };
-        let exit = tui::run_tui(output, ctx);
-        std::process::exit(exit);
-    }
 
     if matches!(config.output.format, OutputFormat::Json) {
         let out = JsonOutput {
