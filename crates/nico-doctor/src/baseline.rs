@@ -4,6 +4,41 @@ use crate::runner::Report;
 
 pub type Baseline = HashMap<String, String>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delta {
+    New,
+    Fixed,
+    Unchanged,
+}
+
+pub fn compute_deltas(report: &Report, baseline: Option<&Baseline>) -> HashMap<String, Delta> {
+    let Some(baseline) = baseline else {
+        return report.layers.iter()
+            .map(|l| (l.name.to_string(), Delta::Unchanged))
+            .collect();
+    };
+
+    report.layers.iter().map(|l| {
+        let delta = match baseline.get(l.name) {
+            None => Delta::Unchanged,
+            Some(prev) => {
+                let prev_bad = matches!(prev.as_str(), "warn" | "fail");
+                let now_bad = matches!(l.status, Status::Warn | Status::Fail);
+                let prev_ok = matches!(prev.as_str(), "ok" | "skipped");
+                let now_ok = matches!(l.status, Status::Ok | Status::Skipped);
+                if prev_ok && now_bad {
+                    Delta::New
+                } else if prev_bad && now_ok {
+                    Delta::Fixed
+                } else {
+                    Delta::Unchanged
+                }
+            }
+        };
+        (l.name.to_string(), delta)
+    }).collect()
+}
+
 fn status_str(status: &Status) -> &'static str {
     match status {
         Status::Ok => "ok",
@@ -180,6 +215,78 @@ mod tests {
             save_to(&path, &report);
         }
         assert!(!path.exists(), "baseline must not be written on exit code 3");
+    }
+
+    // ── delta computation tests ───────────────────────────────────────────────
+
+    #[test]
+    fn delta_new_when_ok_becomes_warn() {
+        let report = make_report(&[("logs", Status::Warn)]);
+        let mut baseline = Baseline::new();
+        baseline.insert("logs".into(), "ok".into());
+        let deltas = compute_deltas(&report, Some(&baseline));
+        assert_eq!(deltas["logs"], Delta::New);
+    }
+
+    #[test]
+    fn delta_new_when_skipped_becomes_fail() {
+        let report = make_report(&[("cluster", Status::Fail)]);
+        let mut baseline = Baseline::new();
+        baseline.insert("cluster".into(), "skipped".into());
+        let deltas = compute_deltas(&report, Some(&baseline));
+        assert_eq!(deltas["cluster"], Delta::New);
+    }
+
+    #[test]
+    fn delta_fixed_when_warn_becomes_ok() {
+        let report = make_report(&[("logs", Status::Ok)]);
+        let mut baseline = Baseline::new();
+        baseline.insert("logs".into(), "warn".into());
+        let deltas = compute_deltas(&report, Some(&baseline));
+        assert_eq!(deltas["logs"], Delta::Fixed);
+    }
+
+    #[test]
+    fn delta_fixed_when_fail_becomes_skipped() {
+        let report = make_report(&[("grpc", Status::Skipped)]);
+        let mut baseline = Baseline::new();
+        baseline.insert("grpc".into(), "fail".into());
+        let deltas = compute_deltas(&report, Some(&baseline));
+        assert_eq!(deltas["grpc"], Delta::Fixed);
+    }
+
+    #[test]
+    fn delta_unchanged_when_status_stays_ok() {
+        let report = make_report(&[("cluster", Status::Ok)]);
+        let mut baseline = Baseline::new();
+        baseline.insert("cluster".into(), "ok".into());
+        let deltas = compute_deltas(&report, Some(&baseline));
+        assert_eq!(deltas["cluster"], Delta::Unchanged);
+    }
+
+    #[test]
+    fn delta_unchanged_when_status_stays_warn() {
+        let report = make_report(&[("logs", Status::Warn)]);
+        let mut baseline = Baseline::new();
+        baseline.insert("logs".into(), "warn".into());
+        let deltas = compute_deltas(&report, Some(&baseline));
+        assert_eq!(deltas["logs"], Delta::Unchanged);
+    }
+
+    #[test]
+    fn delta_unchanged_when_no_baseline() {
+        let report = make_report(&[("cluster", Status::Warn), ("logs", Status::Ok)]);
+        let deltas = compute_deltas(&report, None);
+        assert_eq!(deltas["cluster"], Delta::Unchanged);
+        assert_eq!(deltas["logs"], Delta::Unchanged);
+    }
+
+    #[test]
+    fn delta_unchanged_when_layer_not_in_baseline() {
+        let report = make_report(&[("newlayer", Status::Ok)]);
+        let baseline = Baseline::new();
+        let deltas = compute_deltas(&report, Some(&baseline));
+        assert_eq!(deltas["newlayer"], Delta::Unchanged);
     }
 
     #[test]

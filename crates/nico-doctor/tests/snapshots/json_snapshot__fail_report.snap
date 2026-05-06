@@ -17,6 +17,7 @@ expression: v
           "value": "core /healthz failed"
         }
       ],
+      "delta": "unchanged",
       "duration_ms": 42,
       "name": "health",
       "status": "fail"
@@ -29,6 +30,7 @@ expression: v
           "value": "unreachable"
         }
       ],
+      "delta": "unchanged",
       "duration_ms": 42,
       "name": "grpc",
       "status": "fail"

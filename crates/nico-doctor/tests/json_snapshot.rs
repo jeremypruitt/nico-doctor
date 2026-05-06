@@ -1,7 +1,13 @@
+use std::collections::HashMap;
 use nico_common::output::Status;
+use nico_doctor::baseline::Delta;
 use nico_doctor::formatter::format_json;
 use nico_doctor::layer::{Check, LayerResult};
 use nico_doctor::runner::Report;
+
+fn no_deltas() -> HashMap<String, Delta> {
+    HashMap::new()
+}
 
 fn ok_check(name: &'static str, value: &str) -> Check {
     Check { name, status: Status::Ok, value: value.to_string(), next_command: None }
@@ -57,7 +63,7 @@ fn all_ok_report() -> Report {
 #[test]
 fn all_ok() {
     let report = all_ok_report();
-    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
     insta::assert_json_snapshot!(v);
 }
 
@@ -75,7 +81,7 @@ fn warn_only() {
             ]),
         ],
     };
-    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "staging", serde_json::json!({"ok": true}))).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "staging", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
     insta::assert_json_snapshot!(v);
 }
 
@@ -92,7 +98,7 @@ fn fail_report() {
             ]),
         ],
     };
-    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "prod", serde_json::json!({"ok": true}))).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "prod", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
     insta::assert_json_snapshot!(v);
 }
 
@@ -106,7 +112,7 @@ fn skipped_layer() {
             layer_from_checks("postgres", vec![ok_check("pool", "pool 5/20 in-use")]),
         ],
     };
-    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
     insta::assert_json_snapshot!(v);
 }
 
@@ -119,6 +125,6 @@ fn unknown_timeout_layer() {
             unknown_timeout("grpc"),
         ],
     };
-    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
     insta::assert_json_snapshot!(v);
 }

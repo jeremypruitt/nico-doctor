@@ -56,6 +56,9 @@ struct Cli {
     #[arg(short, long, help = "Show details for passing checks")]
     verbose: bool,
 
+    #[arg(long, help = "Show only layers with warn/fail status or a new/fixed delta badge")]
+    spotlight: bool,
+
     #[arg(long, help = "ASCII-only output")]
     ascii: bool,
 
@@ -335,7 +338,7 @@ async fn main() {
     };
 
     // Read prior baseline before layers run; missing file is a no-op.
-    let _baseline = baseline::load();
+    let baseline = baseline::load();
 
     let mut layers: Vec<Box<dyn layer::Layer>> = vec![];
 
@@ -479,10 +482,12 @@ async fn main() {
         baseline::save(&report);
     }
 
+    let deltas = baseline::compute_deltas(&report, baseline.as_ref());
+
     if matches!(config.output.format, OutputFormat::Json) {
-        println!("{}", formatter::format_json(&report, &config.cluster.namespace, preflight::ok_section()));
+        println!("{}", formatter::format_json(&report, &config.cluster.namespace, preflight::ok_section(), &deltas));
     } else {
-        print!("{}", formatter::format_report(&report, &mode, cli.verbose));
+        print!("{}", formatter::format_report(&report, &mode, cli.verbose, &deltas, cli.spotlight));
     }
 
     process::exit(code);
