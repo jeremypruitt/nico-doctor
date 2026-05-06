@@ -422,13 +422,20 @@ async fn main() {
                 }
             }
             "grpc" => {
-                // Prefer explicit NICO_GRPC_ADDRESS; fall back to resolved temporal address.
-                let grpc_addr = std::env::var("NICO_GRPC_ADDRESS")
-                    .unwrap_or_else(|_| temporal_address.clone());
-                layers.push(Box::new(layers::grpc::GrpcLayer::new(
-                    Arc::new(grpc::TonicGrpcInspector),
-                    grpc_addr,
-                )));
+                match config.cluster.grpc_address.clone() {
+                    Some(addr) => {
+                        layers.push(Box::new(layers::grpc::GrpcLayer::new(
+                            Arc::new(grpc::TonicGrpcInspector),
+                            addr,
+                        )));
+                    }
+                    None => {
+                        layers.push(layer::UnconfiguredLayer::new(
+                            "grpc",
+                            "set NICO_GRPC_ADDRESS or cluster.grpc_address in config to enable",
+                        ));
+                    }
+                }
             }
             "postgres" => {
                 match postgres::SqlxPostgresClient::new(&postgres_url) {

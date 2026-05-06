@@ -14,6 +14,7 @@ pub struct ClusterConfig {
     pub context: Option<String>,
     pub namespace: String,
     pub reach_mode: ReachMode,
+    pub grpc_address: Option<String>,
 }
 
 pub struct PostgresConfig {
@@ -95,6 +96,7 @@ struct FileClusterConfig {
     context: Option<String>,
     namespace: Option<String>,
     reach_mode: Option<String>,
+    grpc_address: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -184,6 +186,8 @@ impl Config {
             None => ReachMode::auto_detect(env),
         };
 
+        let grpc_address = env.get("NICO_GRPC_ADDRESS").cloned().or(cluster.grpc_address);
+
         // Flag override layer — highest precedence
         let context = overrides.context.clone().or(context);
         let namespace = overrides.namespace.clone().unwrap_or(namespace);
@@ -197,7 +201,7 @@ impl Config {
         let tui_refresh = overrides.tui_refresh.unwrap_or(tui_refresh);
 
         Ok(Config {
-            cluster: ClusterConfig { context, namespace, reach_mode },
+            cluster: ClusterConfig { context, namespace, reach_mode, grpc_address },
             postgres: PostgresConfig { url: postgres_url },
             temporal: TemporalConfig {
                 address: temporal_address,
@@ -345,5 +349,44 @@ url = "postgres://prod:secret@db:5432/prod"
         };
         let config = Config::load(Some(toml), &env, &overrides).unwrap();
         assert_eq!(config.output.tui_refresh, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn grpc_address_defaults_to_none() {
+        let config = Config::load(None, &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        assert!(config.cluster.grpc_address.is_none());
+    }
+
+    #[test]
+    fn grpc_address_from_env() {
+        let mut env = HashMap::new();
+        env.insert("NICO_GRPC_ADDRESS".to_string(), "carbide-api:1079".to_string());
+        let config = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.cluster.grpc_address.as_deref(), Some("carbide-api:1079"));
+    }
+
+    #[test]
+    fn grpc_address_from_file() {
+        let toml = "[cluster]\ngrpc_address = \"carbide-api:1079\"";
+        let config = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.cluster.grpc_address.as_deref(), Some("carbide-api:1079"));
+    }
+
+    #[test]
+    fn grpc_address_env_overrides_file() {
+        let toml = "[cluster]\ngrpc_address = \"from-file:1079\"";
+        let mut env = HashMap::new();
+        env.insert("NICO_GRPC_ADDRESS".to_string(), "from-env:1079".to_string());
+        let config = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.cluster.grpc_address.as_deref(), Some("from-env:1079"));
+    }
+
+    #[test]
+    fn grpc_address_independent_from_temporal_address() {
+        let mut env = HashMap::new();
+        env.insert("NICO_TEMPORAL_ADDRESS".to_string(), "temporal:7233".to_string());
+        let config = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        assert!(config.cluster.grpc_address.is_none());
+        assert_eq!(config.temporal.address, "temporal:7233");
     }
 }
