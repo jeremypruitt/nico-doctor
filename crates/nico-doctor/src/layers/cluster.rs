@@ -1,7 +1,9 @@
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use nico_common::k8s::{K8sClient, PodScope, RawEvent, RawPod};
 use nico_common::output::Status;
-use crate::k8s::K8sClient;
 use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
 
 pub struct ClusterLayer {
@@ -21,18 +23,42 @@ impl Layer for ClusterLayer {
     }
 
     async fn collect(&self, opts: &RunOpts) -> LayerOutcome {
-        let all_pods = self.k8s.list_pods(&opts.namespace).await.unwrap_or_default();
-        let events = self.k8s.list_events(&opts.namespace, opts.since).await.unwrap_or_default();
-        let pods: Vec<_> = all_pods.into_iter().filter(|p| !p.succeeded).collect();
-        LayerOutcome::Checks(checks_from(&pods, &events, &opts.namespace))
+        let all_pods = self
+            .k8s
+            .list_pods(PodScope::Namespace(&opts.namespace))
+            .await
+            .unwrap_or_default();
+        let raw_events = self
+            .k8s
+            .list_events(&opts.namespace, None)
+            .await
+            .unwrap_or_default();
+        let warning_events = filter_warning_events(&raw_events, SystemTime::now(), opts.since);
+        let pods: Vec<&RawPod> = all_pods.iter().filter(|p| !p.succeeded).collect();
+        LayerOutcome::Checks(checks_from(&pods, &warning_events, &opts.namespace))
     }
 }
 
-fn checks_from(pods: &[crate::k8s::PodInfo], events: &[crate::k8s::EventInfo], namespace: &str) -> Vec<Check> {
+fn filter_warning_events(
+    events: &[RawEvent],
+    now: SystemTime,
+    since: Duration,
+) -> Vec<&RawEvent> {
+    let now_dt: DateTime<Utc> = now.into();
+    let cutoff = now_dt
+        - chrono::Duration::from_std(since).unwrap_or_else(|_| chrono::Duration::hours(24));
+    events
+        .iter()
+        .filter(|e| e.event_type.as_deref() == Some("Warning"))
+        .filter(|e| e.ts.map(|t| t >= cutoff).unwrap_or(false))
+        .collect()
+}
+
+fn checks_from(pods: &[&RawPod], warning_events: &[&RawEvent], namespace: &str) -> Vec<Check> {
     let total = pods.len();
     let ready = pods.iter().filter(|p| p.ready).count();
     let restarts: u32 = pods.iter().map(|p| p.restart_count).sum();
-    let warn_events = events.len();
+    let warn_events = warning_events.len();
 
     let pods_status = if ready == total { Status::Ok } else { Status::Warn };
     let restart_status = if restarts == 0 { Status::Ok } else { Status::Warn };
@@ -78,19 +104,37 @@ fn checks_from(pods: &[crate::k8s::PodInfo], events: &[crate::k8s::EventInfo], n
 mod tests {
     use super::*;
     use std::time::Duration;
-    use anyhow::Result;
-    use async_trait::async_trait;
+    use nico_common::k8s::testing::MockK8sClient;
     use nico_common::output::Status;
-    use crate::k8s::{EventInfo, PodInfo};
     use crate::layer::LayerResult;
+
+    fn pod(name: &str, ready: bool, restart_count: u32, succeeded: bool) -> RawPod {
+        RawPod {
+            name: name.into(),
+            namespace: "nico".into(),
+            phase: None,
+            ready,
+            restart_count,
+            succeeded,
+            crash_loop: false,
+        }
+    }
+
+    fn warning_event(reason: &str) -> RawEvent {
+        RawEvent {
+            ts: Some(Utc::now()),
+            event_type: Some("Warning".into()),
+            reason: Some(reason.into()),
+            message: Some(reason.into()),
+        }
+    }
 
     #[test]
     fn checks_from_all_healthy_returns_three_ok_checks() {
-        let pods = vec![
-            PodInfo { name: "core-abc".into(), ready: true, restart_count: 0, succeeded: false },
-            PodInfo { name: "rest-xyz".into(), ready: true, restart_count: 0, succeeded: false },
-        ];
-        let events: Vec<EventInfo> = vec![];
+        let p1 = pod("core-abc", true, 0, false);
+        let p2 = pod("rest-xyz", true, 0, false);
+        let pods = vec![&p1, &p2];
+        let events: Vec<&RawEvent> = vec![];
         let checks = checks_from(&pods, &events, "nico");
         assert_eq!(checks.len(), 3);
         assert!(checks.iter().all(|c| c.status == Status::Ok));
@@ -98,46 +142,43 @@ mod tests {
 
     #[test]
     fn checks_from_not_ready_pod_and_warning_event_returns_warn_statuses() {
-        let pods = vec![
-            PodInfo { name: "core-abc".into(), ready: false, restart_count: 2, succeeded: false },
-        ];
-        let events = vec![
-            EventInfo { message: "OOMKilled".into(), reason: "OOMKilling".into() },
-        ];
+        let p1 = pod("core-abc", false, 2, false);
+        let pods = vec![&p1];
+        let e1 = warning_event("OOMKilling");
+        let events = vec![&e1];
         let checks = checks_from(&pods, &events, "nico");
         assert_eq!(checks.len(), 3);
-        let pods_check = checks.iter().find(|c| c.name == "pods_ready").unwrap();
-        let restart_check = checks.iter().find(|c| c.name == "recent_restarts").unwrap();
-        let events_check = checks.iter().find(|c| c.name == "warning_events").unwrap();
-        assert_eq!(pods_check.status, Status::Warn);
-        assert_eq!(restart_check.status, Status::Warn);
-        assert_eq!(events_check.status, Status::Warn);
+        assert!(checks.iter().all(|c| c.status == Status::Warn));
     }
 
-    struct MockK8sClient {
-        pods: Vec<PodInfo>,
-        events: Vec<EventInfo>,
-    }
-
-    #[async_trait]
-    impl K8sClient for MockK8sClient {
-        async fn list_pods(&self, _namespace: &str) -> Result<Vec<PodInfo>> {
-            Ok(self.pods.iter().map(|p| PodInfo {
-                name: p.name.clone(),
-                ready: p.ready,
-                restart_count: p.restart_count,
-                succeeded: p.succeeded,
-            }).collect())
-        }
-        async fn list_events(&self, _namespace: &str, _since: Duration) -> Result<Vec<EventInfo>> {
-            Ok(self.events.iter().map(|e| EventInfo {
-                message: e.message.clone(),
-                reason: e.reason.clone(),
-            }).collect())
-        }
-        async fn pod_logs(&self, _namespace: &str, _pod: &str, _since: Duration) -> Result<Vec<String>> {
-            Ok(vec![])
-        }
+    #[test]
+    fn filter_warning_events_drops_normal_events_and_old_events() {
+        let now = SystemTime::now();
+        let recent: DateTime<Utc> = now.into();
+        let old = recent - chrono::Duration::hours(48);
+        let events = vec![
+            RawEvent {
+                ts: Some(recent),
+                event_type: Some("Warning".into()),
+                reason: Some("OOM".into()),
+                message: None,
+            },
+            RawEvent {
+                ts: Some(recent),
+                event_type: Some("Normal".into()),
+                reason: None,
+                message: None,
+            },
+            RawEvent {
+                ts: Some(old),
+                event_type: Some("Warning".into()),
+                reason: None,
+                message: None,
+            },
+        ];
+        let filtered = filter_warning_events(&events, now, Duration::from_secs(600));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].reason.as_deref(), Some("OOM"));
     }
 
     fn opts() -> RunOpts {
@@ -149,26 +190,30 @@ mod tests {
     }
 
     fn check_value<'a>(result: &'a LayerResult, name: &str) -> &'a str {
-        result.checks.iter().find(|c| c.name == name)
+        result
+            .checks
+            .iter()
+            .find(|c| c.name == name)
             .map(|c| c.value.as_str())
             .unwrap_or_else(|| panic!("check '{name}' not found"))
     }
 
     fn check_status<'a>(result: &'a LayerResult, name: &str) -> &'a Status {
-        result.checks.iter().find(|c| c.name == name)
+        result
+            .checks
+            .iter()
+            .find(|c| c.name == name)
             .map(|c| &c.status)
             .unwrap_or_else(|| panic!("check '{name}' not found"))
     }
 
     #[tokio::test]
     async fn warning_events_report_warn() {
-        let client = Arc::new(MockK8sClient {
-            pods: vec![PodInfo { name: "core-abc".into(), ready: true, restart_count: 0, succeeded: false }],
-            events: vec![
-                EventInfo { message: "OOMKilled".into(), reason: "OOMKilling".into() },
-                EventInfo { message: "Backoff".into(), reason: "BackOff".into() },
-            ],
-        });
+        let client = Arc::new(
+            MockK8sClient::new()
+                .with_pods(vec![pod("core-abc", true, 0, false)])
+                .with_events(vec![warning_event("OOMKilling"), warning_event("BackOff")]),
+        );
         let result = ClusterLayer::new(client).run(&opts()).await;
         assert_eq!(result.status, Status::Warn);
         assert_eq!(check_value(&result, "warning_events"), "2");
@@ -178,13 +223,10 @@ mod tests {
 
     #[tokio::test]
     async fn pod_with_recent_restarts_reports_warn() {
-        let client = Arc::new(MockK8sClient {
-            pods: vec![
-                PodInfo { name: "core-abc".into(), ready: true, restart_count: 3, succeeded: false },
-                PodInfo { name: "rest-xyz".into(), ready: true, restart_count: 0, succeeded: false },
-            ],
-            events: vec![],
-        });
+        let client = Arc::new(MockK8sClient::new().with_pods(vec![
+            pod("core-abc", true, 3, false),
+            pod("rest-xyz", true, 0, false),
+        ]));
         let result = ClusterLayer::new(client).run(&opts()).await;
         assert_eq!(result.status, Status::Warn);
         assert_eq!(check_value(&result, "recent_restarts"), "3");
@@ -194,30 +236,28 @@ mod tests {
 
     #[tokio::test]
     async fn pod_not_ready_reports_warn() {
-        let client = Arc::new(MockK8sClient {
-            pods: vec![
-                PodInfo { name: "core-abc".into(), ready: true, restart_count: 0, succeeded: false },
-                PodInfo { name: "rest-xyz".into(), ready: false, restart_count: 0, succeeded: false },
-            ],
-            events: vec![],
-        });
+        let client = Arc::new(MockK8sClient::new().with_pods(vec![
+            pod("core-abc", true, 0, false),
+            pod("rest-xyz", false, 0, false),
+        ]));
         let result = ClusterLayer::new(client).run(&opts()).await;
         assert_eq!(result.status, Status::Warn);
         assert_eq!(check_value(&result, "pods_ready"), "1/2");
         assert_eq!(check_status(&result, "pods_ready"), &Status::Warn);
-        assert!(result.checks.iter().find(|c| c.name == "pods_ready")
-            .and_then(|c| c.next_command.as_deref()).is_some());
+        assert!(result
+            .checks
+            .iter()
+            .find(|c| c.name == "pods_ready")
+            .and_then(|c| c.next_command.as_deref())
+            .is_some());
     }
 
     #[tokio::test]
     async fn all_pods_ready_no_issues_reports_ok() {
-        let client = Arc::new(MockK8sClient {
-            pods: vec![
-                PodInfo { name: "core-abc".into(), ready: true, restart_count: 0, succeeded: false },
-                PodInfo { name: "rest-xyz".into(), ready: true, restart_count: 0, succeeded: false },
-            ],
-            events: vec![],
-        });
+        let client = Arc::new(MockK8sClient::new().with_pods(vec![
+            pod("core-abc", true, 0, false),
+            pod("rest-xyz", true, 0, false),
+        ]));
         let result = ClusterLayer::new(client).run(&opts()).await;
         assert_eq!(result.status, Status::Ok);
         assert_eq!(check_value(&result, "pods_ready"), "2/2");
@@ -227,13 +267,10 @@ mod tests {
 
     #[tokio::test]
     async fn succeeded_pod_excluded_from_readiness_count() {
-        let client = Arc::new(MockK8sClient {
-            pods: vec![
-                PodInfo { name: "core-abc".into(), ready: true, restart_count: 0, succeeded: false },
-                PodInfo { name: "migrate-job-xyz".into(), ready: false, restart_count: 0, succeeded: true },
-            ],
-            events: vec![],
-        });
+        let client = Arc::new(MockK8sClient::new().with_pods(vec![
+            pod("core-abc", true, 0, false),
+            pod("migrate-job-xyz", false, 0, true),
+        ]));
         let result = ClusterLayer::new(client).run(&opts()).await;
         assert_eq!(result.status, Status::Ok, "succeeded pods must not trigger a warning");
         assert_eq!(check_value(&result, "pods_ready"), "1/1");

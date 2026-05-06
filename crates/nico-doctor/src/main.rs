@@ -13,7 +13,6 @@ mod baseline;
 mod formatter;
 mod grpc;
 mod http;
-mod k8s;
 mod layer;
 mod layers;
 mod log_source;
@@ -21,7 +20,6 @@ mod loki;
 mod postgres;
 mod preflight;
 mod runner;
-mod temporal;
 mod tui;
 
 use layer::RunOpts;
@@ -87,11 +85,11 @@ struct Cli {
 struct Unavailable { reason: &'static str }
 
 #[async_trait]
-impl k8s::K8sClient for Unavailable {
-    async fn list_pods(&self, _ns: &str) -> anyhow::Result<Vec<k8s::PodInfo>> {
+impl nico_common::k8s::K8sClient for Unavailable {
+    async fn list_pods(&self, _scope: nico_common::k8s::PodScope<'_>) -> anyhow::Result<Vec<nico_common::k8s::RawPod>> {
         Err(anyhow::anyhow!("{}", self.reason))
     }
-    async fn list_events(&self, _ns: &str, _since: Duration) -> anyhow::Result<Vec<k8s::EventInfo>> {
+    async fn list_events(&self, _ns: &str, _field_selector: Option<&str>) -> anyhow::Result<Vec<nico_common::k8s::RawEvent>> {
         Err(anyhow::anyhow!("{}", self.reason))
     }
     async fn pod_logs(&self, _ns: &str, _pod: &str, _since: Duration) -> anyhow::Result<Vec<String>> {
@@ -221,13 +219,13 @@ async fn main() {
     let opts = RunOpts { namespace: config.cluster.namespace.clone(), since, timeout };
 
     // Build k8s client using context from Config (flag > env > file > default).
-    let k8s_result = k8s::KubeRsK8sClient::try_new(config.cluster.context.as_deref()).await;
-    let (k8s_client, raw_k8s, reach_mgr): (Option<Arc<dyn k8s::K8sClient>>, Option<kube::Client>, Option<ReachManager>) =
+    let k8s_result = nico_common::k8s::KubeRsK8sClient::try_new(config.cluster.context.as_deref()).await;
+    let (k8s_client, raw_k8s, reach_mgr): (Option<Arc<dyn nico_common::k8s::K8sClient>>, Option<kube::Client>, Option<ReachManager>) =
         match k8s_result {
             Ok(c) => {
                 let raw = c.raw_client().clone();
                 let mgr = ReachManager::new(reach_mode, raw.clone(), config.cluster.namespace.clone(), config.cluster.postgres_namespace.clone());
-                (Some(Arc::new(c) as Arc<dyn k8s::K8sClient>), Some(raw), Some(mgr))
+                (Some(Arc::new(c) as Arc<dyn nico_common::k8s::K8sClient>), Some(raw), Some(mgr))
             }
             Err(_) => (None, None, None),
         };
@@ -397,10 +395,10 @@ async fn main() {
             }
             "workflows" => {
                 layers.push(Box::new(layers::workflows::WorkflowsLayer::new(
-                    Arc::new(temporal::RealTemporalClient::new(
+                    Arc::new(nico_common::temporal::GrpcTemporalClient::new(
                         temporal_address.clone(),
-                        config.temporal.namespace.clone(),
                     )),
+                    config.temporal.namespace.clone(),
                     config.temporal.stuck_threshold,
                 )));
             }

@@ -1,12 +1,13 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use nico_common::k8s::{K8sClient, PodScope, RawEvent, RawPod};
+
 use crate::event::{Event, Severity};
 use crate::id::IdType;
-use crate::source::{Source, SourceResult, SourceOutput, SourceUnavailable, StateEntry};
-use kube::{Client, Api};
-use kube::api::ListParams;
-use k8s_openapi::api::core::v1::{Pod, Event as CoreEvent};
+use crate::source::{Source, SourceOutput, SourceResult, SourceUnavailable, StateEntry};
 
 #[derive(Clone)]
 pub struct K8sPod {
@@ -30,94 +31,75 @@ pub struct K8sPodData {
     pub warning_events: Vec<K8sWarningEvent>,
 }
 
-#[async_trait]
-pub trait K8sClient: Send + Sync {
-    async fn find_pods_with_events(&self, id: &str, id_type: &IdType) -> Result<Vec<K8sPodData>>;
-}
-
-pub struct KubeRsK8sClient {
-    client: Client,
-}
-
-impl KubeRsK8sClient {
-    pub async fn try_default() -> Result<Self> {
-        let client = Client::try_default().await?;
-        Ok(Self { client })
-    }
-
-}
-
-#[async_trait]
-impl K8sClient for KubeRsK8sClient {
-    async fn find_pods_with_events(&self, id: &str, id_type: &IdType) -> Result<Vec<K8sPodData>> {
-        let label_selector = format!("{}={id}", id_type.label_key());
-
-        let pods: Api<Pod> = Api::all(self.client.clone());
-        let pod_list = pods.list(&ListParams::default().labels(&label_selector)).await
-            .map_err(|e| anyhow::anyhow!("k8s pod list failed: {e}"))?;
-
-        let mut results = Vec::new();
-        for pod in pod_list.items {
-            let name = pod.metadata.name.unwrap_or_default();
-            let namespace = pod.metadata.namespace.unwrap_or_else(|| "default".into());
-
-            let status = pod.status.as_ref()
-                .and_then(|s| s.phase.as_deref())
-                .unwrap_or("Unknown")
-                .to_string();
-
-            let restart_count: u32 = pod.status.as_ref()
-                .and_then(|s| s.container_statuses.as_ref())
-                .map(|cs| cs.iter().map(|c| c.restart_count as u32).sum())
-                .unwrap_or(0);
-
-            let crash_loop = pod.status.as_ref()
-                .and_then(|s| s.container_statuses.as_ref())
-                .map(|cs| cs.iter().any(|c| {
-                    c.state.as_ref()
-                        .and_then(|s| s.waiting.as_ref())
-                        .and_then(|w| w.reason.as_deref())
-                        == Some("CrashLoopBackOff")
-                }))
-                .unwrap_or(false);
-
-            let events_api: Api<CoreEvent> = Api::namespaced(self.client.clone(), &namespace);
-            let field_selector = format!(
-                "involvedObject.kind=Pod,involvedObject.name={name},type=Warning"
-            );
-            let raw_events = events_api.list(&ListParams::default().fields(&field_selector))
-                .await
-                .map(|l| l.items)
-                .unwrap_or_default();
-
-            let warning_events: Vec<K8sWarningEvent> = raw_events.into_iter().filter_map(|e| {
-                let ts = e.last_timestamp
-                    .map(|t| t.0)
-                    .or_else(|| e.first_timestamp.map(|t| t.0))
-                    .unwrap_or_else(Utc::now);
-                let reason = e.reason?;
-                let message = e.message.unwrap_or_default();
-                Some(K8sWarningEvent { ts, pod_name: name.clone(), reason, message })
-            }).collect();
-
-            results.push(K8sPodData {
-                pod: K8sPod { name, status, restart_count, crash_loop },
-                warning_events,
-            });
-        }
-
-        Ok(results)
-    }
-}
-
 pub struct K8sSource {
-    client: Box<dyn K8sClient>,
+    client: Arc<dyn K8sClient>,
 }
 
 impl K8sSource {
-    pub fn new(client: Box<dyn K8sClient>) -> Self {
+    pub fn new(client: Arc<dyn K8sClient>) -> Self {
         Self { client }
     }
+}
+
+/// Build correlate's `K8sPodData` view by composing the common low-level
+/// `K8sClient` primitives: list pods by label, then fetch warning events
+/// per pod via a field selector scoped to that pod.
+async fn find_pods_with_events(
+    client: &dyn K8sClient,
+    id: &str,
+    id_type: &IdType,
+) -> Result<Vec<K8sPodData>> {
+    let label_selector = format!("{}={id}", id_type.label_key());
+    let pods = client.list_pods(PodScope::AllWithLabel(&label_selector)).await?;
+
+    let mut results = Vec::new();
+    for raw in pods {
+        let namespace = if raw.namespace.is_empty() {
+            "default".to_string()
+        } else {
+            raw.namespace.clone()
+        };
+        let field_selector = format!(
+            "involvedObject.kind=Pod,involvedObject.name={},type=Warning",
+            raw.name
+        );
+        let raw_events = client
+            .list_events(&namespace, Some(&field_selector))
+            .await
+            .unwrap_or_default();
+
+        let warning_events = raw_events
+            .into_iter()
+            .filter_map(|e| event_to_warning(&raw.name, e))
+            .collect();
+
+        results.push(K8sPodData {
+            pod: pod_view(&raw),
+            warning_events,
+        });
+    }
+
+    Ok(results)
+}
+
+fn pod_view(raw: &RawPod) -> K8sPod {
+    let status = raw.phase.clone().unwrap_or_else(|| "Unknown".to_string());
+    K8sPod {
+        name: raw.name.clone(),
+        status,
+        restart_count: raw.restart_count,
+        crash_loop: raw.crash_loop,
+    }
+}
+
+fn event_to_warning(pod_name: &str, raw: RawEvent) -> Option<K8sWarningEvent> {
+    let reason = raw.reason?;
+    Some(K8sWarningEvent {
+        ts: raw.ts.unwrap_or_else(Utc::now),
+        pod_name: pod_name.to_string(),
+        reason,
+        message: raw.message.unwrap_or_default(),
+    })
 }
 
 fn pod_state_entry(pod: &K8sPod) -> StateEntry {
@@ -148,10 +130,11 @@ impl Source for K8sSource {
     }
 
     async fn collect(&self, id: &str, id_type: &IdType) -> SourceResult {
-        match self.client.find_pods_with_events(id, id_type).await {
+        match find_pods_with_events(&*self.client, id, id_type).await {
             Ok(pod_data) => {
                 let state = pod_data.iter().map(|pd| pod_state_entry(&pd.pod)).collect();
-                let events = pod_data.into_iter()
+                let events = pod_data
+                    .into_iter()
                     .flat_map(|pd| pd.warning_events.into_iter().map(warning_event_to_event))
                     .collect();
                 SourceResult::Output(SourceOutput { events, state })
@@ -168,41 +151,31 @@ impl Source for K8sSource {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-
-    struct FakeK8sClient {
-        result: Result<Vec<K8sPodData>>,
-    }
-
-    impl FakeK8sClient {
-        fn ok(data: Vec<K8sPodData>) -> Self {
-            Self { result: Ok(data) }
-        }
-        fn err(msg: &str) -> Self {
-            Self { result: Err(anyhow::anyhow!(msg.to_string())) }
-        }
-    }
-
-    #[async_trait]
-    impl K8sClient for FakeK8sClient {
-        async fn find_pods_with_events(&self, _id: &str, _id_type: &IdType) -> Result<Vec<K8sPodData>> {
-            match &self.result {
-                Ok(data) => Ok(data.clone()),
-                Err(e) => Err(anyhow::anyhow!(e.to_string())),
-            }
-        }
-    }
+    use nico_common::k8s::testing::MockK8sClient;
 
     fn ts(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()
     }
 
+    fn raw_pod(name: &str, phase: &str, restart_count: u32, crash_loop: bool) -> RawPod {
+        RawPod {
+            name: name.into(),
+            namespace: "nico".into(),
+            phase: Some(phase.into()),
+            ready: false,
+            restart_count,
+            succeeded: false,
+            crash_loop,
+        }
+    }
+
     #[tokio::test]
     async fn pods_become_state_entries() {
-        let data = vec![K8sPodData {
-            pod: K8sPod { name: "hp-worker-xyz".into(), status: "Running".into(), restart_count: 3, crash_loop: false },
-            warning_events: vec![],
-        }];
-        let source = K8sSource::new(Box::new(FakeK8sClient::ok(data)));
+        let mut client = MockK8sClient::new()
+            .with_pods(vec![raw_pod("hp-worker-xyz", "Running", 3, false)]);
+        client.require_label_selector = Some("workflow_id=hp-abc".into());
+        let source = K8sSource::new(Arc::new(client));
+
         let result = source.collect("hp-abc", &IdType::Workflow).await;
         let output = match result {
             SourceResult::Output(o) => o,
@@ -217,11 +190,11 @@ mod tests {
 
     #[tokio::test]
     async fn singular_restart_word() {
-        let data = vec![K8sPodData {
-            pod: K8sPod { name: "hp-worker-xyz".into(), status: "Running".into(), restart_count: 1, crash_loop: false },
-            warning_events: vec![],
-        }];
-        let source = K8sSource::new(Box::new(FakeK8sClient::ok(data)));
+        let mut client = MockK8sClient::new()
+            .with_pods(vec![raw_pod("hp-worker-xyz", "Running", 1, false)]);
+        client.require_label_selector = Some("workflow_id=hp-abc".into());
+        let source = K8sSource::new(Arc::new(client));
+
         let result = source.collect("hp-abc", &IdType::Workflow).await;
         let output = match result {
             SourceResult::Output(o) => o,
@@ -232,16 +205,17 @@ mod tests {
 
     #[tokio::test]
     async fn warning_events_map_to_warning_severity_events() {
-        let data = vec![K8sPodData {
-            pod: K8sPod { name: "hp-worker-xyz".into(), status: "Running".into(), restart_count: 2, crash_loop: false },
-            warning_events: vec![K8sWarningEvent {
-                ts: ts(1000),
-                pod_name: "hp-worker-xyz".into(),
-                reason: "OOMKilled".into(),
-                message: "container ran out of memory".into(),
-            }],
-        }];
-        let source = K8sSource::new(Box::new(FakeK8sClient::ok(data)));
+        let mut client = MockK8sClient::new()
+            .with_pods(vec![raw_pod("hp-worker-xyz", "Running", 2, false)])
+            .with_events(vec![RawEvent {
+                ts: Some(ts(1000)),
+                event_type: Some("Warning".into()),
+                reason: Some("OOMKilled".into()),
+                message: Some("container ran out of memory".into()),
+            }]);
+        client.require_label_selector = Some("workflow_id=hp-abc".into());
+        let source = K8sSource::new(Arc::new(client));
+
         let result = source.collect("hp-abc", &IdType::Workflow).await;
         let output = match result {
             SourceResult::Output(o) => o,
@@ -256,11 +230,11 @@ mod tests {
 
     #[tokio::test]
     async fn crash_loop_pod_shows_crash_loop_back_off_status() {
-        let data = vec![K8sPodData {
-            pod: K8sPod { name: "hp-worker-xyz".into(), status: "Running".into(), restart_count: 5, crash_loop: true },
-            warning_events: vec![],
-        }];
-        let source = K8sSource::new(Box::new(FakeK8sClient::ok(data)));
+        let mut client = MockK8sClient::new()
+            .with_pods(vec![raw_pod("hp-worker-xyz", "Running", 5, true)]);
+        client.require_label_selector = Some("workflow_id=hp-abc".into());
+        let source = K8sSource::new(Arc::new(client));
+
         let result = source.collect("hp-abc", &IdType::Workflow).await;
         let output = match result {
             SourceResult::Output(o) => o,
@@ -271,7 +245,8 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_client_returns_unavailable() {
-        let source = K8sSource::new(Box::new(FakeK8sClient::err("cluster unreachable")));
+        let client = MockK8sClient::new().with_pods_err("cluster unreachable");
+        let source = K8sSource::new(Arc::new(client));
         let result = source.collect("hp-abc", &IdType::Workflow).await;
         match result {
             SourceResult::Unavailable(u) => {
@@ -280,16 +255,5 @@ mod tests {
             }
             _ => panic!("expected Unavailable"),
         }
-    }
-
-    #[tokio::test]
-    async fn smoke_real_k8s_skips_when_no_kubeconfig() {
-        let client = match KubeRsK8sClient::try_default().await {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        // Ok or Err both accepted; cluster may be unreachable in CI
-        let _ = client.find_pods_with_events("hp-smoke-test", &IdType::Workflow).await;
-        let _ = client.find_pods_with_events("host-r12u5", &IdType::Host).await;
     }
 }

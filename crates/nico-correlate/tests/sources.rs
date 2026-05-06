@@ -1,9 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration, TimeZone, Utc};
+use nico_common::k8s::testing::MockK8sClient;
+use nico_common::k8s::{RawEvent, RawPod};
+use nico_common::temporal::testing::MockTemporalClient;
 use nico_correlate::id::IdType;
 use nico_correlate::source::{Source, SourceResult};
-use nico_correlate::sources::k8s::{K8sClient, K8sPod, K8sPodData, K8sSource, K8sWarningEvent};
+use nico_correlate::sources::k8s::K8sSource;
 use nico_correlate::sources::loki::{
     K8sLogLine, K8sLogStreamClient, LokiClient, LokiLogLine, LokiSource,
 };
@@ -13,7 +16,10 @@ use nico_correlate::sources::postgres::{
 use nico_correlate::sources::redfish::{
     RedfishClient, RedfishData, RedfishRawEvent, RedfishSource, RedfishSystemState,
 };
-use nico_correlate::sources::temporal::{RawTemporalEvent, TemporalClient, TemporalSource};
+use nico_correlate::sources::temporal::TemporalSource;
+use std::sync::Arc;
+use temporal_sdk_core_protos::temporal::api::enums::v1::EventType;
+use temporal_sdk_core_protos::temporal::api::history::v1::{History, HistoryEvent};
 
 fn ts(secs: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(secs, 0).unwrap()
@@ -189,78 +195,56 @@ async fn postgres_source_state_and_events_non_empty() {
 
 // ─── TemporalSource: two events of different types ───────────────────────────
 
-struct MockTemporalOk {
-    events: Vec<RawTemporalEvent>,
-}
-
-#[async_trait]
-impl TemporalClient for MockTemporalOk {
-    async fn get_history(&self, _workflow_id: &str) -> Result<Vec<RawTemporalEvent>> {
-        Ok(self.events.clone())
-    }
-}
-
 #[tokio::test]
 async fn temporal_source_two_events_correct_kinds() {
-    let client = MockTemporalOk {
+    let history = History {
         events: vec![
-            RawTemporalEvent {
-                event_type: "WorkflowExecutionStarted".into(),
-                ts: ts(1000),
+            HistoryEvent {
+                event_id: 1,
+                event_type: EventType::WorkflowExecutionStarted as i32,
                 ..Default::default()
             },
-            RawTemporalEvent {
-                event_type: "WorkflowExecutionFailed".into(),
-                ts: ts(2000),
+            HistoryEvent {
+                event_id: 2,
+                event_type: EventType::WorkflowExecutionFailed as i32,
                 ..Default::default()
             },
         ],
     };
-    let source = TemporalSource::new(Box::new(client));
+    let client = MockTemporalClient::new().with_history(history);
+    let source = TemporalSource::new(Arc::new(client), "default".into());
     let output = match source.collect("hp-abc", &IdType::Workflow).await {
         SourceResult::Output(o) => o,
         _ => panic!("expected Output"),
     };
     assert_eq!(output.events.len(), 2);
-    assert_eq!(output.events[0].kind, "WorkflowExecutionStarted");
-    assert_eq!(output.events[1].kind, "WorkflowExecutionFailed");
+    assert_eq!(output.events[0].kind, "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED");
+    assert_eq!(output.events[1].kind, "EVENT_TYPE_WORKFLOW_EXECUTION_FAILED");
     assert!(output.events.iter().all(|e| e.source == "temporal"));
 }
 
 // ─── K8sSource: one pod warning event → source is "k8s" ─────────────────────
 
-struct MockK8sOk {
-    data: Vec<K8sPodData>,
-}
-
-#[async_trait]
-impl K8sClient for MockK8sOk {
-    async fn find_pods_with_events(
-        &self,
-        _id: &str,
-        _id_type: &IdType,
-    ) -> Result<Vec<K8sPodData>> {
-        Ok(self.data.clone())
-    }
-}
-
 #[tokio::test]
 async fn k8s_source_one_pod_event_has_k8s_source() {
-    let data = vec![K8sPodData {
-        pod: K8sPod {
-            name: "hp-worker-xyz".into(),
-            status: "Running".into(),
-            restart_count: 0,
-            crash_loop: false,
-        },
-        warning_events: vec![K8sWarningEvent {
-            ts: ts(1000),
-            pod_name: "hp-worker-xyz".into(),
-            reason: "OOMKilled".into(),
-            message: "container ran out of memory".into(),
-        }],
+    let pods = vec![RawPod {
+        name: "hp-worker-xyz".into(),
+        namespace: "nico".into(),
+        phase: Some("Running".into()),
+        ready: true,
+        restart_count: 0,
+        succeeded: false,
+        crash_loop: false,
     }];
-    let source = K8sSource::new(Box::new(MockK8sOk { data }));
+    let events = vec![RawEvent {
+        ts: Some(ts(1000)),
+        event_type: Some("Warning".into()),
+        reason: Some("OOMKilled".into()),
+        message: Some("container ran out of memory".into()),
+    }];
+    let mut client = MockK8sClient::new().with_pods(pods).with_events(events);
+    client.require_label_selector = Some("workflow_id=hp-abc".into());
+    let source = K8sSource::new(Arc::new(client));
     let output = match source.collect("hp-abc", &IdType::Workflow).await {
         SourceResult::Output(o) => o,
         _ => panic!("expected Output"),
