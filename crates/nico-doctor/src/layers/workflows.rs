@@ -1,12 +1,12 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nico_common::output::Status;
 use nico_common::temporal::TemporalClient;
 use temporal_sdk_core_protos::temporal::api::workflow::v1::WorkflowExecutionInfo;
 
-use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
+use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
 
 /// Doctor's view of a running workflow that has exceeded the stuck
 /// threshold. Built from a `WorkflowExecutionInfo` returned by the
@@ -52,8 +52,7 @@ impl Layer for WorkflowsLayer {
         "workflows"
     }
 
-    async fn run(&self, opts: &RunOpts) -> LayerResult {
-        let start = Instant::now();
+    async fn collect(&self, opts: &RunOpts) -> LayerOutcome {
         let now = SystemTime::now();
         let stuck_before = now
             .checked_sub(self.stuck_threshold)
@@ -67,15 +66,7 @@ impl Layer for WorkflowsLayer {
             .await
             .unwrap_or_default();
 
-        let checks = checks_from(&stuck, &failed, now);
-        let overall = aggregate_status(&checks);
-
-        LayerResult {
-            name: "workflows",
-            status: overall,
-            checks,
-            duration_ms: start.elapsed().as_millis() as u64,
-        }
+        LayerOutcome::Checks(checks_from(&stuck, &failed, now))
     }
 }
 

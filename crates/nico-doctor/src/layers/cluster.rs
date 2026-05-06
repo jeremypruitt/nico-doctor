@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nico_common::k8s::{K8sClient, PodScope, RawEvent, RawPod};
 use nico_common::output::Status;
-use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
+use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
 
 pub struct ClusterLayer {
     k8s: Arc<dyn K8sClient>,
@@ -22,8 +22,7 @@ impl Layer for ClusterLayer {
         "cluster"
     }
 
-    async fn run(&self, opts: &RunOpts) -> LayerResult {
-        let start = Instant::now();
+    async fn collect(&self, opts: &RunOpts) -> LayerOutcome {
         let all_pods = self
             .k8s
             .list_pods(PodScope::Namespace(&opts.namespace))
@@ -36,14 +35,7 @@ impl Layer for ClusterLayer {
             .unwrap_or_default();
         let warning_events = filter_warning_events(&raw_events, SystemTime::now(), opts.since);
         let pods: Vec<&RawPod> = all_pods.iter().filter(|p| !p.succeeded).collect();
-        let checks = checks_from(&pods, &warning_events, &opts.namespace);
-        let overall = aggregate_status(&checks);
-        LayerResult {
-            name: "cluster",
-            status: overall,
-            checks,
-            duration_ms: start.elapsed().as_millis() as u64,
-        }
+        LayerOutcome::Checks(checks_from(&pods, &warning_events, &opts.namespace))
     }
 }
 
@@ -114,6 +106,7 @@ mod tests {
     use std::time::Duration;
     use nico_common::k8s::testing::MockK8sClient;
     use nico_common::output::Status;
+    use crate::layer::LayerResult;
 
     fn pod(name: &str, ready: bool, restart_count: u32, succeeded: bool) -> RawPod {
         RawPod {

@@ -1,9 +1,8 @@
 use std::sync::Arc;
-use std::time::Instant;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::postgres::{LockWait, PoolStats, PostgresClient};
-use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
+use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
 
 const POOL_WARN_RATIO: f64 = 0.90;
 const LOCK_WARN_SECS: f64 = 5.0;
@@ -77,23 +76,16 @@ fn lock_checks(waits: &[LockWait]) -> Vec<Check> {
 impl Layer for PostgresLayer {
     fn name(&self) -> &'static str { "postgres" }
 
-    async fn run(&self, _opts: &RunOpts) -> LayerResult {
-        let start = Instant::now();
-
+    async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
         let stats = match self.client.pool_stats().await {
             Ok(s) => s,
             Err(_) => {
-                return LayerResult {
-                    name: "postgres",
+                return LayerOutcome::Checks(vec![Check {
+                    name: "pool",
                     status: Status::Unknown,
-                    checks: vec![Check {
-                        name: "pool",
-                        status: Status::Unknown,
-                        value: "postgres unreachable".into(),
-                        next_command: Some("kubectl get svc -n nico | grep postgres".into()),
-                    }],
-                    duration_ms: start.elapsed().as_millis() as u64,
-                };
+                    value: "postgres unreachable".into(),
+                    next_command: Some("kubectl get svc -n nico | grep postgres".into()),
+                }]);
             }
         };
 
@@ -111,14 +103,7 @@ impl Layer for PostgresLayer {
             }
         }
 
-        let overall = aggregate_status(&checks);
-
-        LayerResult {
-            name: "postgres",
-            status: overall,
-            checks,
-            duration_ms: start.elapsed().as_millis() as u64,
-        }
+        LayerOutcome::Checks(checks)
     }
 }
 

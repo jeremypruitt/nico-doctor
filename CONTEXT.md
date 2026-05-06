@@ -22,6 +22,18 @@ every output line points at where to dig deeper.
   checks: cluster, logs, workflows, health, grpc, postgres. Layers run
   concurrently, are independently skippable, produce Findings, and contribute
   to exit codes 0/1/2.
+- **LayerResult** (nico-doctor specific) — what a Layer produces: a name, an
+  aggregated `Status`, a `Vec<Check>`, and a measured `duration_ms`. The name
+  comes from the Layer itself; the status is derived from the checks via
+  `aggregate_status` (worst-case priority: Fail > Warn > Unknown > Ok), unless
+  the Layer reports `LayerOutcome::Skipped`, which produces `Status::Skipped`
+  independent of any checks.
+- **LayerOutcome** (nico-doctor specific) — what a Layer's `collect` method
+  returns. Two variants: `Checks(Vec<Check>)` (the layer ran and produced
+  findings, possibly empty; the runner aggregates the worst status), or
+  `Skipped` (the layer sat out — `--skip` flag or layer not enabled). The
+  default `Layer::run` impl maps a `LayerOutcome` to a `LayerResult` and
+  handles timing.
 - **Pre-flight check** (nico-doctor specific) — a serial check that runs
   before all Layers. If a pre-flight check fails the tool exits immediately
   with code 3 (can't-run); the diagnostic ladder never starts. Pre-flight

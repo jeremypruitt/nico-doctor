@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use nico_common::output::Status;
 
@@ -22,10 +22,30 @@ pub struct LayerResult {
     pub duration_ms: u64,
 }
 
+pub enum LayerOutcome {
+    Checks(Vec<Check>),
+    Skipped,
+}
+
 #[async_trait]
 pub trait Layer: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn run(&self, opts: &RunOpts) -> LayerResult;
+    async fn collect(&self, opts: &RunOpts) -> LayerOutcome;
+
+    async fn run(&self, opts: &RunOpts) -> LayerResult {
+        let start = Instant::now();
+        let outcome = self.collect(opts).await;
+        let (status, checks) = match outcome {
+            LayerOutcome::Skipped => (Status::Skipped, vec![]),
+            LayerOutcome::Checks(checks) => (aggregate_status(&checks), checks),
+        };
+        LayerResult {
+            name: self.name(),
+            status,
+            checks,
+            duration_ms: start.elapsed().as_millis() as u64,
+        }
+    }
 }
 
 /// Returns the worst-case status across a slice of checks.
@@ -78,6 +98,59 @@ mod tests {
         assert_eq!(aggregate_status(&[check(Status::Unknown)]), Status::Unknown);
         assert_eq!(aggregate_status(&[check(Status::Warn), check(Status::Unknown)]), Status::Warn);
     }
+
+    struct StubLayer {
+        outcome: std::sync::Mutex<Option<LayerOutcome>>,
+    }
+
+    impl StubLayer {
+        fn new(outcome: LayerOutcome) -> Self {
+            Self { outcome: std::sync::Mutex::new(Some(outcome)) }
+        }
+    }
+
+    #[async_trait]
+    impl Layer for StubLayer {
+        fn name(&self) -> &'static str { "stub" }
+        async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
+            self.outcome.lock().unwrap().take().expect("collect called twice")
+        }
+    }
+
+    fn opts() -> RunOpts {
+        RunOpts {
+            namespace: "nico".into(),
+            since: Duration::from_secs(60),
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_run_skipped_outcome_produces_skipped_status_and_no_checks() {
+        let layer = StubLayer::new(LayerOutcome::Skipped);
+        let result = layer.run(&opts()).await;
+        assert_eq!(result.name, "stub");
+        assert_eq!(result.status, Status::Skipped);
+        assert!(result.checks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_run_aggregates_checks_status() {
+        let layer = StubLayer::new(LayerOutcome::Checks(vec![
+            check(Status::Ok),
+            check(Status::Warn),
+        ]));
+        let result = layer.run(&opts()).await;
+        assert_eq!(result.status, Status::Warn);
+        assert_eq!(result.checks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn default_run_uses_layer_name_for_result_name() {
+        let layer = StubLayer::new(LayerOutcome::Checks(vec![check(Status::Ok)]));
+        let result = layer.run(&opts()).await;
+        assert_eq!(result.name, layer.name());
+    }
 }
 
 pub struct SkippedLayer {
@@ -94,13 +167,8 @@ impl SkippedLayer {
 #[async_trait]
 impl Layer for SkippedLayer {
     fn name(&self) -> &'static str { self.name }
-    async fn run(&self, _opts: &RunOpts) -> LayerResult {
-        LayerResult {
-            name: self.name,
-            status: Status::Skipped,
-            checks: vec![],
-            duration_ms: 0,
-        }
+    async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
+        LayerOutcome::Skipped
     }
 }
 
@@ -119,17 +187,12 @@ impl UnconfiguredLayer {
 #[async_trait]
 impl Layer for UnconfiguredLayer {
     fn name(&self) -> &'static str { self.name }
-    async fn run(&self, _opts: &RunOpts) -> LayerResult {
-        LayerResult {
-            name: self.name,
+    async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
+        LayerOutcome::Checks(vec![Check {
+            name: "config",
             status: Status::Unknown,
-            checks: vec![Check {
-                name: "config",
-                status: Status::Unknown,
-                value: self.reason.clone(),
-                next_command: None,
-            }],
-            duration_ms: 0,
-        }
+            value: self.reason.clone(),
+            next_command: None,
+        }])
     }
 }
