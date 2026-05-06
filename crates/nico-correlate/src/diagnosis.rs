@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use std::time::Duration;
 use chrono::Utc;
 use crate::event::{Event, Severity};
@@ -25,15 +26,20 @@ pub struct Diagnosis {
 const K8S_RESTART_THRESHOLD: u32 = 5;
 
 pub struct DiagnosisRule {
+    pub priority: u8,
     pub matcher: fn(&[Event], &[StateEntry], &DiagnosisConfig) -> Option<Diagnosis>,
 }
 
-static RULES: &[DiagnosisRule] = &[
-    DiagnosisRule { matcher: match_k8s_crash_loop },
-    DiagnosisRule { matcher: match_provisioning_timeout },
-    DiagnosisRule { matcher: activity_retry_exhaustion },
-    DiagnosisRule { matcher: match_stuck_workflow },
-];
+static RULES: LazyLock<Vec<DiagnosisRule>> = LazyLock::new(|| {
+    let mut rules = vec![
+        DiagnosisRule { priority: 0, matcher: match_k8s_crash_loop },
+        DiagnosisRule { priority: 1, matcher: match_provisioning_timeout },
+        DiagnosisRule { priority: 2, matcher: activity_retry_exhaustion },
+        DiagnosisRule { priority: 3, matcher: match_stuck_workflow },
+    ];
+    rules.sort_by_key(|r| r.priority);
+    rules
+});
 
 pub fn diagnose(events: &[Event], state: &[StateEntry], config: &DiagnosisConfig) -> Option<Diagnosis> {
     RULES.iter().find_map(|rule| (rule.matcher)(events, state, config))
@@ -439,5 +445,40 @@ mod tests {
         let d = diagnose(&[], &state, &default_config()).unwrap();
         assert!(d.next_commands[0].contains("my-pod-123"));
         assert!(d.next_commands[1].contains("my-pod-123"));
+    }
+
+    // --- priority ordering ---
+
+    #[test]
+    fn high_priority_rule_inserted_last_matches_first() {
+        fn always_low(_: &[Event], _: &[StateEntry], _: &DiagnosisConfig) -> Option<Diagnosis> {
+            Some(Diagnosis {
+                pattern: "low".to_string(),
+                activity: String::new(),
+                error_signature: String::new(),
+                next_commands: vec![],
+            })
+        }
+        fn always_high(_: &[Event], _: &[StateEntry], _: &DiagnosisConfig) -> Option<Diagnosis> {
+            Some(Diagnosis {
+                pattern: "high".to_string(),
+                activity: String::new(),
+                error_signature: String::new(),
+                next_commands: vec![],
+            })
+        }
+
+        // low-priority rule is first in source array, high-priority rule is last
+        let mut rules = vec![
+            DiagnosisRule { priority: 10, matcher: always_low },
+            DiagnosisRule { priority: 1, matcher: always_high },
+        ];
+        rules.sort_by_key(|r| r.priority);
+
+        let result = rules
+            .iter()
+            .find_map(|r| (r.matcher)(&[], &[], &DiagnosisConfig::default()))
+            .unwrap();
+        assert_eq!(result.pattern, "high");
     }
 }
