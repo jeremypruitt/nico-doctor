@@ -1,9 +1,8 @@
 use std::sync::Arc;
-use std::time::Instant;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::http::{HttpClient, ServiceEndpoint};
-use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
+use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
 
 enum ProbeOutcome { Healthy, Degraded, Failed }
 
@@ -76,8 +75,7 @@ impl HealthLayer {
 impl Layer for HealthLayer {
     fn name(&self) -> &'static str { "health" }
 
-    async fn run(&self, _opts: &RunOpts) -> LayerResult {
-        let start = Instant::now();
+    async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
         let mut probes = Vec::new();
 
         for svc in &self.services {
@@ -117,15 +115,7 @@ impl Layer for HealthLayer {
             }
         }
 
-        let checks = checks_from(&probes);
-        let overall = aggregate_status(&checks);
-
-        LayerResult {
-            name: "health",
-            status: overall,
-            checks,
-            duration_ms: start.elapsed().as_millis() as u64,
-        }
+        LayerOutcome::Checks(checks_from(&probes))
     }
 }
 
