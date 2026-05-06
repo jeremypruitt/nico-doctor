@@ -22,49 +22,52 @@ impl Layer for GrpcLayer {
 
     async fn run(&self, _opts: &RunOpts) -> LayerResult {
         let start = Instant::now();
-
-        let checks = match self.inspector.inspect(&self.addr).await {
-            Ok(GrpcInspectResult::Reachable { services }) => {
-                let svc_count = services.len();
-                let method_count: usize = services.iter().map(|s| s.method_count).sum();
-                vec![
-                    Check {
-                        name: "reachable",
-                        status: Status::Ok,
-                        value: "reachable".to_string(),
-                        next_command: None,
-                    },
-                    Check {
-                        name: "services",
-                        status: Status::Ok,
-                        value: format!("{svc_count} services"),
-                        next_command: None,
-                    },
-                    Check {
-                        name: "methods",
-                        status: Status::Ok,
-                        value: format!("{method_count} methods"),
-                        next_command: None,
-                    },
-                ]
-            }
-            Ok(GrpcInspectResult::Unreachable) | Err(_) => {
-                vec![Check {
-                    name: "reachable",
-                    status: Status::Fail,
-                    value: "unreachable".to_string(),
-                    next_command: Some(format!("grpcurl -plaintext {} list", self.addr)),
-                }]
-            }
-        };
-
+        let result = self.inspector.inspect(&self.addr).await
+            .unwrap_or(GrpcInspectResult::Unreachable);
+        let checks = checks_from(&result, &self.addr);
         let overall = aggregate_status(&checks);
-
         LayerResult {
             name: "grpc",
             status: overall,
             checks,
             duration_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+}
+
+fn checks_from(result: &GrpcInspectResult, addr: &str) -> Vec<Check> {
+    match result {
+        GrpcInspectResult::Reachable { services } => {
+            let svc_count = services.len();
+            let method_count: usize = services.iter().map(|s| s.method_count).sum();
+            vec![
+                Check {
+                    name: "reachable",
+                    status: Status::Ok,
+                    value: "reachable".to_string(),
+                    next_command: None,
+                },
+                Check {
+                    name: "services",
+                    status: Status::Ok,
+                    value: format!("{svc_count} services"),
+                    next_command: None,
+                },
+                Check {
+                    name: "methods",
+                    status: Status::Ok,
+                    value: format!("{method_count} methods"),
+                    next_command: None,
+                },
+            ]
+        }
+        GrpcInspectResult::Unreachable => {
+            vec![Check {
+                name: "reachable",
+                status: Status::Fail,
+                value: "unreachable".to_string(),
+                next_command: Some(format!("grpcurl -plaintext {addr} list")),
+            }]
         }
     }
 }
@@ -165,5 +168,33 @@ mod tests {
         assert_eq!(services.value, "0 services");
         let methods = result.checks.iter().find(|c| c.name == "methods").unwrap();
         assert_eq!(methods.value, "0 methods");
+    }
+
+    #[test]
+    fn checks_from_reachable_produces_ok_status() {
+        let result = GrpcInspectResult::Reachable {
+            services: vec![
+                GrpcServiceInfo { name: "svc.v1.Foo".into(), method_count: 3 },
+                GrpcServiceInfo { name: "svc.v1.Bar".into(), method_count: 7 },
+            ],
+        };
+        let checks = checks_from(&result, "host:50051");
+
+        let reachable = checks.iter().find(|c| c.name == "reachable").unwrap();
+        assert_eq!(reachable.status, Status::Ok);
+        let services = checks.iter().find(|c| c.name == "services").unwrap();
+        assert_eq!(services.status, Status::Ok);
+        let methods = checks.iter().find(|c| c.name == "methods").unwrap();
+        assert_eq!(methods.status, Status::Ok);
+    }
+
+    #[test]
+    fn checks_from_unreachable_produces_fail_status() {
+        let result = GrpcInspectResult::Unreachable;
+        let checks = checks_from(&result, "host:50051");
+
+        let reachable = checks.iter().find(|c| c.name == "reachable").unwrap();
+        assert_eq!(reachable.status, Status::Fail);
+        assert!(reachable.next_command.as_deref().unwrap().contains("host:50051"));
     }
 }
