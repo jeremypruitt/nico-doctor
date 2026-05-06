@@ -15,11 +15,20 @@ future-us) to add convenience features like `--fix`, `--restart-pod`, or
 
 Both tools are **read-only**. They never:
 
-- Mutate Kubernetes resources (no patches, no deletes, no creates).
+- Mutate Kubernetes resources (no patches, no deletes, no state-changing creates).
 - Execute Temporal signals, terminations, resets, or workflow starts.
 - Write to Postgres (no UPDATE, no DELETE, no INSERT — only SELECT).
 - Call any Redfish action endpoint that has side effects.
-- Modify local files outside their own structured output and stderr logs.
+- Modify local files outside their own structured output, stderr logs, and
+  the designated local cache file (`~/.local/share/nico-doctor/last-run.json`).
+
+**Non-mutating create-shaped API calls are permitted.** Specifically,
+`SelfSubjectAccessReview` (POST to `/apis/authorization.k8s.io/v1/selfsubjectaccessreviews`)
+is allowed in the auth pre-flight check. It uses HTTP POST but has no side
+effects — it answers "can I do X?" without changing any cluster state. The
+prohibition above targets state-changing creates (pods, configmaps, jobs, etc.).
+Future callers must justify any new POST/PUT/PATCH call against this
+distinction before adding it.
 
 When the tools find a problem, they print the next command for a human to run
 themselves. The tool suggests; the human decides.

@@ -19,8 +19,20 @@ every output line points at where to dig deeper.
 - **Activity** — atomic step inside a workflow, retried independently.
 - **Site Agent** — the in-cluster worker that executes activities.
 - **Layer** (nico-doctor specific) — one of the six categories the doctor
-  checks: cluster, logs, workflows, health, grpc, postgres.
+  checks: cluster, logs, workflows, health, grpc, postgres. Layers run
+  concurrently, are independently skippable, produce Findings, and contribute
+  to exit codes 0/1/2.
+- **Pre-flight check** (nico-doctor specific) — a serial check that runs
+  before all Layers. If a pre-flight check fails the tool exits immediately
+  with code 3 (can't-run); the diagnostic ladder never starts. Pre-flight
+  checks are not skippable. Auth pre-flight runs four sub-checks in dependency
+  order — reachability → token expiry → namespace exists → RBAC — and
+  short-circuits at the first failure. Each failure message includes the next
+  command for the operator to run. Running RBAC checks against an unreachable
+  apiserver is vacuous; the chain ensures each sub-check's preconditions are met.
 - **Finding** — a single warning or failure produced by a layer.
+- **Baseline** (nico-doctor specific) — the Layer-level status snapshot persisted from the most recent completed run (`~/.local/share/nico-doctor/last-run.json`). Keyed by layer name; value is the aggregate status (ok / warn / fail / unknown / skipped). Written only on exit codes 0, 1, or 2 (diagnostic ladder completed). Exit code 3 (can't-run) leaves the existing baseline untouched — a failed auth pre-flight must not overwrite a good baseline with an empty record.
+- **Delta** (nico-doctor specific) — the per-layer comparison between the current run and the Baseline. Three states: `new` (layer was ok/skipped last run, now warn/fail), `fixed` (layer was warn/fail last run, now ok/skipped), `unchanged`. Computed at Layer granularity, not Finding granularity — dynamic Finding text (pod names, timestamps) makes Finding-level identity brittle. Interaction rule: `--spotlight` hides ok/skipped layers, but layers carrying a `new` or `fixed` Delta badge are always shown regardless of `--spotlight` — delta signal takes priority over spotlight suppression.
 - **Entity** — the thing being correlated: a Workflow, Host, DPU, Tenant, or Request. The subject handed to `nico-correlate` via its ID. DPU is a first-class Entity type because operators sometimes identify incidents by DPU ID before knowing which Host is involved.
   _Avoid_: object, resource, subject
 - **Correlation** — entity-scoped aggregation of events and current state from every source, unified into a timeline, scoped to a single Entity ID. What `nico-correlate` produces. Not statistical correlation.
@@ -77,7 +89,7 @@ Read-only. No remediation. Output is human-readable by default and JSON under
 
 ## Out of scope (explicit)
 - Remediation actions
-- Persistent state (no SQLite, no daemons)
+- Persistent state (no embedded database, no daemons, no always-on processes). Exception: a single local cache file (`~/.local/share/nico-doctor/last-run.json`) written by `nico-doctor` to support historical delta badges is in scope. It is written only on exit codes 0/1/2 (diagnostic ladder completed) and read at startup; it is not a database and does not require a running process.
 - Web UI or always-on TUI (opt-in `--tui` flag is in scope, see ADR-007)
 - Alerting (Datadog already does that)
 - Self-update or telemetry

@@ -143,7 +143,12 @@ mid-stream, two things happen simultaneously:
 A live-refresh dashboard. Checks re-run on a configurable interval (default
 30 s, see config key below). Each layer occupies one row in the left pane;
 status icon updates in place. Selecting a layer shows its Findings in the
-right pane. `r` forces an immediate refresh.
+right pane. Keybindings specific to the dashboard:
+
+| Key | Action |
+|-----|--------|
+| `r` | Force immediate full refresh (re-run all layers) |
+| `R` | Re-run only the focused layer row; shows a spinner on that row while running, other rows unaffected |
 
 The same collapse threshold (100 columns), `?` overlay, and keybinding
 conventions apply.
