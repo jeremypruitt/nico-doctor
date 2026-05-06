@@ -1769,15 +1769,20 @@ name = "nico-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "chrono",
  "humantime",
  "k8s-openapi",
  "kube",
  "owo-colors",
+ "prost-wkt-types",
  "ratatui",
  "serde",
+ "temporal-sdk-core-protos",
  "thiserror",
  "tokio",
  "toml",
+ "tonic",
 ]
 
 [[package]]

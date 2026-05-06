@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::k8s::K8sClient;
+use nico_common::k8s::{K8sClient, PodScope};
 
 /// One round of log collection: the entries gathered, the human-readable
 /// label of the source that produced them, and whether the primary
@@ -94,7 +94,7 @@ impl LogSource for K8sLogSource {
         since: Duration,
         limit: usize,
     ) -> Result<LogCollection> {
-        let pods = self.k8s.list_pods(namespace).await?;
+        let pods = self.k8s.list_pods(PodScope::Namespace(namespace)).await?;
         let mut entries = Vec::new();
         for pod in &pods {
             let lines = self.k8s.pod_logs(namespace, &pod.name, since)

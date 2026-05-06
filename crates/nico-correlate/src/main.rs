@@ -18,10 +18,11 @@ use nico_common::output::{OutputMode, Status};
 use nico_common::reach::ReachManager;
 use crate::id::{IdType, detect_id_type};
 use crate::source::{Source, SourceKind, SourceResult, StateEntry, UnavailableSource};
-use crate::sources::temporal::{TemporalSource, TemporalClient};
-use crate::sources::temporal_grpc::GrpcTemporalClient;
+use crate::sources::temporal::TemporalSource;
+use nico_common::temporal::{GrpcTemporalClient, TemporalClient};
+use nico_common::k8s::KubeRsK8sClient;
 use crate::sources::postgres::{PostgresSource, SqlxPostgresClient};
-use crate::sources::k8s::{K8sSource, KubeRsK8sClient};
+use crate::sources::k8s::K8sSource;
 use crate::sources::loki::{LokiSource, LokiClient, K8sLogStreamClient, RealLokiClient, RealK8sLogStreamClient};
 use crate::sources::redfish::{RedfishSource, RealRedfishClient};
 use crate::timeline::filter_timeline;
@@ -302,14 +303,12 @@ async fn main() {
     };
 
     let k8s_source: Box<dyn Source> = match KubeRsK8sClient::try_default().await {
-        Ok(c) => Box::new(K8sSource::new(Box::new(c))),
+        Ok(c) => Box::new(K8sSource::new(Arc::new(c))),
         Err(e) => Box::new(UnavailableSource::new("k8s", format!("kubeconfig unavailable: {e}"))),
     };
 
-    let temporal_client: Box<dyn TemporalClient> = Box::new(GrpcTemporalClient::new(
-        temporal_address,
-        config.temporal.namespace.clone(),
-    ));
+    let temporal_client: Arc<dyn TemporalClient> =
+        Arc::new(GrpcTemporalClient::new(temporal_address));
 
     // Loki: explicit env var wins, then reach manager discovery.
     let loki_result: Result<Box<dyn LokiClient>, &'static str> = match std::env::var("LOKI_URL") {
@@ -353,7 +352,7 @@ async fn main() {
     };
 
     let all_sources: Vec<(&'static str, Box<dyn Source>)> = vec![
-        ("temporal", Box::new(TemporalSource::new(temporal_client))),
+        ("temporal", Box::new(TemporalSource::new(temporal_client, config.temporal.namespace.clone()))),
         ("postgres", pg_source),
         ("k8s", k8s_source),
         ("loki", loki_source),
