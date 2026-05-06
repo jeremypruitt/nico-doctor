@@ -22,6 +22,7 @@ expression: v
           "value": "0"
         }
       ],
+      "delta": "unchanged",
       "duration_ms": 42,
       "name": "cluster",
       "status": "ok"
@@ -39,6 +40,7 @@ expression: v
           "value": "loki"
         }
       ],
+      "delta": "unchanged",
       "duration_ms": 42,
       "name": "logs",
       "status": "ok"
@@ -56,6 +58,7 @@ expression: v
           "value": "0 failed"
         }
       ],
+      "delta": "unchanged",
       "duration_ms": 42,
       "name": "workflows",
       "status": "ok"

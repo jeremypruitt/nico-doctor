@@ -17,6 +17,7 @@ expression: v
           "value": "0"
         }
       ],
+      "delta": "unchanged",
       "duration_ms": 42,
       "name": "cluster",
       "status": "warn"
@@ -34,6 +35,7 @@ expression: v
           "value": "0 lock waits"
         }
       ],
+      "delta": "unchanged",
       "duration_ms": 42,
       "name": "postgres",
       "status": "warn"

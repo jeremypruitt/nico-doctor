@@ -1,10 +1,27 @@
+use std::collections::HashMap;
 use nico_common::output::{OutputMode, Status};
+use crate::baseline::Delta;
 use crate::runner::Report;
 
-pub fn format_report(report: &Report, mode: &OutputMode, verbose: bool) -> String {
+pub fn format_report(
+    report: &Report,
+    mode: &OutputMode,
+    verbose: bool,
+    deltas: &HashMap<String, Delta>,
+    spotlight: bool,
+) -> String {
     let mut out = String::new();
 
     for layer in &report.layers {
+        let delta = deltas.get(layer.name).copied().unwrap_or(Delta::Unchanged);
+
+        if spotlight {
+            let is_quiet = matches!(layer.status, Status::Ok | Status::Skipped);
+            if is_quiet && delta == Delta::Unchanged {
+                continue;
+            }
+        }
+
         let icon = layer.status.icon(mode);
         let styled_icon = layer.status.style(icon, mode);
         let summary = if layer.status == Status::Skipped {
@@ -15,7 +32,12 @@ pub fn format_report(report: &Report, mode: &OutputMode, verbose: bool) -> Strin
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        out.push_str(&format!("  {} {:<12} {}\n", styled_icon, layer.name, summary));
+        let badge = match delta {
+            Delta::New => " [NEW]",
+            Delta::Fixed => " [FIXED]",
+            Delta::Unchanged => "",
+        };
+        out.push_str(&format!("  {} {:<12} {}{}\n", styled_icon, layer.name, summary, badge));
 
         if verbose && layer.status != Status::Skipped {
             for check in &layer.checks {
@@ -71,7 +93,12 @@ pub fn format_report(report: &Report, mode: &OutputMode, verbose: bool) -> Strin
     out
 }
 
-pub fn format_json(report: &Report, namespace: &str, preflight: serde_json::Value) -> String {
+pub fn format_json(
+    report: &Report,
+    namespace: &str,
+    preflight: serde_json::Value,
+    deltas: &HashMap<String, Delta>,
+) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "version": 1,
         "namespace": namespace,
@@ -83,27 +110,47 @@ pub fn format_json(report: &Report, namespace: &str, preflight: serde_json::Valu
             "skipped": report.layers.iter().filter(|l| l.status == Status::Skipped).count(),
             "unknown": report.layers.iter().filter(|l| l.status == Status::Unknown).count(),
         },
-        "layers": report.layers.iter().map(|l| serde_json::json!({
-            "name": l.name,
-            "status": format!("{:?}", l.status).to_lowercase(),
-            "duration_ms": l.duration_ms,
-            "checks": l.checks.iter().map(|c| serde_json::json!({
-                "name": c.name,
-                "status": format!("{:?}", c.status).to_lowercase(),
-                "value": c.value,
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
+        "layers": report.layers.iter().map(|l| {
+            let delta = deltas.get(l.name).copied().unwrap_or(Delta::Unchanged);
+            let delta_str = match delta {
+                Delta::New => "new",
+                Delta::Fixed => "fixed",
+                Delta::Unchanged => "unchanged",
+            };
+            serde_json::json!({
+                "name": l.name,
+                "status": format!("{:?}", l.status).to_lowercase(),
+                "delta": delta_str,
+                "duration_ms": l.duration_ms,
+                "checks": l.checks.iter().map(|c| serde_json::json!({
+                    "name": c.name,
+                    "status": format!("{:?}", c.status).to_lowercase(),
+                    "value": c.value,
+                })).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
     })).unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::baseline::Delta;
     use crate::layer::{Check, LayerResult};
     use crate::runner::Report;
 
     fn plain() -> OutputMode {
         OutputMode { color: false, ascii: true }
+    }
+
+    fn no_deltas() -> HashMap<String, Delta> {
+        HashMap::new()
+    }
+
+    fn single_delta(name: &str, delta: Delta) -> HashMap<String, Delta> {
+        let mut m = HashMap::new();
+        m.insert(name.to_string(), delta);
+        m
     }
 
     fn ok_check(name: &'static str, value: &str) -> Check {
@@ -172,7 +219,7 @@ mod tests {
             ok_check("recent_restarts", "0"),
             ok_check("warning_events", "0"),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out,
             "  ok cluster      2/2, 0, 0\n\
              \n\
@@ -188,7 +235,7 @@ mod tests {
             ok_check("recent_restarts", "0"),
             ok_check("warning_events", "0"),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out, concat!(
             "  warn cluster      1/2, 0, 0\n",
             "\n",
@@ -208,7 +255,7 @@ mod tests {
             ok_check("recent_restarts", "0"),
             ok_check("warning_events", "0"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
         assert_eq!(json["version"], 1);
         assert_eq!(json["namespace"], "nico");
         assert_eq!(json["summary"]["ok"], 1);
@@ -231,7 +278,7 @@ mod tests {
             ok_check("error_lines", "0 errors"),
             ok_check("source", "loki"),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out,
             "  ok logs         0 errors, loki\n\
              \n\
@@ -248,7 +295,7 @@ mod tests {
             warn_check("pod_error", "core-abc: ERROR: disk full", Some("kubectl logs core-abc -n nico")),
             warn_check("pod_error", "rest-xyz: FATAL: oom", Some("kubectl logs rest-xyz -n nico")),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out, concat!(
             "  warn logs         2 errors, loki, core-abc: ERROR: disk full, rest-xyz: FATAL: oom\n",
             "\n",
@@ -270,7 +317,7 @@ mod tests {
             ok_check("error_lines", "0 errors"),
             ok_check("source", "loki"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
         let layer = &json["layers"][0];
         assert_eq!(layer["name"], "logs");
         assert_eq!(layer["status"], "ok");
@@ -285,7 +332,7 @@ mod tests {
             ok_check("stuck", "0 stuck"),
             ok_check("failed", "0 failed"),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out,
             "  ok workflows    0 stuck, 0 failed\n\
              \n\
@@ -302,7 +349,7 @@ mod tests {
             warn_check("stuck_workflow", "wf-001 (HostProvisioning): 47m running, last: ActivityScheduled",
                 Some("temporal workflow show -w wf-001")),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out, concat!(
             "  warn workflows    1 stuck, 0 failed, wf-001 (HostProvisioning): 47m running, last: ActivityScheduled\n",
             "\n",
@@ -322,7 +369,7 @@ mod tests {
             ok_check("stuck", "0 stuck"),
             ok_check("failed", "0 failed"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
         let layer = &json["layers"][0];
         assert_eq!(layer["name"], "workflows");
         assert_eq!(layer["status"], "ok");
@@ -335,7 +382,7 @@ mod tests {
         let report = Report { layers: vec![layer("health", vec![
             ok_check("endpoints", "2/2 healthy"),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out,
             "  ok health       2/2 healthy\n\
              \n\
@@ -350,7 +397,7 @@ mod tests {
             fail_check("endpoints", "1/2 healthy, 0 degraded, 1 failed", None),
             fail_check("service", "core /healthz failed", Some("curl -s http://core:8080/healthz")),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out, concat!(
             "  fail health       1/2 healthy, 0 degraded, 1 failed, core /healthz failed\n",
             "\n",
@@ -369,7 +416,7 @@ mod tests {
         let report = Report { layers: vec![layer("health", vec![
             ok_check("endpoints", "2/2 healthy"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
         let layer = &json["layers"][0];
         assert_eq!(layer["name"], "health");
         assert_eq!(layer["status"], "ok");
@@ -384,7 +431,7 @@ mod tests {
             ok_check("services", "3 services"),
             ok_check("methods", "21 methods"),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out,
             "  ok grpc         reachable, 3 services, 21 methods\n\
              \n\
@@ -398,7 +445,7 @@ mod tests {
         let report = Report { layers: vec![layer("grpc", vec![
             fail_check("reachable", "unreachable", Some("grpcurl -plaintext localhost:50051 list")),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out, concat!(
             "  fail grpc         unreachable\n",
             "\n",
@@ -418,7 +465,7 @@ mod tests {
             ok_check("services", "3 services"),
             ok_check("methods", "21 methods"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
         let layer = &json["layers"][0];
         assert_eq!(layer["name"], "grpc");
         assert_eq!(layer["status"], "ok");
@@ -433,7 +480,7 @@ mod tests {
             ok_check("pool", "pool 5/20 in-use"),
             ok_check("locks", "0 lock waits"),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out,
             "  ok postgres     pool 5/20 in-use, 0 lock waits\n\
              \n\
@@ -449,7 +496,7 @@ mod tests {
                 Some("SELECT * FROM pg_stat_activity WHERE state != 'idle' ORDER BY query_start")),
             ok_check("locks", "0 lock waits"),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out, concat!(
             "  warn postgres     pool 18/20 in-use, 0 lock waits\n",
             "\n",
@@ -468,7 +515,7 @@ mod tests {
             ok_check("pool", "pool 5/20 in-use"),
             ok_check("locks", "0 lock waits"),
         ])] };
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
         let layer = &json["layers"][0];
         assert_eq!(layer["name"], "postgres");
         assert_eq!(layer["status"], "ok");
@@ -482,7 +529,7 @@ mod tests {
     #[test]
     fn all_ok_fits_within_20_lines() {
         let report = all_ok_report();
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         let lines = out.lines().count();
         assert!(lines <= 20, "default output has {lines} lines, expected <= 20:\n{out}");
     }
@@ -490,7 +537,7 @@ mod tests {
     #[test]
     fn all_ok_human_snapshot() {
         let report = all_ok_report();
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out, concat!(
             "  ok cluster      2/2, 0, 0\n",
             "  ok logs         0 errors, loki\n",
@@ -507,7 +554,7 @@ mod tests {
     #[test]
     fn all_ok_json_snapshot() {
         let report = all_ok_report();
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
         assert_eq!(json["version"], 1);
         assert_eq!(json["namespace"], "nico");
         assert_eq!(json["summary"]["ok"], 6);
@@ -544,7 +591,7 @@ mod tests {
                 ok_check("locks", "0 lock waits"),
             ]),
         ]};
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert_eq!(out, concat!(
             "  ok cluster      2/2, 0, 0\n",
             "  . logs         (skipped)\n",
@@ -565,7 +612,7 @@ mod tests {
             skipped("logs"),
             skipped("grpc"),
         ]};
-        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}))).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())).unwrap();
         assert_eq!(json["summary"]["ok"], 1);
         assert_eq!(json["summary"]["skipped"], 2);
         assert_eq!(json["layers"][1]["status"], "skipped");
@@ -589,7 +636,7 @@ mod tests {
                 ok_check("locks", "0 lock waits"),
             ]),
         ]};
-        let out = format_report(&report, &plain(), true);
+        let out = format_report(&report, &plain(), true, &no_deltas(), false);
         assert_eq!(out, concat!(
             "  ok cluster      2/2, 0, 0\n",
             "      ok pods_ready     2/2\n",
@@ -613,7 +660,7 @@ mod tests {
                 ok_check("warning_events", "0"),
             ]),
         ]};
-        let out = format_report(&report, &plain(), true);
+        let out = format_report(&report, &plain(), true, &no_deltas(), false);
         assert_eq!(out, concat!(
             "  warn cluster      1/2, 0, 0\n",
             "      warn pods_ready     1/2\n",
@@ -632,7 +679,7 @@ mod tests {
             skipped("logs"),
             layer("postgres", vec![ok_check("pool", "pool 5/20 in-use")]),
         ]};
-        let out = format_report(&report, &plain(), true);
+        let out = format_report(&report, &plain(), true, &no_deltas(), false);
         assert_eq!(out, concat!(
             "  . logs         (skipped)\n",
             "  ok postgres     pool 5/20 in-use\n",
@@ -648,7 +695,7 @@ mod tests {
     #[test]
     fn footer_hint_appears_with_no_layers() {
         let report = Report { layers: vec![] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert!(out.contains("Hint: --verbose for details on passing checks, --json for machine output"));
     }
 
@@ -657,7 +704,188 @@ mod tests {
         let report = Report { layers: vec![layer("grpc", vec![
             fail_check("reachable", "unreachable", None),
         ])] };
-        let out = format_report(&report, &plain(), false);
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
         assert!(out.contains("Hint: --verbose for details on passing checks, --json for machine output"));
+    }
+
+    // ── delta badge display ───────────────────────────────────────────────────
+
+    #[test]
+    fn new_badge_shown_when_layer_regresses() {
+        let report = Report { layers: vec![layer("logs", vec![
+            warn_check("error_lines", "2 errors", None),
+        ])] };
+        let deltas = single_delta("logs", Delta::New);
+        let out = format_report(&report, &plain(), false, &deltas, false);
+        assert!(out.contains("[NEW]"), "expected [NEW] badge in:\n{out}");
+    }
+
+    #[test]
+    fn fixed_badge_shown_when_layer_recovers() {
+        let report = Report { layers: vec![layer("cluster", vec![
+            ok_check("pods_ready", "2/2"),
+        ])] };
+        let deltas = single_delta("cluster", Delta::Fixed);
+        let out = format_report(&report, &plain(), false, &deltas, false);
+        assert!(out.contains("[FIXED]"), "expected [FIXED] badge in:\n{out}");
+    }
+
+    #[test]
+    fn no_badge_for_unchanged_layer() {
+        let report = Report { layers: vec![layer("cluster", vec![
+            ok_check("pods_ready", "2/2"),
+        ])] };
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
+        assert!(!out.contains("[NEW]") && !out.contains("[FIXED]"),
+            "expected no badge in:\n{out}");
+    }
+
+    #[test]
+    fn new_badge_snapshot() {
+        let report = Report { layers: vec![
+            layer("logs", vec![warn_check("error_lines", "2 errors", None)]),
+            layer("cluster", vec![ok_check("pods_ready", "2/2")]),
+        ]};
+        let mut deltas = HashMap::new();
+        deltas.insert("logs".to_string(), Delta::New);
+        let out = format_report(&report, &plain(), false, &deltas, false);
+        assert_eq!(out, concat!(
+            "  warn logs         2 errors [NEW]\n",
+            "  ok cluster      2/2\n",
+            "\n",
+            "logs:\n",
+            "  • 2 errors (error_lines)\n",
+            "\n",
+            "Summary: warn  1 warnings, 0 failures\n",
+            "Hint: --verbose for details on passing checks, --json for machine output\n",
+        ));
+    }
+
+    #[test]
+    fn fixed_badge_snapshot() {
+        let report = Report { layers: vec![
+            layer("cluster", vec![ok_check("pods_ready", "2/2")]),
+        ]};
+        let deltas = single_delta("cluster", Delta::Fixed);
+        let out = format_report(&report, &plain(), false, &deltas, false);
+        assert_eq!(out, concat!(
+            "  ok cluster      2/2 [FIXED]\n",
+            "\n",
+            "Summary: ok  0 warnings, 0 failures\n",
+            "Hint: --verbose for details on passing checks, --json for machine output\n",
+        ));
+    }
+
+    // ── spotlight flag ────────────────────────────────────────────────────────
+
+    #[test]
+    fn spotlight_hides_ok_unchanged_layers() {
+        let report = Report { layers: vec![
+            layer("cluster", vec![ok_check("pods_ready", "2/2")]),
+            layer("logs", vec![warn_check("error_lines", "3 errors", None)]),
+        ]};
+        let out = format_report(&report, &plain(), false, &no_deltas(), true);
+        assert!(!out.contains("cluster"), "ok+unchanged cluster should be hidden by spotlight");
+        assert!(out.contains("logs"), "warn layer should still appear");
+    }
+
+    #[test]
+    fn spotlight_hides_skipped_unchanged_layers() {
+        let report = Report { layers: vec![
+            skipped("grpc"),
+            layer("logs", vec![warn_check("error_lines", "1 error", None)]),
+        ]};
+        let out = format_report(&report, &plain(), false, &no_deltas(), true);
+        assert!(!out.contains("grpc"), "skipped+unchanged grpc should be hidden");
+        assert!(out.contains("logs"));
+    }
+
+    #[test]
+    fn spotlight_always_shows_new_delta_even_if_ok() {
+        let report = Report { layers: vec![
+            layer("cluster", vec![ok_check("pods_ready", "2/2")]),
+        ]};
+        let deltas = single_delta("cluster", Delta::Fixed);
+        let out = format_report(&report, &plain(), false, &deltas, true);
+        assert!(out.contains("cluster"), "ok+fixed cluster must be shown by spotlight");
+        assert!(out.contains("[FIXED]"));
+    }
+
+    #[test]
+    fn spotlight_always_shows_new_badge_layers() {
+        let report = Report { layers: vec![
+            layer("logs", vec![warn_check("error_lines", "2 errors", None)]),
+            layer("cluster", vec![ok_check("pods_ready", "2/2")]),
+        ]};
+        let deltas = single_delta("logs", Delta::New);
+        let out = format_report(&report, &plain(), false, &deltas, true);
+        assert!(out.contains("logs"), "warn+new logs must be shown");
+        assert!(out.contains("[NEW]"));
+        assert!(!out.contains("cluster"), "ok+unchanged cluster hidden by spotlight");
+    }
+
+    #[test]
+    fn spotlight_snapshot_shows_only_changed_layers() {
+        let report = Report { layers: vec![
+            layer("cluster", vec![ok_check("pods_ready", "2/2")]),
+            layer("logs", vec![warn_check("error_lines", "2 errors", None)]),
+            layer("grpc", vec![ok_check("reachable", "reachable")]),
+        ]};
+        let deltas = single_delta("logs", Delta::New);
+        let out = format_report(&report, &plain(), false, &deltas, true);
+        assert_eq!(out, concat!(
+            "  warn logs         2 errors [NEW]\n",
+            "\n",
+            "logs:\n",
+            "  • 2 errors (error_lines)\n",
+            "\n",
+            "Summary: warn  1 warnings, 0 failures\n",
+            "Hint: --verbose for details on passing checks, --json for machine output\n",
+        ));
+    }
+
+    // ── JSON delta field ──────────────────────────────────────────────────────
+
+    #[test]
+    fn json_includes_delta_unchanged_by_default() {
+        let report = Report { layers: vec![layer("cluster", vec![ok_check("pods_ready", "2/2")])] };
+        let json: serde_json::Value = serde_json::from_str(
+            &format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())
+        ).unwrap();
+        assert_eq!(json["layers"][0]["delta"], "unchanged");
+    }
+
+    #[test]
+    fn json_includes_delta_new() {
+        let report = Report { layers: vec![layer("logs", vec![warn_check("error_lines", "2 errors", None)])] };
+        let deltas = single_delta("logs", Delta::New);
+        let json: serde_json::Value = serde_json::from_str(
+            &format_json(&report, "nico", serde_json::json!({"ok": true}), &deltas)
+        ).unwrap();
+        assert_eq!(json["layers"][0]["delta"], "new");
+    }
+
+    #[test]
+    fn json_includes_delta_fixed() {
+        let report = Report { layers: vec![layer("cluster", vec![ok_check("pods_ready", "2/2")])] };
+        let deltas = single_delta("cluster", Delta::Fixed);
+        let json: serde_json::Value = serde_json::from_str(
+            &format_json(&report, "nico", serde_json::json!({"ok": true}), &deltas)
+        ).unwrap();
+        assert_eq!(json["layers"][0]["delta"], "fixed");
+    }
+
+    #[test]
+    fn json_all_layers_have_delta_field() {
+        let report = Report { layers: vec![
+            layer("cluster", vec![ok_check("pods_ready", "2/2")]),
+            layer("logs", vec![warn_check("error_lines", "1 error", None)]),
+        ]};
+        let json: serde_json::Value = serde_json::from_str(
+            &format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())
+        ).unwrap();
+        for l in json["layers"].as_array().unwrap() {
+            assert!(l.get("delta").is_some(), "layer {} missing delta field", l["name"]);
+        }
     }
 }

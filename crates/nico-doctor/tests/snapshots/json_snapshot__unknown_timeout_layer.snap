@@ -12,18 +12,21 @@ expression: v
           "value": "2/2"
         }
       ],
+      "delta": "unchanged",
       "duration_ms": 42,
       "name": "cluster",
       "status": "ok"
     },
     {
       "checks": [],
+      "delta": "unchanged",
       "duration_ms": 5000,
       "name": "workflows",
       "status": "unknown"
     },
     {
       "checks": [],
+      "delta": "unchanged",
       "duration_ms": 5000,
       "name": "grpc",
       "status": "unknown"
