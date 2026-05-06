@@ -132,7 +132,7 @@ mod tests {
     impl K8sClient for MockK8s {
         async fn list_pods(&self, _: &str) -> Result<Vec<PodInfo>> {
             Ok(self.pods.iter().map(|p| PodInfo {
-                name: p.name.clone(), ready: p.ready, restart_count: p.restart_count,
+                name: p.name.clone(), ready: p.ready, restart_count: p.restart_count, succeeded: p.succeeded,
             }).collect())
         }
         async fn list_events(&self, _: &str, _: Duration) -> Result<Vec<EventInfo>> {
@@ -174,7 +174,7 @@ mod tests {
     async fn loki_unreachable_falls_back_to_k8s_and_annotates() {
         let loki = Arc::new(MockLoki(MockLokiResponse::Unreachable));
         let k8s = Arc::new(MockK8s {
-            pods: vec![PodInfo { name: "core-abc".into(), ready: true, restart_count: 0 }],
+            pods: vec![PodInfo { name: "core-abc".into(), ready: true, restart_count: 0, succeeded: false }],
             logs: vec![("core-abc".into(), vec![
                 "INFO: started".into(),
                 "ERROR: connection refused".into(),
@@ -195,7 +195,7 @@ mod tests {
     async fn loki_error_falls_back_to_k8s() {
         let loki = Arc::new(MockLoki(MockLokiResponse::Err));
         let k8s = Arc::new(MockK8s {
-            pods: vec![PodInfo { name: "agent-1".into(), ready: true, restart_count: 0 }],
+            pods: vec![PodInfo { name: "agent-1".into(), ready: true, restart_count: 0, succeeded: false }],
             logs: vec![("agent-1".into(), vec!["PANIC: nil pointer".into()])],
         });
         let result = LogsLayer::new(loki, k8s).run(&opts()).await;

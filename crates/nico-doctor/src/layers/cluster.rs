@@ -23,9 +23,10 @@ impl Layer for ClusterLayer {
 
     async fn run(&self, opts: &RunOpts) -> LayerResult {
         let start = Instant::now();
-        let pods = self.k8s.list_pods(&opts.namespace).await.unwrap_or_default();
+        let all_pods = self.k8s.list_pods(&opts.namespace).await.unwrap_or_default();
         let events = self.k8s.list_events(&opts.namespace, opts.since).await.unwrap_or_default();
 
+        let pods: Vec<_> = all_pods.into_iter().filter(|p| !p.succeeded).collect();
         let total = pods.len();
         let ready = pods.iter().filter(|p| p.ready).count();
         let restarts: u32 = pods.iter().map(|p| p.restart_count).sum();
@@ -106,6 +107,7 @@ mod tests {
                 name: p.name.clone(),
                 ready: p.ready,
                 restart_count: p.restart_count,
+                succeeded: p.succeeded,
             }).collect())
         }
         async fn list_events(&self, _namespace: &str, _since: Duration) -> Result<Vec<EventInfo>> {
@@ -142,7 +144,7 @@ mod tests {
     #[tokio::test]
     async fn warning_events_report_warn() {
         let client = Arc::new(MockK8sClient {
-            pods: vec![PodInfo { name: "core-abc".into(), ready: true, restart_count: 0 }],
+            pods: vec![PodInfo { name: "core-abc".into(), ready: true, restart_count: 0, succeeded: false }],
             events: vec![
                 EventInfo { message: "OOMKilled".into(), reason: "OOMKilling".into() },
                 EventInfo { message: "Backoff".into(), reason: "BackOff".into() },
@@ -159,8 +161,8 @@ mod tests {
     async fn pod_with_recent_restarts_reports_warn() {
         let client = Arc::new(MockK8sClient {
             pods: vec![
-                PodInfo { name: "core-abc".into(), ready: true, restart_count: 3 },
-                PodInfo { name: "rest-xyz".into(), ready: true, restart_count: 0 },
+                PodInfo { name: "core-abc".into(), ready: true, restart_count: 3, succeeded: false },
+                PodInfo { name: "rest-xyz".into(), ready: true, restart_count: 0, succeeded: false },
             ],
             events: vec![],
         });
@@ -175,8 +177,8 @@ mod tests {
     async fn pod_not_ready_reports_warn() {
         let client = Arc::new(MockK8sClient {
             pods: vec![
-                PodInfo { name: "core-abc".into(), ready: true, restart_count: 0 },
-                PodInfo { name: "rest-xyz".into(), ready: false, restart_count: 0 },
+                PodInfo { name: "core-abc".into(), ready: true, restart_count: 0, succeeded: false },
+                PodInfo { name: "rest-xyz".into(), ready: false, restart_count: 0, succeeded: false },
             ],
             events: vec![],
         });
@@ -192,8 +194,8 @@ mod tests {
     async fn all_pods_ready_no_issues_reports_ok() {
         let client = Arc::new(MockK8sClient {
             pods: vec![
-                PodInfo { name: "core-abc".into(), ready: true, restart_count: 0 },
-                PodInfo { name: "rest-xyz".into(), ready: true, restart_count: 0 },
+                PodInfo { name: "core-abc".into(), ready: true, restart_count: 0, succeeded: false },
+                PodInfo { name: "rest-xyz".into(), ready: true, restart_count: 0, succeeded: false },
             ],
             events: vec![],
         });
@@ -202,5 +204,20 @@ mod tests {
         assert_eq!(check_value(&result, "pods_ready"), "2/2");
         assert_eq!(check_value(&result, "recent_restarts"), "0");
         assert_eq!(check_value(&result, "warning_events"), "0");
+    }
+
+    #[tokio::test]
+    async fn succeeded_pod_excluded_from_readiness_count() {
+        let client = Arc::new(MockK8sClient {
+            pods: vec![
+                PodInfo { name: "core-abc".into(), ready: true, restart_count: 0, succeeded: false },
+                PodInfo { name: "migrate-job-xyz".into(), ready: false, restart_count: 0, succeeded: true },
+            ],
+            events: vec![],
+        });
+        let result = ClusterLayer::new(client).run(&opts()).await;
+        assert_eq!(result.status, Status::Ok, "succeeded pods must not trigger a warning");
+        assert_eq!(check_value(&result, "pods_ready"), "1/1");
+        assert_eq!(check_value(&result, "recent_restarts"), "0");
     }
 }
