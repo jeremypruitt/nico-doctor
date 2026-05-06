@@ -8,6 +8,7 @@ use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat, Reac
 use nico_common::output::{OutputMode, Status};
 use nico_common::reach::ReachManager;
 
+mod baseline;
 mod formatter;
 mod grpc;
 mod http;
@@ -333,6 +334,9 @@ async fn main() {
         }
     };
 
+    // Read prior baseline before layers run; missing file is a no-op.
+    let _baseline = baseline::load();
+
     let mut layers: Vec<Box<dyn layer::Layer>> = vec![];
 
     for &name in LAYER_ORDER {
@@ -466,13 +470,22 @@ async fn main() {
     // Port-forward guards are dropped here, cleanly closing all forwards.
     drop(_pf_guards);
 
+    let code = exit_code(&report);
+
+    // Persist baseline after a completed diagnostic run (exit 0/1/2).
+    // Skip on exit 3: a pre-flight failure exits before this point, and an
+    // all-Unknown run must not overwrite a good baseline with stale data.
+    if code != 3 {
+        baseline::save(&report);
+    }
+
     if matches!(config.output.format, OutputFormat::Json) {
         println!("{}", formatter::format_json(&report, &config.cluster.namespace, preflight::ok_section()));
     } else {
         print!("{}", formatter::format_report(&report, &mode, cli.verbose));
     }
 
-    process::exit(exit_code(&report));
+    process::exit(code);
 }
 
 async fn run_layers_tui(
