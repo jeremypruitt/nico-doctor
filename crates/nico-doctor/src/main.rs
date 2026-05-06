@@ -16,6 +16,7 @@ mod http;
 mod k8s;
 mod layer;
 mod layers;
+mod log_source;
 mod loki;
 mod postgres;
 mod preflight;
@@ -372,16 +373,20 @@ async fn main() {
             "logs" => {
                 match (k8s_client.as_ref(), loki_url.is_some()) {
                     (Some(k8s), _) => {
-                        layers.push(Box::new(layers::logs::LogsLayer::new(
-                            loki_client.clone(),
-                            k8s.clone(),
-                        )));
+                        let chain = log_source::best_effort_chain(vec![
+                            Arc::new(loki::LokiLogSource::new(loki_client.clone())),
+                            Arc::new(log_source::K8sLogSource::new(k8s.clone())),
+                        ]);
+                        layers.push(Box::new(layers::logs::LogsLayer::new(chain)));
                     }
                     (None, true) => {
-                        layers.push(Box::new(layers::logs::LogsLayer::new(
-                            loki_client.clone(),
-                            Arc::new(Unavailable { reason: "kubeconfig not found" }),
-                        )));
+                        let chain = log_source::best_effort_chain(vec![
+                            Arc::new(loki::LokiLogSource::new(loki_client.clone())),
+                            Arc::new(log_source::K8sLogSource::new(
+                                Arc::new(Unavailable { reason: "kubeconfig not found" }),
+                            )),
+                        ]);
+                        layers.push(Box::new(layers::logs::LogsLayer::new(chain)));
                     }
                     (None, false) => {
                         layers.push(layer::UnconfiguredLayer::new(

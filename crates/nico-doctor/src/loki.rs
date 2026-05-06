@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
+
+use crate::log_source::{LogCollection, LogSource};
 
 pub struct LokiLine {
     pub pod: String,
@@ -101,5 +104,36 @@ impl LokiClient for RealLokiClient {
         }
 
         Ok(LokiQueryResult::Lines(lines))
+    }
+}
+
+pub struct LokiLogSource {
+    client: Arc<dyn LokiClient>,
+}
+
+impl LokiLogSource {
+    pub fn new(client: Arc<dyn LokiClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl LogSource for LokiLogSource {
+    fn name(&self) -> &str { "loki" }
+
+    async fn collect(
+        &self,
+        namespace: &str,
+        since: Duration,
+        limit: usize,
+    ) -> Result<LogCollection> {
+        match self.client.query_errors(namespace, since, limit).await? {
+            LokiQueryResult::Lines(lines) => Ok(LogCollection {
+                label: "loki".to_string(),
+                primary_ok: true,
+                entries: lines.into_iter().map(|l| (l.pod, l.text)).collect(),
+            }),
+            LokiQueryResult::Unreachable => Err(anyhow!("loki unreachable")),
+        }
     }
 }
