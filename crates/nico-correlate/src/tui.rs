@@ -571,10 +571,9 @@ fn render_timeline(
     };
 
     if show_placeholder {
-        let dim = Style::default().add_modifier(Modifier::DIM);
-        let placeholder = ListItem::new(Line::from(Span::styled("waiting for sources\u{2026}", dim)));
+        let placeholder = ListItem::new(Line::from(Span::raw("waiting for sources\u{2026}")));
         let list = List::new(vec![placeholder]);
-        frame.render_stateful_widget(list, list_area, &mut state.list_state);
+        frame.render_widget(list, list_area);
     } else {
         let items: Vec<ListItem> = filtered.iter().enumerate().map(|(vis_idx, &raw_idx)| {
             let e = &state.events[raw_idx];
@@ -2000,6 +1999,138 @@ mod tests {
         assert!(
             all_rows.contains("source_error"),
             "Expected 'source_error' event in timeline: {all_rows}"
+        );
+    }
+
+    // ─── Issue #90: phantom grey bar in Timeline pane ─────────────────────────
+
+    #[test]
+    fn placeholder_row_is_not_dimmed() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = IncrementalState::new(&config); // sources still fetching
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        // The placeholder text must be present.
+        let row1 = row_str(&buf, 1, 120);
+        assert!(
+            row1.contains("waiting for sources"),
+            "Placeholder text not rendered: {row1}"
+        );
+        // No DIM modifier — invisible text looks like a grey bar.
+        let dim_cells: Vec<u16> = (1..71)
+            .filter(|&x| {
+                buf.cell((x, 1))
+                   .map(|c| c.modifier.contains(Modifier::DIM))
+                   .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            dim_cells.is_empty(),
+            "Placeholder row has DIM modifier at x={dim_cells:?}; makes text invisible against grey bg"
+        );
+    }
+
+    #[test]
+    fn placeholder_row_has_no_reversed_modifier() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = IncrementalState::new(&config);
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let reversed_cells: Vec<u16> = (1..71)
+            .filter(|&x| {
+                buf.cell((x, 1))
+                   .map(|c| c.modifier.contains(Modifier::REVERSED))
+                   .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            reversed_cells.is_empty(),
+            "Phantom REVERSED on Timeline placeholder row at x={reversed_cells:?}"
+        );
+    }
+
+    #[test]
+    fn first_event_row_has_no_reversed_when_unselected() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config); // all sources done, selected == None
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let reversed_cells: Vec<u16> = (1..71)
+            .filter(|&x| {
+                buf.cell((x, 1))
+                   .map(|c| c.modifier.contains(Modifier::REVERSED))
+                   .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            reversed_cells.is_empty(),
+            "First event row has unexpected REVERSED at x={reversed_cells:?} with no selection"
+        );
+    }
+
+    #[test]
+    fn first_event_row_has_reversed_only_when_explicitly_selected() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+        state.select_first(); // explicit ↓ / select
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let reversed_cells: Vec<u16> = (1..71)
+            .filter(|&x| {
+                buf.cell((x, 1))
+                   .map(|c| c.modifier.contains(Modifier::REVERSED))
+                   .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !reversed_cells.is_empty(),
+            "Selected first row should have REVERSED modifier but found none"
+        );
+    }
+
+    #[test]
+    fn second_event_row_has_no_reversed_when_first_is_selected() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let config = sample_config();
+        let ctx = TuiContext { mode: OutputMode { color: false, ascii: false } };
+        let mut state = sample_state(&config);
+        state.select_first(); // first row selected, second should be plain
+
+        terminal.draw(|f| render(f, &config, &ctx, &mut state)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        // Row y=2 is the second event row.
+        let reversed_cells: Vec<u16> = (1..71)
+            .filter(|&x| {
+                buf.cell((x, 2))
+                   .map(|c| c.modifier.contains(Modifier::REVERSED))
+                   .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            reversed_cells.is_empty(),
+            "Non-selected second row has unexpected REVERSED at x={reversed_cells:?}"
         );
     }
 }
