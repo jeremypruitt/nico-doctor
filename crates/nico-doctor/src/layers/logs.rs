@@ -2,25 +2,18 @@ use std::sync::Arc;
 use std::time::Instant;
 use async_trait::async_trait;
 use nico_common::output::Status;
-use crate::k8s::K8sClient;
-use crate::loki::{LokiClient, LokiQueryResult};
+use crate::log_source::LogSource;
 use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
 
 const LOG_LINE_LIMIT: usize = 500;
 
-fn is_error_line(s: &str) -> bool {
-    let l = s.to_lowercase();
-    l.contains("error") || l.contains("panic") || l.contains("fatal")
-}
-
 pub struct LogsLayer {
-    loki: Arc<dyn LokiClient>,
-    k8s: Arc<dyn K8sClient>,
+    source: Arc<dyn LogSource>,
 }
 
 impl LogsLayer {
-    pub fn new(loki: Arc<dyn LokiClient>, k8s: Arc<dyn K8sClient>) -> Self {
-        Self { loki, k8s }
+    pub fn new(source: Arc<dyn LogSource>) -> Self {
+        Self { source }
     }
 }
 
@@ -32,28 +25,9 @@ impl Layer for LogsLayer {
         let start = Instant::now();
 
         let (pod_errors, source_label, source_ok) =
-            match self.loki.query_errors(&opts.namespace, opts.since, LOG_LINE_LIMIT).await {
-                Ok(LokiQueryResult::Lines(lines)) => {
-                    let errors: Vec<(String, String)> = lines.into_iter()
-                        .map(|l| (l.pod, l.text))
-                        .collect();
-                    (errors, "loki".to_string(), true)
-                }
-                _ => {
-                    let pods = self.k8s.list_pods(&opts.namespace).await.unwrap_or_default();
-                    let mut errors = Vec::new();
-                    for pod in &pods {
-                        let lines = self.k8s.pod_logs(&opts.namespace, &pod.name, opts.since)
-                            .await
-                            .unwrap_or_default();
-                        for line in lines.into_iter().take(LOG_LINE_LIMIT) {
-                            if is_error_line(&line) {
-                                errors.push((pod.name.clone(), line));
-                            }
-                        }
-                    }
-                    (errors, "k8s (loki unavailable)".to_string(), false)
-                }
+            match self.source.collect(&opts.namespace, opts.since, LOG_LINE_LIMIT).await {
+                Ok(c) => (c.entries, c.label, c.primary_ok),
+                Err(_) => (Vec::new(), "unavailable".to_string(), false),
             };
 
         let checks = checks_from(&pod_errors, &source_label, source_ok, &opts.namespace);
@@ -113,109 +87,39 @@ mod tests {
     use std::time::Duration;
     use anyhow::Result;
     use async_trait::async_trait;
-    use crate::k8s::{EventInfo, PodInfo};
-    use crate::loki::{LokiLine, LokiQueryResult};
-
-    enum MockLokiResponse { Lines(Vec<(String, String)>), Unreachable, Err }
-
-    struct MockLoki(MockLokiResponse);
-
-    #[async_trait]
-    impl LokiClient for MockLoki {
-        async fn query_errors(&self, _: &str, _: Duration, _: usize) -> Result<LokiQueryResult> {
-            match &self.0 {
-                MockLokiResponse::Lines(ls) => Ok(LokiQueryResult::Lines(ls.iter().map(|(p, t)| LokiLine {
-                    pod: p.clone(), text: t.clone(),
-                }).collect())),
-                MockLokiResponse::Unreachable => Ok(LokiQueryResult::Unreachable),
-                MockLokiResponse::Err => Err(anyhow::anyhow!("loki error")),
-            }
-        }
-    }
-
-    struct MockK8s {
-        pods: Vec<PodInfo>,
-        logs: Vec<(String, Vec<String>)>,
-    }
-
-    #[async_trait]
-    impl K8sClient for MockK8s {
-        async fn list_pods(&self, _: &str) -> Result<Vec<PodInfo>> {
-            Ok(self.pods.iter().map(|p| PodInfo {
-                name: p.name.clone(), ready: p.ready, restart_count: p.restart_count, succeeded: p.succeeded,
-            }).collect())
-        }
-        async fn list_events(&self, _: &str, _: Duration) -> Result<Vec<EventInfo>> {
-            Ok(vec![])
-        }
-        async fn pod_logs(&self, _: &str, pod: &str, _: Duration) -> Result<Vec<String>> {
-            Ok(self.logs.iter()
-                .find(|(name, _)| name == pod)
-                .map(|(_, lines)| lines.clone())
-                .unwrap_or_default())
-        }
-    }
+    use crate::log_source::{LogCollection, LogSource};
 
     fn opts() -> RunOpts {
         RunOpts { namespace: "nico".into(), since: Duration::from_secs(600), timeout: Duration::from_secs(5) }
     }
 
-    #[tokio::test]
-    async fn loki_errors_show_as_warn_with_kubectl_hints() {
-        let loki = Arc::new(MockLoki(MockLokiResponse::Lines(vec![
-            ("core-abc".into(), "ERROR: disk full".into()),
-            ("rest-xyz".into(), "FATAL: oom".into()),
-        ])));
-        let k8s = Arc::new(MockK8s { pods: vec![], logs: vec![] });
-        let result = LogsLayer::new(loki, k8s).run(&opts()).await;
-
-        assert_eq!(result.status, Status::Warn);
-        let err_check = result.checks.iter().find(|c| c.name == "error_lines").unwrap();
-        assert_eq!(err_check.value, "2 errors");
-        let src = result.checks.iter().find(|c| c.name == "source").unwrap();
-        assert_eq!(src.value, "loki");
-        assert_eq!(src.status, Status::Ok);
-        let pod_errors: Vec<_> = result.checks.iter().filter(|c| c.name == "pod_error").collect();
-        assert_eq!(pod_errors.len(), 2);
-        assert!(pod_errors[0].next_command.as_deref().unwrap().starts_with("kubectl logs"));
+    struct FakeLogSource {
+        label: String,
+        primary_ok: bool,
+        entries: Vec<(String, String)>,
     }
 
-    #[tokio::test]
-    async fn loki_unreachable_falls_back_to_k8s_and_annotates() {
-        let loki = Arc::new(MockLoki(MockLokiResponse::Unreachable));
-        let k8s = Arc::new(MockK8s {
-            pods: vec![PodInfo { name: "core-abc".into(), ready: true, restart_count: 0, succeeded: false }],
-            logs: vec![("core-abc".into(), vec![
-                "INFO: started".into(),
-                "ERROR: connection refused".into(),
-            ])],
-        });
-        let result = LogsLayer::new(loki, k8s).run(&opts()).await;
-
-        assert_eq!(result.status, Status::Warn);
-        let src = result.checks.iter().find(|c| c.name == "source").unwrap();
-        assert!(src.value.contains("loki unavailable"), "source value: {}", src.value);
-        assert_eq!(src.status, Status::Warn);
-        let pod_errors: Vec<_> = result.checks.iter().filter(|c| c.name == "pod_error").collect();
-        assert_eq!(pod_errors.len(), 1);
-        assert!(pod_errors[0].value.contains("core-abc"));
+    impl FakeLogSource {
+        fn new(label: &str, primary_ok: bool, entries: Vec<(&str, &str)>) -> Self {
+            Self {
+                label: label.to_string(),
+                primary_ok,
+                entries: entries.into_iter().map(|(p, t)| (p.to_string(), t.to_string())).collect(),
+            }
+        }
     }
 
-    #[tokio::test]
-    async fn loki_error_falls_back_to_k8s() {
-        let loki = Arc::new(MockLoki(MockLokiResponse::Err));
-        let k8s = Arc::new(MockK8s {
-            pods: vec![PodInfo { name: "agent-1".into(), ready: true, restart_count: 0, succeeded: false }],
-            logs: vec![("agent-1".into(), vec!["PANIC: nil pointer".into()])],
-        });
-        let result = LogsLayer::new(loki, k8s).run(&opts()).await;
+    #[async_trait]
+    impl LogSource for FakeLogSource {
+        fn name(&self) -> &str { &self.label }
 
-        assert_eq!(result.status, Status::Warn);
-        let src = result.checks.iter().find(|c| c.name == "source").unwrap();
-        assert!(src.value.contains("loki unavailable"));
-        let pod_errors: Vec<_> = result.checks.iter().filter(|c| c.name == "pod_error").collect();
-        assert_eq!(pod_errors.len(), 1);
-        assert!(pod_errors[0].value.contains("PANIC"));
+        async fn collect(&self, _: &str, _: Duration, _: usize) -> Result<LogCollection> {
+            Ok(LogCollection {
+                label: self.label.clone(),
+                primary_ok: self.primary_ok,
+                entries: self.entries.clone(),
+            })
+        }
     }
 
     #[test]
@@ -248,11 +152,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_errors_reports_ok() {
-        let loki = Arc::new(MockLoki(MockLokiResponse::Lines(vec![])));
-        let k8s = Arc::new(MockK8s { pods: vec![], logs: vec![] });
-        let result = LogsLayer::new(loki, k8s).run(&opts()).await;
+    async fn primary_source_with_errors_reports_warn_with_kubectl_hints() {
+        let source: Arc<dyn LogSource> = Arc::new(FakeLogSource::new(
+            "loki", true,
+            vec![("core-abc", "ERROR: disk full"), ("rest-xyz", "FATAL: oom")],
+        ));
+        let result = LogsLayer::new(source).run(&opts()).await;
 
+        assert_eq!(result.status, Status::Warn);
+        let err_check = result.checks.iter().find(|c| c.name == "error_lines").unwrap();
+        assert_eq!(err_check.value, "2 errors");
+        let src = result.checks.iter().find(|c| c.name == "source").unwrap();
+        assert_eq!(src.value, "loki");
+        assert_eq!(src.status, Status::Ok);
+        let pod_errors: Vec<_> = result.checks.iter().filter(|c| c.name == "pod_error").collect();
+        assert_eq!(pod_errors.len(), 2);
+        assert!(pod_errors[0].next_command.as_deref().unwrap().starts_with("kubectl logs"));
+    }
+
+    #[tokio::test]
+    async fn fallback_source_marks_source_warn_and_keeps_label() {
+        let source: Arc<dyn LogSource> = Arc::new(FakeLogSource::new(
+            "k8s (loki unavailable)", false,
+            vec![("core-abc", "ERROR: connection refused")],
+        ));
+        let result = LogsLayer::new(source).run(&opts()).await;
+
+        assert_eq!(result.status, Status::Warn);
+        let src = result.checks.iter().find(|c| c.name == "source").unwrap();
+        assert!(src.value.contains("loki unavailable"));
+        assert_eq!(src.status, Status::Warn);
+    }
+
+    #[tokio::test]
+    async fn empty_source_reports_ok() {
+        let source: Arc<dyn LogSource> = Arc::new(FakeLogSource::new("loki", true, vec![]));
+        let result = LogsLayer::new(source).run(&opts()).await;
         assert_eq!(result.status, Status::Ok);
         let err_check = result.checks.iter().find(|c| c.name == "error_lines").unwrap();
         assert_eq!(err_check.value, "0 errors");
