@@ -5,6 +5,62 @@ use nico_common::output::Status;
 use crate::http::{HttpClient, ServiceEndpoint};
 use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
 
+enum ProbeOutcome { Healthy, Degraded, Failed }
+
+struct ServiceProbe {
+    name: String,
+    base_url: String,
+    outcome: ProbeOutcome,
+}
+
+fn checks_from(probes: &[ServiceProbe]) -> Vec<Check> {
+    let total = probes.len();
+    let healthy = probes.iter().filter(|p| matches!(p.outcome, ProbeOutcome::Healthy)).count();
+    let degraded = probes.iter().filter(|p| matches!(p.outcome, ProbeOutcome::Degraded)).count();
+    let failed = probes.iter().filter(|p| matches!(p.outcome, ProbeOutcome::Failed)).count();
+
+    let summary_value = if degraded == 0 && failed == 0 {
+        format!("{healthy}/{total} healthy")
+    } else {
+        format!("{healthy}/{total} healthy, {degraded} degraded, {failed} failed")
+    };
+
+    let summary_status = if failed > 0 {
+        Status::Fail
+    } else if degraded > 0 {
+        Status::Warn
+    } else {
+        Status::Ok
+    };
+
+    let mut checks = vec![Check {
+        name: "endpoints",
+        status: summary_status,
+        value: summary_value,
+        next_command: None,
+    }];
+
+    for probe in probes {
+        match probe.outcome {
+            ProbeOutcome::Failed => checks.push(Check {
+                name: "service",
+                status: Status::Fail,
+                value: format!("{} /healthz failed", probe.name),
+                next_command: Some(format!("curl -s {}/healthz", probe.base_url)),
+            }),
+            ProbeOutcome::Degraded => checks.push(Check {
+                name: "service",
+                status: Status::Warn,
+                value: format!("{} degraded (/readyz)", probe.name),
+                next_command: Some(format!("curl -s {}/readyz", probe.base_url)),
+            }),
+            ProbeOutcome::Healthy => {}
+        }
+    }
+
+    checks
+}
+
 pub struct HealthLayer {
     client: Arc<dyn HttpClient>,
     services: Vec<ServiceEndpoint>,
@@ -22,11 +78,7 @@ impl Layer for HealthLayer {
 
     async fn run(&self, _opts: &RunOpts) -> LayerResult {
         let start = Instant::now();
-        let total = self.services.len();
-        let mut healthy = 0usize;
-        let mut degraded = 0usize;
-        let mut failed = 0usize;
-        let mut findings: Vec<Check> = Vec::new();
+        let mut probes = Vec::new();
 
         for svc in &self.services {
             let healthz_ok = self.client
@@ -36,12 +88,10 @@ impl Layer for HealthLayer {
                 .unwrap_or(false);
 
             if !healthz_ok {
-                failed += 1;
-                findings.push(Check {
-                    name: "service",
-                    status: Status::Fail,
-                    value: format!("{} /healthz failed", svc.name),
-                    next_command: Some(format!("curl -s {}/healthz", svc.base_url)),
+                probes.push(ServiceProbe {
+                    name: svc.name.clone(),
+                    base_url: svc.base_url.clone(),
+                    outcome: ProbeOutcome::Failed,
                 });
                 continue;
             }
@@ -53,40 +103,21 @@ impl Layer for HealthLayer {
                 .unwrap_or(false);
 
             if !readyz_ok {
-                degraded += 1;
-                findings.push(Check {
-                    name: "service",
-                    status: Status::Warn,
-                    value: format!("{} degraded (/readyz)", svc.name),
-                    next_command: Some(format!("curl -s {}/readyz", svc.base_url)),
+                probes.push(ServiceProbe {
+                    name: svc.name.clone(),
+                    base_url: svc.base_url.clone(),
+                    outcome: ProbeOutcome::Degraded,
                 });
             } else {
-                healthy += 1;
+                probes.push(ServiceProbe {
+                    name: svc.name.clone(),
+                    base_url: svc.base_url.clone(),
+                    outcome: ProbeOutcome::Healthy,
+                });
             }
         }
 
-        let summary_value = if degraded == 0 && failed == 0 {
-            format!("{healthy}/{total} healthy")
-        } else {
-            format!("{healthy}/{total} healthy, {degraded} degraded, {failed} failed")
-        };
-
-        let summary_status = if failed > 0 {
-            Status::Fail
-        } else if degraded > 0 {
-            Status::Warn
-        } else {
-            Status::Ok
-        };
-
-        let mut checks = vec![Check {
-            name: "endpoints",
-            status: summary_status,
-            value: summary_value,
-            next_command: None,
-        }];
-        checks.extend(findings);
-
+        let checks = checks_from(&probes);
         let overall = aggregate_status(&checks);
 
         LayerResult {
@@ -136,6 +167,58 @@ mod tests {
 
     fn svc(name: &str, base_url: &str) -> ServiceEndpoint {
         ServiceEndpoint { name: name.into(), base_url: base_url.into() }
+    }
+
+    fn probe(name: &str, base_url: &str, outcome: ProbeOutcome) -> ServiceProbe {
+        ServiceProbe { name: name.into(), base_url: base_url.into(), outcome }
+    }
+
+    #[test]
+    fn checks_from_all_healthy_is_ok() {
+        let probes = vec![
+            probe("core", "http://core:8080", ProbeOutcome::Healthy),
+            probe("rest", "http://rest:8080", ProbeOutcome::Healthy),
+        ];
+        let checks = checks_from(&probes);
+        let ep = checks.iter().find(|c| c.name == "endpoints").unwrap();
+        assert_eq!(ep.status, Status::Ok);
+        assert_eq!(checks.iter().filter(|c| c.name == "service").count(), 0);
+    }
+
+    #[test]
+    fn checks_from_degraded_probe_is_warn() {
+        let probes = vec![probe("core", "http://core:8080", ProbeOutcome::Degraded)];
+        let checks = checks_from(&probes);
+        let ep = checks.iter().find(|c| c.name == "endpoints").unwrap();
+        assert_eq!(ep.status, Status::Warn);
+        let svc = checks.iter().find(|c| c.name == "service").unwrap();
+        assert_eq!(svc.status, Status::Warn);
+    }
+
+    #[test]
+    fn checks_from_failed_probe_is_fail() {
+        let probes = vec![probe("core", "http://core:8080", ProbeOutcome::Failed)];
+        let checks = checks_from(&probes);
+        let ep = checks.iter().find(|c| c.name == "endpoints").unwrap();
+        assert_eq!(ep.status, Status::Fail);
+        let svc = checks.iter().find(|c| c.name == "service").unwrap();
+        assert_eq!(svc.status, Status::Fail);
+    }
+
+    #[test]
+    fn checks_from_mixed_produces_correct_service_check_count() {
+        let probes = vec![
+            probe("a", "http://a:8080", ProbeOutcome::Healthy),
+            probe("b", "http://b:8080", ProbeOutcome::Degraded),
+            probe("c", "http://c:8080", ProbeOutcome::Failed),
+        ];
+        let checks = checks_from(&probes);
+        let ep = checks.iter().find(|c| c.name == "endpoints").unwrap();
+        assert_eq!(ep.status, Status::Fail);
+        let svc_checks: Vec<_> = checks.iter().filter(|c| c.name == "service").collect();
+        assert_eq!(svc_checks.len(), 2);
+        assert!(svc_checks.iter().any(|c| c.status == Status::Warn));
+        assert!(svc_checks.iter().any(|c| c.status == Status::Fail));
     }
 
     #[tokio::test]
