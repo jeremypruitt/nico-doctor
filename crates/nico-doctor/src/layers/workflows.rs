@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::temporal::{FailedWorkflow, RunningWorkflow, TemporalClient};
-use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
+use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
 
 pub struct WorkflowsLayer {
     temporal: Arc<dyn TemporalClient>,
@@ -20,8 +20,7 @@ impl WorkflowsLayer {
 impl Layer for WorkflowsLayer {
     fn name(&self) -> &'static str { "workflows" }
 
-    async fn run(&self, opts: &RunOpts) -> LayerResult {
-        let start = Instant::now();
+    async fn collect(&self, opts: &RunOpts) -> LayerOutcome {
         let now = SystemTime::now();
         let stuck_before = now.checked_sub(self.stuck_threshold).unwrap_or(SystemTime::UNIX_EPOCH);
         let failed_since = now.checked_sub(opts.since).unwrap_or(SystemTime::UNIX_EPOCH);
@@ -29,15 +28,7 @@ impl Layer for WorkflowsLayer {
         let stuck = self.temporal.list_stuck(&opts.namespace, stuck_before).await.unwrap_or_default();
         let failed = self.temporal.list_failed(&opts.namespace, failed_since).await.unwrap_or_default();
 
-        let checks = checks_from(&stuck, &failed, now);
-        let overall = aggregate_status(&checks);
-
-        LayerResult {
-            name: "workflows",
-            status: overall,
-            checks,
-            duration_ms: start.elapsed().as_millis() as u64,
-        }
+        LayerOutcome::Checks(checks_from(&stuck, &failed, now))
     }
 }
 

@@ -1,9 +1,8 @@
 use std::sync::Arc;
-use std::time::Instant;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::grpc::{GrpcInspectResult, GrpcInspector};
-use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
+use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
 
 pub struct GrpcLayer {
     inspector: Arc<dyn GrpcInspector>,
@@ -20,18 +19,10 @@ impl GrpcLayer {
 impl Layer for GrpcLayer {
     fn name(&self) -> &'static str { "grpc" }
 
-    async fn run(&self, _opts: &RunOpts) -> LayerResult {
-        let start = Instant::now();
+    async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
         let result = self.inspector.inspect(&self.addr).await
             .unwrap_or(GrpcInspectResult::Unreachable);
-        let checks = checks_from(&result, &self.addr);
-        let overall = aggregate_status(&checks);
-        LayerResult {
-            name: "grpc",
-            status: overall,
-            checks,
-            duration_ms: start.elapsed().as_millis() as u64,
-        }
+        LayerOutcome::Checks(checks_from(&result, &self.addr))
     }
 }
 

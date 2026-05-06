@@ -49,7 +49,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use async_trait::async_trait;
-    use crate::layer::RunOpts;
+    use crate::layer::{Check, LayerOutcome, RunOpts};
 
     struct StubLayer {
         name: &'static str,
@@ -68,8 +68,13 @@ mod tests {
     #[async_trait]
     impl Layer for StubLayer {
         fn name(&self) -> &'static str { self.name }
-        async fn run(&self, _opts: &RunOpts) -> LayerResult {
-            LayerResult { name: self.name, status: self.result.clone(), checks: vec![], duration_ms: 0 }
+        async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
+            LayerOutcome::Checks(vec![Check {
+                name: "stub",
+                status: self.result.clone(),
+                value: String::new(),
+                next_command: None,
+            }])
         }
     }
 
@@ -82,9 +87,9 @@ mod tests {
     #[async_trait]
     impl Layer for SlowLayer {
         fn name(&self) -> &'static str { self.name }
-        async fn run(&self, _opts: &RunOpts) -> LayerResult {
+        async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
             tokio::time::sleep(self.delay).await;
-            LayerResult { name: self.name, status: Status::Ok, checks: vec![], duration_ms: 0 }
+            LayerOutcome::Checks(vec![])
         }
     }
 

@@ -1,9 +1,8 @@
 use std::sync::Arc;
-use std::time::Instant;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::k8s::K8sClient;
-use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
+use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
 
 pub struct ClusterLayer {
     k8s: Arc<dyn K8sClient>,
@@ -21,19 +20,11 @@ impl Layer for ClusterLayer {
         "cluster"
     }
 
-    async fn run(&self, opts: &RunOpts) -> LayerResult {
-        let start = Instant::now();
+    async fn collect(&self, opts: &RunOpts) -> LayerOutcome {
         let all_pods = self.k8s.list_pods(&opts.namespace).await.unwrap_or_default();
         let events = self.k8s.list_events(&opts.namespace, opts.since).await.unwrap_or_default();
         let pods: Vec<_> = all_pods.into_iter().filter(|p| !p.succeeded).collect();
-        let checks = checks_from(&pods, &events, &opts.namespace);
-        let overall = aggregate_status(&checks);
-        LayerResult {
-            name: "cluster",
-            status: overall,
-            checks,
-            duration_ms: start.elapsed().as_millis() as u64,
-        }
+        LayerOutcome::Checks(checks_from(&pods, &events, &opts.namespace))
     }
 }
 
@@ -91,6 +82,7 @@ mod tests {
     use async_trait::async_trait;
     use nico_common::output::Status;
     use crate::k8s::{EventInfo, PodInfo};
+    use crate::layer::LayerResult;
 
     #[test]
     fn checks_from_all_healthy_returns_three_ok_checks() {

@@ -1,9 +1,8 @@
 use std::sync::Arc;
-use std::time::Instant;
 use async_trait::async_trait;
 use nico_common::output::Status;
 use crate::log_source::LogSource;
-use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
+use crate::layer::{Check, Layer, LayerOutcome, RunOpts};
 
 const LOG_LINE_LIMIT: usize = 500;
 
@@ -21,24 +20,14 @@ impl LogsLayer {
 impl Layer for LogsLayer {
     fn name(&self) -> &'static str { "logs" }
 
-    async fn run(&self, opts: &RunOpts) -> LayerResult {
-        let start = Instant::now();
-
+    async fn collect(&self, opts: &RunOpts) -> LayerOutcome {
         let (pod_errors, source_label, source_ok) =
             match self.source.collect(&opts.namespace, opts.since, LOG_LINE_LIMIT).await {
                 Ok(c) => (c.entries, c.label, c.primary_ok),
                 Err(_) => (Vec::new(), "unavailable".to_string(), false),
             };
 
-        let checks = checks_from(&pod_errors, &source_label, source_ok, &opts.namespace);
-        let overall = aggregate_status(&checks);
-
-        LayerResult {
-            name: "logs",
-            status: overall,
-            checks,
-            duration_ms: start.elapsed().as_millis() as u64,
-        }
+        LayerOutcome::Checks(checks_from(&pod_errors, &source_label, source_ok, &opts.namespace))
     }
 }
 
@@ -87,6 +76,7 @@ mod tests {
     use std::time::Duration;
     use anyhow::Result;
     use async_trait::async_trait;
+    use crate::layer::aggregate_status;
     use crate::log_source::{LogCollection, LogSource};
 
     fn opts() -> RunOpts {
