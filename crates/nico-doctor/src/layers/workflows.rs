@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 use nico_common::output::Status;
-use crate::temporal::TemporalClient;
+use crate::temporal::{FailedWorkflow, RunningWorkflow, TemporalClient};
 use crate::layer::{aggregate_status, Check, Layer, LayerResult, RunOpts};
 
 pub struct WorkflowsLayer {
@@ -29,49 +29,7 @@ impl Layer for WorkflowsLayer {
         let stuck = self.temporal.list_stuck(&opts.namespace, stuck_before).await.unwrap_or_default();
         let failed = self.temporal.list_failed(&opts.namespace, failed_since).await.unwrap_or_default();
 
-        let mut checks = vec![
-            Check {
-                name: "stuck",
-                status: if stuck.is_empty() { Status::Ok } else { Status::Warn },
-                value: format!("{} stuck", stuck.len()),
-                next_command: if stuck.is_empty() {
-                    None
-                } else {
-                    Some(r#"temporal workflow list --query "ExecutionStatus=Running""#.to_string())
-                },
-            },
-            Check {
-                name: "failed",
-                status: if failed.is_empty() { Status::Ok } else { Status::Warn },
-                value: format!("{} failed", failed.len()),
-                next_command: None,
-            },
-        ];
-
-        for wf in &stuck {
-            let running_mins = now.duration_since(wf.start_time)
-                .unwrap_or_default()
-                .as_secs() / 60;
-            checks.push(Check {
-                name: "stuck_workflow",
-                status: Status::Warn,
-                value: format!(
-                    "{} ({}): {}m running, last: {}",
-                    wf.workflow_id, wf.workflow_type, running_mins, wf.last_event
-                ),
-                next_command: Some(format!("temporal workflow show -w {}", wf.workflow_id)),
-            });
-        }
-
-        for wf in &failed {
-            checks.push(Check {
-                name: "failed_workflow",
-                status: Status::Warn,
-                value: format!("{} ({}): failed", wf.workflow_id, wf.workflow_type),
-                next_command: Some(format!("temporal workflow show -w {}", wf.workflow_id)),
-            });
-        }
-
+        let checks = checks_from(&stuck, &failed, now);
         let overall = aggregate_status(&checks);
 
         LayerResult {
@@ -83,13 +41,112 @@ impl Layer for WorkflowsLayer {
     }
 }
 
+fn checks_from(stuck: &[RunningWorkflow], failed: &[FailedWorkflow], now: SystemTime) -> Vec<Check> {
+    let mut checks = vec![
+        Check {
+            name: "stuck",
+            status: if stuck.is_empty() { Status::Ok } else { Status::Warn },
+            value: format!("{} stuck", stuck.len()),
+            next_command: if stuck.is_empty() {
+                None
+            } else {
+                Some(r#"temporal workflow list --query "ExecutionStatus=Running""#.to_string())
+            },
+        },
+        Check {
+            name: "failed",
+            status: if failed.is_empty() { Status::Ok } else { Status::Warn },
+            value: format!("{} failed", failed.len()),
+            next_command: None,
+        },
+    ];
+
+    for wf in stuck {
+        let running_mins = now.duration_since(wf.start_time)
+            .unwrap_or_default()
+            .as_secs() / 60;
+        checks.push(Check {
+            name: "stuck_workflow",
+            status: Status::Warn,
+            value: format!(
+                "{} ({}): {}m running, last: {}",
+                wf.workflow_id, wf.workflow_type, running_mins, wf.last_event
+            ),
+            next_command: Some(format!("temporal workflow show -w {}", wf.workflow_id)),
+        });
+    }
+
+    for wf in failed {
+        checks.push(Check {
+            name: "failed_workflow",
+            status: Status::Warn,
+            value: format!("{} ({}): failed", wf.workflow_id, wf.workflow_type),
+            next_command: Some(format!("temporal workflow show -w {}", wf.workflow_id)),
+        });
+    }
+
+    checks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
     use anyhow::Result;
     use async_trait::async_trait;
-    use crate::temporal::{FailedWorkflow, RunningWorkflow};
+    // --- sync tests for checks_from (deterministic, fixed `now`) ---
+
+    #[test]
+    fn checks_from_empty_slices_produces_ok_checks() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+        let checks = checks_from(&[], &[], now);
+        assert_eq!(checks.iter().find(|c| c.name == "stuck").unwrap().status, Status::Ok);
+        assert_eq!(checks.iter().find(|c| c.name == "failed").unwrap().status, Status::Ok);
+    }
+
+    #[test]
+    fn checks_from_one_stuck_workflow_is_warn_with_one_finding() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+        let stuck = vec![RunningWorkflow {
+            workflow_id: "wf-001".into(),
+            workflow_type: "HostProvisioning".into(),
+            start_time: now - Duration::from_secs(47 * 60),
+            last_event: "ActivityScheduled".into(),
+        }];
+        let checks = checks_from(&stuck, &[], now);
+        assert_eq!(checks.iter().find(|c| c.name == "stuck").unwrap().status, Status::Warn);
+        assert_eq!(checks.iter().filter(|c| c.name == "stuck_workflow").count(), 1);
+    }
+
+    #[test]
+    fn checks_from_one_failed_workflow_is_warn_with_one_finding() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+        let failed = vec![FailedWorkflow {
+            workflow_id: "wf-002".into(),
+            workflow_type: "HostDecommission".into(),
+            close_time: now - Duration::from_secs(300),
+        }];
+        let checks = checks_from(&[], &failed, now);
+        assert_eq!(checks.iter().find(|c| c.name == "failed").unwrap().status, Status::Warn);
+        assert_eq!(checks.iter().filter(|c| c.name == "failed_workflow").count(), 1);
+    }
+
+    #[test]
+    fn checks_from_multiple_stuck_produces_matching_finding_count() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 3600);
+        let stuck = vec![
+            RunningWorkflow {
+                workflow_id: "wf-a".into(), workflow_type: "HostProvisioning".into(),
+                start_time: now - Duration::from_secs(90 * 60), last_event: "TimerFired".into(),
+            },
+            RunningWorkflow {
+                workflow_id: "wf-b".into(), workflow_type: "HostProvisioning".into(),
+                start_time: now - Duration::from_secs(35 * 60), last_event: "ActivityStarted".into(),
+            },
+        ];
+        let checks = checks_from(&stuck, &[], now);
+        assert_eq!(checks.iter().filter(|c| c.name == "stuck_workflow").count(), 2);
+    }
 
     struct MockTemporal {
         stuck: Vec<RunningWorkflow>,
