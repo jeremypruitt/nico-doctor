@@ -161,6 +161,7 @@ mod tests {
             event_type: Some("Warning".into()),
             reason: Some(reason.into()),
             message: Some(message.into()),
+            involved_object: None,
         }
     }
 

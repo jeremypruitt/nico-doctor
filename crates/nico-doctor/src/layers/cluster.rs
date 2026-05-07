@@ -112,7 +112,50 @@ fn checks_from(pods: &[&RawPod], warning_events: &[&RawEvent], namespace: &str) 
         });
     }
 
+    for (pod, count, recent_reason) in group_events_by_pod(warning_events) {
+        let truncated = if recent_reason.len() > 80 {
+            format!("{}…", &recent_reason[..79])
+        } else {
+            recent_reason.to_string()
+        };
+        let next_command = if pod == UNKNOWN_POD {
+            format!("kubectl get events -n {namespace} --field-selector type=Warning")
+        } else {
+            format!("kubectl describe pod {pod} -n {namespace}")
+        };
+        checks.push(Check {
+            name: "pod_event",
+            status: Status::Warn,
+            value: format!("{pod}: {count} events — {truncated}"),
+            next_command: Some(next_command),
+            kind: CheckKind::Detail,
+        });
+    }
+
     checks
+}
+
+const UNKNOWN_POD: &str = "<unknown>";
+
+/// Group warning events by `involved_object`, returning each bucket's pod
+/// name, count, and the reason from the most-recent event in the bucket.
+/// Events with no `involved_object` collapse into a single `<unknown>` bucket.
+fn group_events_by_pod<'a>(events: &[&'a RawEvent]) -> Vec<(&'a str, usize, &'a str)> {
+    let mut grouped: Vec<(&'a str, usize, Option<DateTime<Utc>>, &'a str)> = Vec::new();
+    for e in events {
+        let pod = e.involved_object.as_deref().unwrap_or(UNKNOWN_POD);
+        let reason = e.reason.as_deref().unwrap_or("");
+        if let Some(slot) = grouped.iter_mut().find(|(p, _, _, _)| *p == pod) {
+            slot.1 += 1;
+            if e.ts >= slot.2 {
+                slot.2 = e.ts;
+                slot.3 = reason;
+            }
+        } else {
+            grouped.push((pod, 1, e.ts, reason));
+        }
+    }
+    grouped.into_iter().map(|(p, c, _, r)| (p, c, r)).collect()
 }
 
 #[cfg(test)]
@@ -141,6 +184,17 @@ mod tests {
             event_type: Some("Warning".into()),
             reason: Some(reason.into()),
             message: Some(reason.into()),
+            involved_object: None,
+        }
+    }
+
+    fn warning_event_for(reason: &str, pod: &str, ts: DateTime<Utc>) -> RawEvent {
+        RawEvent {
+            ts: Some(ts),
+            event_type: Some("Warning".into()),
+            reason: Some(reason.into()),
+            message: Some(reason.into()),
+            involved_object: Some(pod.into()),
         }
     }
 
@@ -178,18 +232,21 @@ mod tests {
                 event_type: Some("Warning".into()),
                 reason: Some("OOM".into()),
                 message: None,
+                involved_object: None,
             },
             RawEvent {
                 ts: Some(recent),
                 event_type: Some("Normal".into()),
                 reason: None,
                 message: None,
+                involved_object: None,
             },
             RawEvent {
                 ts: Some(old),
                 event_type: Some("Warning".into()),
                 reason: None,
                 message: None,
+                involved_object: None,
             },
         ];
         let filtered = filter_warning_events(&events, now, Duration::from_secs(600));
@@ -333,6 +390,137 @@ mod tests {
         assert_eq!(
             pr.next_command.as_deref(),
             Some("kubectl describe pod core-abc -n nico"),
+        );
+    }
+
+    #[test]
+    fn checks_from_zero_warning_events_emits_no_pod_event_checks() {
+        let p1 = pod("core-abc", true, 0, false);
+        let pods = vec![&p1];
+        let events: Vec<&RawEvent> = vec![];
+        let checks = checks_from(&pods, &events, "nico");
+
+        assert_eq!(checks.iter().filter(|c| c.name == "pod_event").count(), 0);
+    }
+
+    #[test]
+    fn checks_from_pod_with_warning_event_emits_detail_pod_event_check() {
+        let p1 = pod("core-abc", true, 0, false);
+        let pods = vec![&p1];
+        let now = Utc::now();
+        let e1 = warning_event_for("OOMKilling", "core-abc", now);
+        let events = vec![&e1];
+        let checks = checks_from(&pods, &events, "nico");
+
+        let pod_events: Vec<_> = checks.iter().filter(|c| c.name == "pod_event").collect();
+        assert_eq!(pod_events.len(), 1);
+        let pe = pod_events[0];
+        assert_eq!(pe.kind, CheckKind::Detail);
+        assert_eq!(pe.status, Status::Warn);
+        assert_eq!(pe.value, "core-abc: 1 events — OOMKilling");
+        assert_eq!(
+            pe.next_command.as_deref(),
+            Some("kubectl describe pod core-abc -n nico"),
+        );
+    }
+
+    #[test]
+    fn checks_from_multiple_warnings_on_same_pod_collapse_to_one_pod_event() {
+        let p1 = pod("core-abc", true, 0, false);
+        let pods = vec![&p1];
+        let earlier = Utc::now() - chrono::Duration::seconds(120);
+        let later = Utc::now();
+        let e_old = warning_event_for("BackOff", "core-abc", earlier);
+        let e_new = warning_event_for("OOMKilling", "core-abc", later);
+        let events = vec![&e_old, &e_new];
+        let checks = checks_from(&pods, &events, "nico");
+
+        let pod_events: Vec<_> = checks.iter().filter(|c| c.name == "pod_event").collect();
+        assert_eq!(pod_events.len(), 1);
+        assert_eq!(pod_events[0].value, "core-abc: 2 events — OOMKilling");
+    }
+
+    #[test]
+    fn checks_from_warnings_on_different_pods_emit_one_pod_event_each() {
+        let p1 = pod("core-abc", true, 0, false);
+        let p2 = pod("rest-xyz", true, 0, false);
+        let pods = vec![&p1, &p2];
+        let now = Utc::now();
+        let e1 = warning_event_for("OOMKilling", "core-abc", now);
+        let e2 = warning_event_for("FailedScheduling", "rest-xyz", now);
+        let events = vec![&e1, &e2];
+        let checks = checks_from(&pods, &events, "nico");
+
+        let pod_events: Vec<_> = checks.iter().filter(|c| c.name == "pod_event").collect();
+        assert_eq!(pod_events.len(), 2);
+        let values: Vec<_> = pod_events.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"core-abc: 1 events — OOMKilling"));
+        assert!(values.contains(&"rest-xyz: 1 events — FailedScheduling"));
+
+        let warn_events_headline = checks.iter().find(|c| c.name == "warning_events").unwrap();
+        assert_eq!(warn_events_headline.value, "2");
+        assert_eq!(warn_events_headline.kind, CheckKind::Headline);
+    }
+
+    #[test]
+    fn checks_from_warnings_with_no_involved_object_bucket_under_unknown() {
+        let pods: Vec<&RawPod> = vec![];
+        let now = Utc::now();
+        let e1 = RawEvent {
+            ts: Some(now),
+            event_type: Some("Warning".into()),
+            reason: Some("FailedScheduling".into()),
+            message: Some("no nodes available".into()),
+            involved_object: None,
+        };
+        let e2 = RawEvent {
+            ts: Some(now),
+            event_type: Some("Warning".into()),
+            reason: Some("FailedScheduling".into()),
+            message: Some("no nodes available".into()),
+            involved_object: None,
+        };
+        let events = vec![&e1, &e2];
+        let checks = checks_from(&pods, &events, "nico");
+
+        let pod_events: Vec<_> = checks.iter().filter(|c| c.name == "pod_event").collect();
+        assert_eq!(pod_events.len(), 1);
+        assert_eq!(
+            pod_events[0].value,
+            "<unknown>: 2 events — FailedScheduling"
+        );
+        assert_eq!(pod_events[0].kind, CheckKind::Detail);
+    }
+
+    #[test]
+    fn checks_from_truncates_long_reason_to_80_chars_with_ellipsis() {
+        let p1 = pod("noisy-pod", true, 0, false);
+        let pods = vec![&p1];
+        let long_reason = "X".repeat(200);
+        let e1 = RawEvent {
+            ts: Some(Utc::now()),
+            event_type: Some("Warning".into()),
+            reason: Some(long_reason),
+            message: None,
+            involved_object: Some("noisy-pod".into()),
+        };
+        let events = vec![&e1];
+        let checks = checks_from(&pods, &events, "nico");
+
+        let pe = checks.iter().find(|c| c.name == "pod_event").unwrap();
+        let after_em_dash = pe
+            .value
+            .split(" — ")
+            .nth(1)
+            .expect("value has reason after em-dash");
+        assert!(
+            after_em_dash.ends_with('…'),
+            "expected ellipsis: {after_em_dash:?}"
+        );
+        assert_eq!(
+            after_em_dash.chars().count(),
+            80,
+            "expected 80 chars total: {after_em_dash:?}"
         );
     }
 

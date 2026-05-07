@@ -47,6 +47,7 @@ pub struct RawEvent {
     pub event_type: Option<String>,
     pub reason: Option<String>,
     pub message: Option<String>,
+    pub involved_object: Option<String>,
 }
 
 #[async_trait]
@@ -118,6 +119,7 @@ pub(crate) fn map_event(event: CoreEvent) -> RawEvent {
         event_type: event.type_,
         reason: event.reason,
         message: event.message,
+        involved_object: event.involved_object.name,
     }
 }
 
@@ -316,7 +318,9 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::api::core::v1::{ContainerState, ContainerStateWaiting, ContainerStatus, PodStatus};
+    use k8s_openapi::api::core::v1::{
+        ContainerState, ContainerStateWaiting, ContainerStatus, ObjectReference, PodStatus,
+    };
     use kube::api::ObjectMeta;
 
     fn pod(name: &str, phase: &str) -> Pod {
@@ -394,6 +398,37 @@ mod tests {
         let raw = map_pod(pod_with_containers("bad-pod", false, 5, true));
         assert!(raw.crash_loop);
         assert!(!raw.ready);
+    }
+
+    #[test]
+    fn map_event_extracts_involved_object_name() {
+        let event = CoreEvent {
+            metadata: ObjectMeta::default(),
+            involved_object: ObjectReference {
+                name: Some("core-abc".into()),
+                ..Default::default()
+            },
+            reason: Some("OOMKilling".into()),
+            message: Some("memory limit exceeded".into()),
+            type_: Some("Warning".into()),
+            ..Default::default()
+        };
+        let raw = map_event(event);
+        assert_eq!(raw.involved_object.as_deref(), Some("core-abc"));
+        assert_eq!(raw.reason.as_deref(), Some("OOMKilling"));
+    }
+
+    #[test]
+    fn map_event_missing_involved_object_name_is_none() {
+        let event = CoreEvent {
+            metadata: ObjectMeta::default(),
+            involved_object: ObjectReference::default(),
+            reason: Some("Unattributed".into()),
+            type_: Some("Warning".into()),
+            ..Default::default()
+        };
+        let raw = map_event(event);
+        assert!(raw.involved_object.is_none());
     }
 
     #[tokio::test]
