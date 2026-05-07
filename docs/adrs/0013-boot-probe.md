@@ -115,8 +115,11 @@ The technical step name (`reachability`, `token_expiry`, etc.) and
 
 #### Bar
 
-Steps-based, not time-based. Filled cells are accent-color while in flight,
-green once all steps have passed, fully red as soon as any step fails.
+Steps-based, not time-based. Each chit reflects its own step's state — not a
+global summary: passed → green, failed → red, skipped → dimmed (filled glyph
+preserved), active → cyan, pending → dimmed empty. A failure does **not**
+cascade visually to other chits; a partial-failure run shows green chits for
+the steps that passed alongside a single red chit for the one that failed.
 
 ### Concurrency: fail-aware
 

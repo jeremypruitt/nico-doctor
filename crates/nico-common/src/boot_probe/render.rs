@@ -202,8 +202,6 @@ pub fn render_block(state: &ProbeState, mode: RenderMode, frame: usize) -> Strin
 pub fn render_bar(state: &ProbeState, mode: RenderMode) -> String {
     let total = state.total_count();
     let done = state.completed_count();
-    let any_failed = state.any_failed();
-    let all_passed = state.all_passed();
 
     let (filled_ch, empty_ch) = if mode.ascii { ('=', '-') } else { ('▰', '▱') };
 
@@ -212,19 +210,22 @@ pub fn render_bar(state: &ProbeState, mode: RenderMode) -> String {
     if mode.ascii {
         bar.push('[');
     }
-    for i in 0..total {
-        let ch = if i < done { filled_ch } else { empty_ch };
+    // Each chit reflects its own step's state — no global cascade.
+    for (_, st) in &state.steps {
+        let ch = match st {
+            StepState::Pending => empty_ch,
+            _ => filled_ch,
+        };
         let s = ch.to_string();
         let styled = if !mode.color {
             s
-        } else if any_failed {
-            s.bright_red().to_string()
-        } else if all_passed {
-            s.bright_green().to_string()
-        } else if i < done {
-            s.bright_cyan().to_string()
         } else {
-            s.dimmed().to_string()
+            match st {
+                StepState::Passed { .. } => s.bright_green().to_string(),
+                StepState::Failed { .. } => s.bright_red().to_string(),
+                StepState::Active { .. } => s.bright_cyan().to_string(),
+                StepState::Skipped | StepState::Pending => s.dimmed().to_string(),
+            }
         };
         bar.push_str(&styled);
     }
@@ -557,6 +558,140 @@ mod tests {
         let g5 = glyph_for(&s, RenderMode::plain(), 5);
         assert_eq!(g0, "✗");
         assert_eq!(g5, "✗");
+    }
+
+    #[test]
+    fn render_bar_colors_each_chit_per_step_state() {
+        // Mirror the bug-report repro: 7 passed, 1 failed, 1 skipped.
+        // Each chit should be colored independently. A failure must NOT
+        // cascade visually — the chits for steps that passed *after* the
+        // failed step still render green.
+        let defs = vec![
+            def_in(StepId::LoadKubeconfig, "load kubeconfig", Section::Connecting, 5),
+            def_in(StepId::ReachApiServer, "reach API server", Section::Connecting, 5),
+            def_in(StepId::Credentials, "credentials", Section::Validating, 5),
+            def_in(StepId::NamespaceExists, "namespace 'forge-system' exists", Section::Validating, 5),
+            def_in(StepId::Rbac, "list-pods permission", Section::Validating, 5),
+            def_in(StepId::PortForwardWorkflows, "port-forward: workflows", Section::Serving, 5),
+            def_in(StepId::PortForwardGrpc, "port-forward: grpc", Section::Serving, 5),
+            def_in(StepId::PortForwardPostgres, "port-forward: postgres", Section::Serving, 5),
+            def_in(StepId::ReachPostgres, "reach postgres", Section::Serving, 5),
+        ];
+        let mut s = ProbeState::new(defs, "port-forward", "auto");
+        let pass = StepState::Passed { elapsed: Duration::from_millis(100) };
+        let fail = StepState::Failed {
+            elapsed: Duration::from_millis(300),
+            message: "x".into(),
+            timed_out: false,
+            next_command: "y".into(),
+        };
+        s.set_state(StepId::LoadKubeconfig, pass.clone());
+        s.set_state(StepId::ReachApiServer, pass.clone());
+        s.set_state(StepId::Credentials, pass.clone());
+        s.set_state(StepId::NamespaceExists, pass.clone());
+        s.set_state(StepId::Rbac, pass.clone());
+        s.set_state(StepId::PortForwardWorkflows, fail);
+        s.set_state(StepId::PortForwardGrpc, StepState::Skipped);
+        s.set_state(StepId::PortForwardPostgres, pass.clone());
+        s.set_state(StepId::ReachPostgres, pass);
+
+        let mode = RenderMode { color: true, ascii: false };
+        let bar = render_bar(&s, mode);
+
+        let green_count = bar.matches("\x1b[92m").count();
+        let red_count = bar.matches("\x1b[91m").count();
+        assert_eq!(
+            green_count, 7,
+            "expected 7 bright_green chits, got {green_count}\nbar: {bar:?}",
+        );
+        assert_eq!(
+            red_count, 1,
+            "expected 1 bright_red chit, got {red_count}\nbar: {bar:?}",
+        );
+
+        // Strip ANSI to confirm all 9 chits keep the filled glyph (skipped
+        // does not switch glyphs — it is just dimmed).
+        let plain = strip_ansi(&bar);
+        let chit_run: String = plain.chars().filter(|c| *c == '▰' || *c == '▱').collect();
+        assert_eq!(
+            chit_run, "▰▰▰▰▰▰▰▰▰",
+            "expected 9 filled chits, got: {chit_run:?}",
+        );
+    }
+
+    #[test]
+    fn render_bar_failure_does_not_cascade_to_later_chits() {
+        // 3 steps: passed, failed, passed. The third chit must still be
+        // green — a failure on chit 2 does not turn chit 3 red.
+        let mut s = three_step_state();
+        s.set_state(
+            StepId::LoadKubeconfig,
+            StepState::Passed { elapsed: Duration::from_millis(50) },
+        );
+        s.set_state(
+            StepId::ReachApiServer,
+            StepState::Failed {
+                elapsed: Duration::from_millis(80),
+                message: "boom".into(),
+                timed_out: false,
+                next_command: "kubectl cluster-info".into(),
+            },
+        );
+        s.set_state(
+            StepId::Credentials,
+            StepState::Passed { elapsed: Duration::from_millis(120) },
+        );
+
+        let mode = RenderMode { color: true, ascii: false };
+        let bar = render_bar(&s, mode);
+
+        assert_eq!(
+            bar.matches("\x1b[92m").count(),
+            2,
+            "expected 2 green chits, got bar: {bar:?}",
+        );
+        assert_eq!(
+            bar.matches("\x1b[91m").count(),
+            1,
+            "expected 1 red chit, got bar: {bar:?}",
+        );
+    }
+
+    #[test]
+    fn render_bar_skipped_chit_keeps_filled_glyph_at_its_position() {
+        // Glyph is per-step now: only chit 2 (the skipped step) is filled
+        // — chits 1 and 3 are pending and stay empty. This case
+        // distinguishes the per-step rendering from the old left-to-right
+        // progress fill, which would produce "▰▱▱" instead.
+        let mut s = three_step_state();
+        s.set_state(StepId::ReachApiServer, StepState::Skipped);
+        // LoadKubeconfig and Credentials left Pending.
+
+        let mode = RenderMode { color: true, ascii: false };
+        let bar = render_bar(&s, mode);
+        let plain = strip_ansi(&bar);
+        let chits: String = plain.chars().filter(|c| *c == '▰' || *c == '▱').collect();
+        assert_eq!(chits, "▱▰▱", "expected ▱▰▱, got {chits:?}\nbar: {bar:?}");
+    }
+
+    #[test]
+    fn render_bar_active_chit_is_bright_cyan() {
+        // Only chit 1 is Active; the others are Pending. Under the old
+        // global-state coloring, no chit would be cyan (done=0 means all
+        // chits get dimmed). Per-step coloring puts cyan on the active
+        // chit specifically.
+        let mut s = three_step_state();
+        s.set_state(
+            StepId::LoadKubeconfig,
+            StepState::Active { elapsed: Duration::from_millis(120) },
+        );
+
+        let mode = RenderMode { color: true, ascii: false };
+        let bar = render_bar(&s, mode);
+        assert!(
+            bar.contains("\x1b[96m"),
+            "expected bright_cyan for active chit, got: {bar:?}",
+        );
     }
 
     #[test]
