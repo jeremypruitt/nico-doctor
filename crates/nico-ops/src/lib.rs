@@ -66,15 +66,16 @@ pub async fn run_ops(args: OpsArgs) -> i32 {
     let bootstrapped = match nico_doctor::bootstrap(&doctor_args).await {
         Ok(b) => b,
         Err(nico_doctor::BootstrapErr::Preflight {
-            human_message,
+            human_message: _,
             json_payload,
             format,
         }) => {
             if matches!(format, OutputFormat::Json) {
                 println!("{json_payload}");
-            } else {
-                eprintln!("{human_message}");
             }
+            // Non-JSON modes already had the failure card painted on
+            // stderr by the boot-probe orchestrator; reprinting
+            // `human_message` duplicates the same fields.
             return 3;
         }
         Err(nico_doctor::BootstrapErr::Fatal { message, code }) => {
