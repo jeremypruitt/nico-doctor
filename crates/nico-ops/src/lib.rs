@@ -195,7 +195,7 @@ async fn run_event_loop<C: Clock>(
 
     loop {
         if app.dirty() {
-            terminal.draw(|f| view::render(&app, theme, f))?;
+            terminal.draw(|f| view::render(&mut app, theme, f))?;
             app.clear_dirty();
         }
 
@@ -203,8 +203,8 @@ async fn run_event_loop<C: Clock>(
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(ev)) => {
-                        if let Some(action) = translate(&ev, Mode::Normal, app.overlay(), app.layout())
-                            && dispatch(&mut app, action, &layers, &opts, &activity_ctx, &tx) {
+                        if let Some(action) = translate(&ev, Mode::Normal, app.layout(), app.overlay())
+                            && dispatch(&mut app, action, &layers, &opts, &activity_ctx, &tx, terminal) {
                             break;
                         }
                     }
@@ -213,12 +213,12 @@ async fn run_event_loop<C: Clock>(
             }
             maybe_action = rx.recv() => {
                 if let Some(action) = maybe_action
-                    && dispatch(&mut app, action, &layers, &opts, &activity_ctx, &tx) {
+                    && dispatch(&mut app, action, &layers, &opts, &activity_ctx, &tx, terminal) {
                     break;
                 }
             }
             _ = tick.tick() => {
-                if dispatch(&mut app, Action::Tick(clock.now()), &layers, &opts, &activity_ctx, &tx) {
+                if dispatch(&mut app, Action::Tick(clock.now()), &layers, &opts, &activity_ctx, &tx, terminal) {
                     break;
                 }
             }
@@ -262,6 +262,7 @@ fn dispatch(
     opts: &nico_doctor::layer::RunOpts,
     activity: &ActivityCtx,
     tx: &mpsc::Sender<Action>,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> bool {
     match app.handle(action) {
         Some(Effect::Quit) => true,
@@ -276,8 +277,70 @@ fn dispatch(
             );
             false
         }
+        Some(Effect::EnableMouseCapture) => {
+            let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
+            false
+        }
+        Some(Effect::DisableMouseCapture) => {
+            let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+            false
+        }
+        Some(Effect::CopyToClipboard(s)) => {
+            if let Err(e) = copy_to_clipboard(&s) {
+                let _ = tx.try_send(Action::ShowToast(format!("clipboard unavailable: {e}")));
+            }
+            false
+        }
+        Some(Effect::OpenUrl(url)) => {
+            if let Err(e) = open_url(&url) {
+                let _ = tx.try_send(Action::ShowToast(format!("open failed: {e}")));
+            }
+            false
+        }
         None => false,
     }
+}
+
+/// Best-effort clipboard copy via `arboard`. Failures (headless Linux,
+/// no DISPLAY, etc.) are mapped to a toast by the caller.
+fn copy_to_clipboard(s: &str) -> Result<(), String> {
+    let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    cb.set_text(s.to_string()).map_err(|e| e.to_string())
+}
+
+/// Best-effort URL open. Honors `$BROWSER` when set, falls back to the
+/// platform default (`open` on macOS, `xdg-open` on Linux, `cmd /c start`
+/// on Windows). Failures bubble up to a toast.
+fn open_url(url: &str) -> Result<(), String> {
+    use std::process::Command;
+    if let Ok(browser) = std::env::var("BROWSER")
+        && !browser.is_empty()
+    {
+        return Command::new(browser)
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.args(["/c", "start", url]);
+        c
+    };
+    cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 fn spawn_refresh(

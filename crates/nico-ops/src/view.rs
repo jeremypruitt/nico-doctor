@@ -3,7 +3,7 @@ use nico_common::output::Status;
 use nico_common::theme::Theme;
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout as TuiLayout, Margin, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -12,9 +12,9 @@ use tui_big_text::{BigText, PixelSize};
 
 use nico_doctor::baseline::Delta;
 
-use crate::app::App;
+use crate::app::{App, Layout as AppLayout};
 use crate::events::Overlay;
-use crate::model::{Finding, LayerSnapshot, Layout as AppLayout, Quadrant, overall_verdict};
+use crate::model::{Finding, LayerSnapshot, Quadrant, overall_verdict};
 use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
 
 /// How many recent verdicts the header breadcrumb shows. The ring buffer
@@ -36,22 +36,32 @@ pub const HELP_LINES: &[&str] = &[
     "Space     pause / resume auto-refresh",
     "↑↓←→/hjkl move focus",
     "Enter     open detail",
+    "s         spotlight (incident-only) view",
+    "a / Esc   show all (return from spotlight)",
+    "y         copy focused next-command (spotlight)",
+    "o         open focused link (spotlight)",
+    "c         correlate (spotlight; reserved)",
     "Esc       close overlay",
     "?         this help",
     "q / ^C    quit",
 ];
 
 /// Top-level render. The host loop calls this once per dirty frame.
-pub fn render(app: &App, theme: &Theme, frame: &mut Frame) {
+///
+/// Takes `&mut App` so the renderer can publish the rendered scorecard
+/// rectangles back to the reducer for click hit-testing — the regions are
+/// only known here and have to round-trip to the reducer somehow.
+pub fn render(app: &mut App, theme: &Theme, frame: &mut Frame) {
     match app.layout() {
         AppLayout::A => render_layout_a(app, theme, frame),
         AppLayout::B => render_layout_b(app, theme, frame),
+        AppLayout::Spotlight => render_spotlight(app, theme, frame),
     }
 }
 
-fn render_layout_a(app: &App, theme: &Theme, frame: &mut Frame) {
+fn render_layout_a(app: &mut App, theme: &Theme, frame: &mut Frame) {
     let area = frame.area();
-    let chunks = TuiLayout::default()
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
@@ -62,7 +72,8 @@ fn render_layout_a(app: &App, theme: &Theme, frame: &mut Frame) {
         .split(area);
 
     render_header(app, theme, frame, chunks[0]);
-    render_grid(app, theme, frame, chunks[1]);
+    let regions = render_grid(app, theme, frame, chunks[1]);
+    app.set_card_regions(regions);
     render_drill(app, theme, frame, chunks[2]);
     render_hint_bar(app, theme, frame, chunks[3]);
 
@@ -71,6 +82,181 @@ fn render_layout_a(app: &App, theme: &Theme, frame: &mut Frame) {
         Overlay::Help => render_help_overlay(theme, frame, area),
         Overlay::None => {}
     }
+}
+
+fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
+    let area = frame.area();
+    // Layout: big-text headline, vertical incident cards, green footer,
+    // hint bar.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(SPOTLIGHT_HEADER_HEIGHT),
+            Constraint::Min(SPOTLIGHT_CARD_HEIGHT),
+            Constraint::Length(1), // green footer
+            Constraint::Length(1), // hint bar
+        ])
+        .split(area);
+
+    render_spotlight_header(app, theme, frame, chunks[0]);
+    render_spotlight_cards(app, theme, frame, chunks[1]);
+    render_spotlight_green_footer(app, theme, frame, chunks[2]);
+    render_spotlight_hint_bar(app, theme, frame, chunks[3]);
+
+    // Layout C still honors the help overlay (`?`) so the operator can
+    // see all keybinds, including the Spotlight-only ones.
+    if matches!(app.overlay(), Overlay::Help) {
+        render_help_overlay(theme, frame, area);
+    }
+}
+
+/// Approximate row height of the tui-big-text headline at
+/// `PixelSize::Quadrant`. A glyph is 8 pixels tall and Quadrant maps two
+/// pixels to one cell, so the rendered headline is 4 rows; we add 1 row
+/// of padding above/below so it doesn't crowd the cards.
+const SPOTLIGHT_HEADER_HEIGHT: u16 = 5;
+
+/// Per-card row height in Layout C: title + evidence + dim next-cmd +
+/// action row + 2 border rows.
+const SPOTLIGHT_CARD_HEIGHT: u16 = 6;
+
+const SPOTLIGHT_ACTION_LINE: &str = "[y] copy   [o] open   [c] correlate   s/a/Esc: show all";
+
+fn render_spotlight_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let verdict = overall_verdict(app.snapshots());
+    let word = verdict_word(&verdict);
+    let color = theme_color(theme, &verdict);
+    let big = BigText::builder()
+        .pixel_size(PixelSize::Quadrant)
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+        .lines(vec![Line::from(word.to_string())])
+        .build();
+    frame.render_widget(big, area);
+}
+
+fn render_spotlight_cards(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let cards = app.spotlight_cards();
+    if cards.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" no incidents ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let line = Line::from(Span::styled(
+            "All layers are green. Press s / a / Esc to return to the show-all view.",
+            Style::default().fg(theme.muted),
+        ));
+        frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), inner);
+        return;
+    }
+
+    let row_constraints: Vec<Constraint> =
+        std::iter::repeat_n(Constraint::Length(SPOTLIGHT_CARD_HEIGHT), cards.len()).collect();
+    let row_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(row_constraints)
+        .split(area);
+    for (i, card) in cards.iter().enumerate() {
+        if i >= row_areas.len() {
+            break;
+        }
+        render_spotlight_card(app, i, card, theme, frame, row_areas[i]);
+    }
+}
+
+fn render_spotlight_card(
+    app: &App,
+    idx: usize,
+    snap: &LayerSnapshot,
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let focused = idx == app.spotlight_focus();
+    let pip_color = theme_color(theme, &snap.status);
+    let title = if focused {
+        format!(" ▶ {} ", snap.name)
+    } else {
+        format!("   {} ", snap.name)
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::styled(
+                pip_glyph(&snap.status).to_string(),
+                Style::default().fg(pip_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(title),
+        ]));
+    if focused {
+        block = block.border_style(
+            Style::default()
+                .fg(theme.overlay_key)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    let evidence_line = Line::from(Span::raw(snap.evidence.clone()));
+    let next_cmd = snap.findings.iter().find_map(|f| f.next_command.clone());
+    let next_line = match next_cmd {
+        Some(cmd) => Line::from(Span::styled(
+            format!("next: {cmd}"),
+            Style::default().fg(theme.muted),
+        )),
+        None => Line::from(Span::styled(
+            "next: (no command suggested)",
+            Style::default().fg(theme.muted),
+        )),
+    };
+    let action_line = Line::from(Span::styled(
+        SPOTLIGHT_ACTION_LINE.to_string(),
+        Style::default().fg(theme.overlay_key),
+    ));
+    let lines = vec![evidence_line, next_line, action_line];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn render_spotlight_green_footer(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let names = app.spotlight_green_layer_names();
+    if names.is_empty() {
+        return;
+    }
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled("● ", Style::default().fg(theme.ok)));
+        spans.push(Span::styled(name.clone(), Style::default().fg(theme.muted)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_spotlight_hint_bar(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    if let Some(t) = app.toast() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {} ", t.message),
+                Style::default()
+                    .fg(theme.warn)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            ))),
+            area,
+        );
+        return;
+    }
+    let line = Line::from(Span::styled(
+        " spotlight  R:refresh  ?:help  [y] copy  [o] open  [c] correlate  s/a/Esc: show all  q:quit "
+            .to_string(),
+        Style::default().fg(theme.muted),
+    ));
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
@@ -130,12 +316,12 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
-fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Vec<Rect> {
     let snapshots = app.snapshots();
     if snapshots.is_empty() {
         let block = Block::default().borders(Borders::ALL).title(" layers ");
         frame.render_widget(block, area);
-        return;
+        return Vec::new();
     }
 
     let cols = grid_cols_for_width(area.width);
@@ -143,20 +329,21 @@ fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 
     let row_constraints: Vec<Constraint> =
         std::iter::repeat_n(Constraint::Length(SCORECARD_ROW_HEIGHT), rows).collect();
-    let row_areas = TuiLayout::default()
+    let row_areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints(row_constraints)
         .split(area);
 
+    let mut regions: Vec<Rect> = vec![Rect::default(); snapshots.len()];
     for r in 0..rows {
         let col_constraints: Vec<Constraint> =
             std::iter::repeat_n(Constraint::Ratio(1, cols as u32), cols).collect();
-        let col_areas = TuiLayout::default()
+        let col_areas = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(col_constraints)
             .split(row_areas[r]);
         for c in 0..cols {
-            let idx = r * 3 + c;
+            let idx = r * cols + c;
             if idx >= snapshots.len() {
                 break;
             }
@@ -165,9 +352,11 @@ fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             } else {
                 continue;
             };
+            regions[idx] = cell;
             render_scorecard(app, idx, theme, frame, cell);
         }
     }
+    regions
 }
 
 /// Row height for one scorecard: top border + evidence line + sparkline +
@@ -213,7 +402,7 @@ fn render_scorecard(app: &App, idx: usize, theme: &Theme, frame: &mut Frame, are
         return;
     }
 
-    let chunks = TuiLayout::default()
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
@@ -261,12 +450,32 @@ fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             Style::default().fg(theme.muted),
         ))],
     };
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.drill_scroll(), 0)),
+        inner,
+    );
 }
 
 fn render_hint_bar(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    if let Some(t) = app.toast() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {} ", t.message),
+                Style::default()
+                    .fg(theme.warn)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            ))),
+            area,
+        );
+        return;
+    }
+    let mouse = if app.mouse_capture() { "on" } else { "off" };
     let mut spans: Vec<Span> = vec![Span::styled(
-        " R:refresh  Space:pause  hjkl/arrows:focus  Enter:detail  ?:help  q:quit ",
+        format!(
+            " R:refresh  Space:pause  hjkl/arrows:focus  Enter:detail  s:spotlight  M:mouse({mouse})  ?:help  q:quit "
+        ),
         Style::default().fg(theme.muted),
     )];
     if app.paused() {
@@ -303,7 +512,9 @@ fn render_detail_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect
         None => vec![],
     };
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.overlay_scroll(), 0)),
         inner.inner(Margin {
             horizontal: 1,
             vertical: 0,
@@ -465,7 +676,7 @@ fn render_layout_b(app: &App, theme: &Theme, frame: &mut Frame) {
     } else {
         ASCII_HEADER_HEIGHT
     };
-    let chunks = TuiLayout::default()
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(header_height),
@@ -518,13 +729,13 @@ fn render_layout_b_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rec
 }
 
 fn render_layout_b_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let rows = TuiLayout::default()
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .split(area);
 
     for row in 0..2 {
-        let cols = TuiLayout::default()
+        let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Ratio(1, 3),
@@ -719,6 +930,7 @@ mod tests {
                     status: Status::Warn,
                     message: "12 ERROR lines in carbide-controller".into(),
                     next_command: Some("kubectl logs -n nico carbide-controller".into()),
+                    link: None,
                 }],
                 duration_ms: 34,
             },
@@ -753,7 +965,7 @@ mod tests {
         ]
     }
 
-    fn render_to_string(app: &App, w: u16, h: u16) -> String {
+    fn render_to_string(app: &mut App, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(app, &DEFAULT, f)).unwrap();
@@ -786,7 +998,7 @@ mod tests {
             findings: vec![],
             duration_ms: 0,
         }]));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("NEW"), "NEW badge missing:\n{s}");
     }
 
@@ -801,7 +1013,7 @@ mod tests {
             findings: vec![],
             duration_ms: 0,
         }]));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("FIXED"), "FIXED badge missing:\n{s}");
     }
 
@@ -809,7 +1021,7 @@ mod tests {
     fn missing_baseline_renders_no_delta_badges() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(
             !s.contains("NEW"),
             "NEW unexpectedly present without baseline:\n{s}"
@@ -831,7 +1043,7 @@ mod tests {
             findings: vec![],
             duration_ms: 0,
         }]));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(
             !s.contains("NEW"),
             "NEW unexpectedly shown for unchanged layer:\n{s}"
@@ -866,7 +1078,7 @@ mod tests {
 
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(&app, &DEFAULT, f)).unwrap();
+        terminal.draw(|f| render(&mut app, &DEFAULT, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let pip = pip_glyph(&Status::Warn);
         let mut found_reversed = false;
@@ -897,7 +1109,7 @@ mod tests {
         }]));
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(&app, &DEFAULT, f)).unwrap();
+        terminal.draw(|f| render(&mut app, &DEFAULT, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let pip = pip_glyph(&Status::Warn);
         for y in 0..buf.area.height {
@@ -926,7 +1138,7 @@ mod tests {
         }]));
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(&app, &DEFAULT, f)).unwrap();
+        terminal.draw(|f| render(&mut app, &DEFAULT, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
         // Find the 'N' of "NEW" and check fg is theme.error.
         for y in 0..buf.area.height {
@@ -968,7 +1180,7 @@ mod tests {
     fn render_shows_title_and_all_layer_names() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 20);
+        let s = render_to_string(&mut app, 120, 20);
         assert!(s.contains("nico ops"), "title missing:\n{s}");
         for name in ["cluster", "logs", "workflows", "health", "grpc", "postgres"] {
             assert!(s.contains(name), "layer {name} missing:\n{s}");
@@ -979,7 +1191,7 @@ mod tests {
     fn render_shows_overall_verdict_word() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 20);
+        let s = render_to_string(&mut app, 120, 20);
         assert!(s.contains("WARN"), "verdict missing:\n{s}");
     }
 
@@ -988,7 +1200,7 @@ mod tests {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::Focus(Dir::Right));
-        let s = render_to_string(&app, 120, 20);
+        let s = render_to_string(&mut app, 120, 20);
         // Focus marker is rendered as part of the focused scorecard's title.
         // We expect "▶ logs" but not "▶ cluster".
         assert!(s.contains("▶ logs"), "expected '▶ logs' in render:\n{s}");
@@ -1003,7 +1215,7 @@ mod tests {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::Focus(Dir::Right));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("findings — logs"), "drill title missing:\n{s}");
         assert!(s.contains("ERROR lines"), "finding text missing:\n{s}");
         assert!(s.contains("next:"), "next-cmd hint missing:\n{s}");
@@ -1013,7 +1225,7 @@ mod tests {
     fn render_hint_bar_lists_keybinds() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("R:refresh"), "hint missing:\n{s}");
         assert!(s.contains("?:help"), "hint missing:\n{s}");
         assert!(s.contains("q:quit"), "hint missing:\n{s}");
@@ -1024,7 +1236,7 @@ mod tests {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::OpenHelp);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("keybinds"), "overlay title missing:\n{s}");
         assert!(s.contains("refresh"), "overlay body missing:\n{s}");
     }
@@ -1034,7 +1246,7 @@ mod tests {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::TogglePause);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("PAUSED"), "PAUSED indicator missing:\n{s}");
     }
 
@@ -1042,7 +1254,7 @@ mod tests {
     fn render_hint_bar_omits_paused_when_running() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(!s.contains("PAUSED"), "PAUSED unexpectedly shown:\n{s}");
     }
 
@@ -1050,7 +1262,7 @@ mod tests {
     fn render_header_shows_done_glyph_after_completion() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("✓"), "expected ✓ in header after refresh:\n{s}");
     }
 
@@ -1059,7 +1271,7 @@ mod tests {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::OpenHelp);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(
             s.contains("pause"),
             "help overlay should mention pause keybind:\n{s}"
@@ -1072,7 +1284,7 @@ mod tests {
         app.handle(Action::Snapshots(six_layers()));
         app.handle(Action::Focus(Dir::Right));
         app.handle(Action::OpenDetail);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains("detail — logs"), "overlay title missing:\n{s}");
     }
 
@@ -1083,6 +1295,7 @@ mod tests {
                     status: Status::Warn,
                     message: format!("warn {i}"),
                     next_command: None,
+                    link: None,
                 })
                 .collect();
             let mut snaps = six_layers();
@@ -1099,7 +1312,7 @@ mod tests {
     fn scorecard_sparkline_appears_after_two_or_more_runs() {
         let mut app = App::new();
         drive_runs(&mut app, &[0, 4, 8]);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         let has_spark = s
             .chars()
             .any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
@@ -1110,7 +1323,7 @@ mod tests {
     fn scorecard_sparkline_blank_after_first_run_only() {
         let mut app = App::new();
         drive_runs(&mut app, &[3]);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         let has_spark = s
             .chars()
             .any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
@@ -1124,7 +1337,7 @@ mod tests {
             drive_runs(&mut app, &[0, 4, 8, 2, 6, 1, 0, 7, 3, 5, 4, 6]);
             // No assertion beyond "renders cleanly" — this test guards against
             // panics or layout glitches on the narrow grid reflows.
-            let _ = render_to_string(&app, w, h);
+            let _ = render_to_string(&mut app, w, h);
         }
     }
 
@@ -1133,7 +1346,7 @@ mod tests {
         let mut app = App::new();
         // Drive enough varied runs to seed both widgets.
         drive_runs(&mut app, &[0, 4, 8, 2, 6]);
-        let s = render_to_string(&app, 120, 24);
+        let s = render_to_string(&mut app, 120, 24);
         assert!(s.contains('■'), "breadcrumb missing:\n{s}");
         let has_spark = s
             .chars()
@@ -1153,7 +1366,7 @@ mod tests {
                 duration_ms: 0,
             }]));
         }
-        let s = render_to_string(&app, 120, 20);
+        let s = render_to_string(&mut app, 120, 20);
         let count = s.chars().filter(|c| *c == '■').count();
         assert!(
             count >= 3,
@@ -1163,8 +1376,8 @@ mod tests {
 
     #[test]
     fn header_breadcrumb_absent_before_any_run() {
-        let app = App::new();
-        let s = render_to_string(&app, 120, 20);
+        let mut app = App::new();
+        let s = render_to_string(&mut app, 120, 20);
         assert!(
             !s.contains('■'),
             "breadcrumb must not paint before any run:\n{s}"
@@ -1183,7 +1396,7 @@ mod tests {
                 duration_ms: 0,
             }]));
         }
-        let s = render_to_string(&app, 120, 20);
+        let s = render_to_string(&mut app, 120, 20);
         let count = s.chars().filter(|c| *c == '■').count();
         assert_eq!(
             count, BREADCRUMB_CAP,
@@ -1193,8 +1406,8 @@ mod tests {
 
     #[test]
     fn loading_header_when_no_snapshots() {
-        let app = App::new();
-        let s = render_to_string(&app, 120, 20);
+        let mut app = App::new();
+        let s = render_to_string(&mut app, 120, 20);
         assert!(s.contains("loading"), "loading hint missing:\n{s}");
     }
 
@@ -1209,7 +1422,7 @@ mod tests {
         }]));
         let backend = TestBackend::new(120, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(&app, theme, f)).unwrap();
+        terminal.draw(|f| render(&mut app, theme, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let pip = pip_glyph(&status);
         for y in 0..buf.area.height {
@@ -1255,8 +1468,8 @@ mod tests {
 
     #[test]
     fn layout_b_renders_all_six_quadrant_titles() {
-        let app = app_in_layout_b();
-        let s = render_to_string(&app, 140, 30);
+        let mut app = app_in_layout_b();
+        let s = render_to_string(&mut app, 140, 30);
         for title in ["Cluster", "Workflows", "Services", "Postgres", "Logs", "Activity"] {
             assert!(s.contains(title), "{title} quadrant missing:\n{s}");
         }
@@ -1264,8 +1477,8 @@ mod tests {
 
     #[test]
     fn layout_b_header_renders_verdict_word_via_big_text() {
-        let app = app_in_layout_b();
-        let s = render_to_string(&app, 140, 30);
+        let mut app = app_in_layout_b();
+        let s = render_to_string(&mut app, 140, 30);
         // The big-text widget emits Quadrant glyphs (▀▄█▌▐ etc.) for the
         // verdict word — assert that at least one such glyph is present.
         let has_quadrant_glyph = s
@@ -1297,15 +1510,15 @@ mod tests {
                 tags: Default::default(),
             },
         ]));
-        let s = render_to_string(&app, 160, 36);
+        let s = render_to_string(&mut app, 160, 36);
         assert!(s.contains("OOMKilled"), "k8s event missing:\n{s}");
         assert!(s.contains("HostProvisioning"), "temporal event missing:\n{s}");
     }
 
     #[test]
     fn layout_b_activity_quadrant_empty_state_when_no_events() {
-        let app = app_in_layout_b();
-        let s = render_to_string(&app, 140, 30);
+        let mut app = app_in_layout_b();
+        let s = render_to_string(&mut app, 140, 30);
         assert!(
             s.contains("no recent namespace events"),
             "empty Activity hint missing:\n{s}"
@@ -1314,8 +1527,8 @@ mod tests {
 
     #[test]
     fn layout_b_focused_quadrant_marker_is_rendered() {
-        let app = app_in_layout_b();
-        let s = render_to_string(&app, 140, 30);
+        let mut app = app_in_layout_b();
+        let s = render_to_string(&mut app, 140, 30);
         // Default focus is index 0 → Cluster.
         assert!(s.contains("▶ Cluster"), "focus marker missing:\n{s}");
     }
@@ -1324,7 +1537,7 @@ mod tests {
     fn layout_b_zoomed_renders_only_focused_quadrant() {
         let mut app = app_in_layout_b();
         app.handle(Action::ZoomQuadrant);
-        let s = render_to_string(&app, 140, 30);
+        let s = render_to_string(&mut app, 140, 30);
         // Zoomed-in view shows the focused quadrant title; the others
         // should not appear as quadrant headers.
         assert!(s.contains("▶ Cluster"), "focused title missing:\n{s}");
@@ -1342,9 +1555,9 @@ mod tests {
 
     #[test]
     fn layout_b_falls_back_to_ascii_verdict_at_short_height() {
-        let app = app_in_layout_b();
+        let mut app = app_in_layout_b();
         // height < 14 → header ASCII fallback path.
-        let s = render_to_string(&app, 140, 12);
+        let s = render_to_string(&mut app, 140, 12);
         assert!(s.contains("WARN"), "ASCII verdict word missing:\n{s}");
         let has_quadrant_glyph = s
             .chars()
@@ -1358,10 +1571,346 @@ mod tests {
     #[test]
     fn layout_b_hint_bar_changes_with_zoom() {
         let mut app = app_in_layout_b();
-        let unzoomed = render_to_string(&app, 140, 30);
+        let unzoomed = render_to_string(&mut app, 140, 30);
         assert!(unzoomed.contains("Enter:zoom"), "missing zoom hint:\n{unzoomed}");
         app.handle(Action::ZoomQuadrant);
-        let zoomed = render_to_string(&app, 140, 30);
+        let zoomed = render_to_string(&mut app, 140, 30);
         assert!(zoomed.contains("Esc:restore"), "missing restore hint:\n{zoomed}");
+    }
+    #[test]
+    fn hint_bar_shows_mouse_on_by_default() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(s.contains("M:mouse(on)"), "mouse hint missing:\n{s}");
+    }
+
+    #[test]
+    fn hint_bar_reflects_mouse_off_after_toggle() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::ToggleMouseCapture);
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(s.contains("M:mouse(off)"), "mouse hint did not flip:\n{s}");
+    }
+
+    #[test]
+    fn render_publishes_card_regions_for_hit_testing() {
+        // Render once to populate card_regions, then locate the "logs"
+        // scorecard by scanning cells (column-counted, not byte-indexed,
+        // to avoid the multi-byte pip glyphs throwing off positions) and
+        // confirm a click on it focuses card #1.
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&mut app, &DEFAULT, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let needle: Vec<&str> = vec!["l", "o", "g", "s"];
+        let mut hit: Option<(u16, u16)> = None;
+        'outer: for y in 0..buf.area.height {
+            for x in 0..buf.area.width.saturating_sub(needle.len() as u16) {
+                if (0..needle.len() as u16)
+                    .all(|i| buf.cell((x + i, y)).unwrap().symbol() == needle[i as usize])
+                {
+                    hit = Some((x, y));
+                    break 'outer;
+                }
+            }
+        }
+        let (col, row) = hit.expect("logs scorecard title not found in render");
+        app.handle(Action::Click { col, row });
+        assert_eq!(
+            app.focus(),
+            1,
+            "click on the logs scorecard at ({col}, {row}) should focus card #1"
+        );
+    }
+
+    #[test]
+    fn drill_scroll_offset_is_applied_to_drill_paragraph() {
+        let mut app = App::new();
+        let many = vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Warn,
+            evidence: "many".into(),
+            findings: (0..10)
+                .map(|i| Finding {
+                    status: Status::Warn,
+                    message: format!("finding number {i:02}"),
+                    next_command: None,
+                    link: None,
+                })
+                .collect(),
+            duration_ms: 0,
+        }];
+        app.handle(Action::Snapshots(many));
+        let baseline = render_to_string(&mut app, 120, 24);
+        app.handle(Action::Scroll(ScrollDir::Down));
+        app.handle(Action::Scroll(ScrollDir::Down));
+        let scrolled = render_to_string(&mut app, 120, 24);
+        assert_ne!(
+            baseline, scrolled,
+            "drill should redraw differently when drill_scroll changes"
+        );
+    }
+
+    #[test]
+    fn overlay_scroll_offset_is_applied_to_detail_overlay() {
+        let mut app = App::new();
+        let many = vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Warn,
+            evidence: "many".into(),
+            findings: (0..30)
+                .map(|i| Finding {
+                    status: Status::Warn,
+                    message: format!("overlay finding {i:02}"),
+                    next_command: None,
+                    link: None,
+                })
+                .collect(),
+            duration_ms: 0,
+        }];
+        app.handle(Action::Snapshots(many));
+        app.handle(Action::OpenDetail);
+        let baseline = render_to_string(&mut app, 120, 24);
+        app.handle(Action::Scroll(ScrollDir::Down));
+        app.handle(Action::Scroll(ScrollDir::Down));
+        app.handle(Action::Scroll(ScrollDir::Down));
+        let scrolled = render_to_string(&mut app, 120, 24);
+        assert_ne!(
+            baseline, scrolled,
+            "detail overlay should redraw differently when overlay_scroll changes"
+        );
+    }
+
+    use crate::action::ScrollDir;
+
+    // ── Layout C / Spotlight ────────────────────────────────────────────
+
+    fn mixed_for_spotlight() -> Vec<LayerSnapshot> {
+        // 2 non-green (warn, fail), 3 green (ok, ok, skipped).
+        vec![
+            LayerSnapshot {
+                name: "cluster".into(),
+                status: Status::Ok,
+                evidence: "3 nodes ready".into(),
+                findings: vec![],
+                duration_ms: 0,
+            },
+            LayerSnapshot {
+                name: "logs".into(),
+                status: Status::Warn,
+                evidence: "12 errors".into(),
+                findings: vec![Finding {
+                    status: Status::Warn,
+                    message: "12 ERROR lines".into(),
+                    next_command: Some("kubectl logs -n nico foo".into()),
+                    link: Some("https://example.com/logs".into()),
+                }],
+                duration_ms: 0,
+            },
+            LayerSnapshot {
+                name: "workflows".into(),
+                status: Status::Ok,
+                evidence: "no stuck wf".into(),
+                findings: vec![],
+                duration_ms: 0,
+            },
+            LayerSnapshot {
+                name: "grpc".into(),
+                status: Status::Fail,
+                evidence: "unreachable".into(),
+                findings: vec![Finding {
+                    status: Status::Fail,
+                    message: "dial tcp: i/o timeout".into(),
+                    next_command: Some("kubectl describe svc -n nico grpc".into()),
+                    link: None,
+                }],
+                duration_ms: 0,
+            },
+            LayerSnapshot {
+                name: "postgres".into(),
+                status: Status::Skipped,
+                evidence: "skipped".into(),
+                findings: vec![],
+                duration_ms: 0,
+            },
+        ]
+    }
+
+    fn enter_spotlight(app: &mut App) {
+        app.handle(Action::ShowSpotlight);
+    }
+
+    #[test]
+    fn spotlight_renders_big_text_headline_for_verdict() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        // tui-big-text doesn't emit literal letters; instead, it paints
+        // box-drawing glyphs derived from the 8x8 font. We assert that
+        // the Spotlight headline area is non-empty (not just blanks) and
+        // styled in the verdict colour.
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&mut app, &DEFAULT, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut found_painted = false;
+        for y in 0..SPOTLIGHT_HEADER_HEIGHT.min(buf.area.height) {
+            for x in 0..buf.area.width {
+                let cell = buf.cell((x, y)).unwrap();
+                if cell.symbol() != " " && cell.fg == DEFAULT.error {
+                    found_painted = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_painted, "expected painted FAIL headline in red");
+    }
+
+    #[test]
+    fn spotlight_renders_one_card_per_non_green_layer() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        let s = render_to_string(&mut app, 120, 30);
+        // The two non-green Layers must each surface as a card title.
+        assert!(s.contains("logs"), "logs card missing:\n{s}");
+        assert!(s.contains("grpc"), "grpc card missing:\n{s}");
+        // Their evidence + next-command lines must show through.
+        assert!(s.contains("12 errors"), "logs evidence missing:\n{s}");
+        assert!(s.contains("unreachable"), "grpc evidence missing:\n{s}");
+        assert!(
+            s.contains("next: kubectl logs"),
+            "logs next-cmd missing:\n{s}"
+        );
+        assert!(
+            s.contains("[y] copy"),
+            "spotlight action keybinds missing:\n{s}"
+        );
+        assert!(
+            s.contains("[o] open"),
+            "spotlight action keybinds missing:\n{s}"
+        );
+        assert!(
+            s.contains("[c] correlate"),
+            "spotlight action keybinds missing:\n{s}"
+        );
+    }
+
+    #[test]
+    fn spotlight_compresses_green_layers_to_footer_line() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        let s = render_to_string(&mut app, 120, 30);
+        for name in ["cluster", "workflows", "postgres"] {
+            assert!(
+                s.contains(name),
+                "green layer {name} should be in footer:\n{s}"
+            );
+        }
+        // The green-strip pip glyph is `●`.
+        assert!(s.contains("●"), "green pip missing in footer:\n{s}");
+    }
+
+    #[test]
+    fn spotlight_does_not_render_layout_a_grid() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        let s = render_to_string(&mut app, 120, 30);
+        // Layout A's "nico ops" header title must not appear in
+        // Spotlight.
+        assert!(
+            !s.contains("nico ops"),
+            "Layout A header leaked into Spotlight:\n{s}"
+        );
+        // Layout A's drill panel title must not appear either.
+        assert!(
+            !s.contains("findings —"),
+            "Layout A drill leaked into Spotlight:\n{s}"
+        );
+    }
+
+    #[test]
+    fn spotlight_with_no_incidents_renders_friendly_empty_state() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![LayerSnapshot {
+            name: "cluster".into(),
+            status: Status::Ok,
+            evidence: "ok".into(),
+            findings: vec![],
+            duration_ms: 0,
+        }]));
+        enter_spotlight(&mut app);
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(
+            s.contains("no incidents") || s.contains("All layers are green"),
+            "expected empty-state hint:\n{s}"
+        );
+    }
+
+    #[test]
+    fn spotlight_toast_renders_in_hint_bar() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        app.handle(Action::ShowToast("clipboard unavailable".into()));
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(
+            s.contains("clipboard unavailable"),
+            "toast missing in render:\n{s}"
+        );
+    }
+
+    #[test]
+    fn layout_a_hint_bar_advertises_spotlight_keybind() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(s.contains("s:spotlight"), "spotlight hint missing:\n{s}");
+    }
+
+    #[test]
+    fn help_overlay_lists_spotlight_keybinds() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        app.handle(Action::OpenHelp);
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(
+            s.contains("spotlight"),
+            "help should mention spotlight:\n{s}"
+        );
+        assert!(
+            s.contains("show all"),
+            "help should mention show-all return:\n{s}"
+        );
+    }
+
+    #[test]
+    fn spotlight_help_overlay_renders_on_top_of_layout_c() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        app.handle(Action::OpenHelp);
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(
+            s.contains("keybinds"),
+            "help overlay missing in spotlight:\n{s}"
+        );
+    }
+
+    #[test]
+    fn render_in_spotlight_does_not_panic_at_narrow_widths() {
+        for (w, h) in [(40u16, 24u16), (60, 24), (90, 24), (120, 30)] {
+            let mut app = App::new();
+            app.handle(Action::Snapshots(mixed_for_spotlight()));
+            enter_spotlight(&mut app);
+            let _ = render_to_string(&mut app, w, h);
+        }
     }
 }

@@ -1,16 +1,5 @@
 use nico_common::output::Status;
 
-/// Which top-level layout the dashboard is currently rendering. Layout A
-/// is the original 6-up scorecard grid (ADR-010); Layout B is the Mission
-/// Control 2×3 quadrant grid with the `tui-big-text` verdict header
-/// (issue #155).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Layout {
-    #[default]
-    A,
-    B,
-}
-
 /// Fixed quadrant order for Layout B. Matches issue #155: Cluster /
 /// Workflows / Services / Postgres / Logs / Activity. Five quadrants are
 /// backed by a doctor `LayerSnapshot`; Activity is sourced from
@@ -67,6 +56,11 @@ pub struct Finding {
     pub status: Status,
     pub message: String,
     pub next_command: Option<String>,
+    /// Optional deep-link a Layer can attach so the Spotlight `[o]` action
+    /// has a sensible URL to hand to the system browser (e.g. a Grafana
+    /// dashboard or Temporal Web UI workflow page). `None` means the
+    /// `[o]` action raises a toast instead.
+    pub link: Option<String>,
 }
 
 /// What a single Layer scorecard shows: its aggregate status, a one-line

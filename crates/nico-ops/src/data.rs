@@ -40,6 +40,7 @@ fn layer_result_to_snapshot(r: LayerResult) -> LayerSnapshot {
             status: c.status,
             message: format!("{}: {}", c.name, c.value),
             next_command: c.next_command,
+            link: None,
         })
         .collect();
     LayerSnapshot {
@@ -95,7 +96,12 @@ mod tests {
     }
 
     fn result(name: &'static str, status: Status, checks: Vec<Check>) -> LayerResult {
-        LayerResult { name, status, checks, duration_ms: 0 }
+        LayerResult {
+            name,
+            status,
+            checks,
+            duration_ms: 0,
+        }
     }
 
     #[test]
