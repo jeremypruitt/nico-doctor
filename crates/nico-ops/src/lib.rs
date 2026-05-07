@@ -23,6 +23,7 @@ pub mod events;
 pub mod model;
 pub mod ringbuffer;
 pub mod view;
+pub mod widgets;
 
 use crate::action::Action;
 use crate::app::{App, Effect};
