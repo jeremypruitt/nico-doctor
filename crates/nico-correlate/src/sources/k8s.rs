@@ -212,6 +212,7 @@ mod tests {
                 event_type: Some("Warning".into()),
                 reason: Some("OOMKilled".into()),
                 message: Some("container ran out of memory".into()),
+                involved_object: Some("hp-worker-xyz".into()),
             }]);
         client.require_label_selector = Some("workflow_id=hp-abc".into());
         let source = K8sSource::new(Arc::new(client));

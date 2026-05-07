@@ -241,6 +241,7 @@ async fn k8s_source_one_pod_event_has_k8s_source() {
         event_type: Some("Warning".into()),
         reason: Some("OOMKilled".into()),
         message: Some("container ran out of memory".into()),
+        involved_object: Some("hp-worker-xyz".into()),
     }];
     let mut client = MockK8sClient::new().with_pods(pods).with_events(events);
     client.require_label_selector = Some("workflow_id=hp-abc".into());
