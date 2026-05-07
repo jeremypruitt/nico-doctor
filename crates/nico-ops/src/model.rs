@@ -1,5 +1,66 @@
 use nico_common::output::Status;
 
+/// Which top-level layout the dashboard is currently rendering. Layout A
+/// is the original 6-up scorecard grid (ADR-010); Layout B is the Mission
+/// Control 2×3 quadrant grid with the `tui-big-text` verdict header
+/// (issue #155).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    #[default]
+    A,
+    B,
+}
+
+/// Fixed quadrant order for Layout B. Matches issue #155: Cluster /
+/// Workflows / Services / Postgres / Logs / Activity. Five quadrants are
+/// backed by a doctor `LayerSnapshot`; Activity is sourced from
+/// [`nico_correlate::recent_namespace_events`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quadrant {
+    Cluster,
+    Workflows,
+    Services,
+    Postgres,
+    Logs,
+    Activity,
+}
+
+impl Quadrant {
+    pub const ALL: [Quadrant; 6] = [
+        Quadrant::Cluster,
+        Quadrant::Workflows,
+        Quadrant::Services,
+        Quadrant::Postgres,
+        Quadrant::Logs,
+        Quadrant::Activity,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Quadrant::Cluster => "Cluster",
+            Quadrant::Workflows => "Workflows",
+            Quadrant::Services => "Services",
+            Quadrant::Postgres => "Postgres",
+            Quadrant::Logs => "Logs",
+            Quadrant::Activity => "Activity",
+        }
+    }
+
+    /// Doctor layer name backing this quadrant, if any. Activity has no
+    /// underlying layer — its content comes from the namespace events
+    /// feed.
+    pub fn layer_name(self) -> Option<&'static str> {
+        match self {
+            Quadrant::Cluster => Some("cluster"),
+            Quadrant::Workflows => Some("workflows"),
+            Quadrant::Services => Some("health"),
+            Quadrant::Postgres => Some("postgres"),
+            Quadrant::Logs => Some("logs"),
+            Quadrant::Activity => None,
+        }
+    }
+}
+
 /// A single warning/failure line attached to a Layer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Finding {

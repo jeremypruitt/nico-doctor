@@ -3,17 +3,18 @@ use nico_common::output::Status;
 use nico_common::theme::Theme;
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Constraint, Direction, Layout as TuiLayout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use tui_big_text::{BigText, PixelSize};
 
 use nico_doctor::baseline::Delta;
 
 use crate::app::App;
 use crate::events::Overlay;
-use crate::model::{Finding, overall_verdict};
+use crate::model::{Finding, LayerSnapshot, Layout as AppLayout, Quadrant, overall_verdict};
 use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
 
 /// How many recent verdicts the header breadcrumb shows. The ring buffer
@@ -42,8 +43,15 @@ pub const HELP_LINES: &[&str] = &[
 
 /// Top-level render. The host loop calls this once per dirty frame.
 pub fn render(app: &App, theme: &Theme, frame: &mut Frame) {
+    match app.layout() {
+        AppLayout::A => render_layout_a(app, theme, frame),
+        AppLayout::B => render_layout_b(app, theme, frame),
+    }
+}
+
+fn render_layout_a(app: &App, theme: &Theme, frame: &mut Frame) {
     let area = frame.area();
-    let chunks = Layout::default()
+    let chunks = TuiLayout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
@@ -135,7 +143,7 @@ fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 
     let row_constraints: Vec<Constraint> =
         std::iter::repeat_n(Constraint::Length(SCORECARD_ROW_HEIGHT), rows).collect();
-    let row_areas = Layout::default()
+    let row_areas = TuiLayout::default()
         .direction(Direction::Vertical)
         .constraints(row_constraints)
         .split(area);
@@ -143,7 +151,7 @@ fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     for r in 0..rows {
         let col_constraints: Vec<Constraint> =
             std::iter::repeat_n(Constraint::Ratio(1, cols as u32), cols).collect();
-        let col_areas = Layout::default()
+        let col_areas = TuiLayout::default()
             .direction(Direction::Horizontal)
             .constraints(col_constraints)
             .split(row_areas[r]);
@@ -205,7 +213,7 @@ fn render_scorecard(app: &App, idx: usize, theme: &Theme, frame: &mut Frame, are
         return;
     }
 
-    let chunks = Layout::default()
+    let chunks = TuiLayout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
@@ -439,6 +447,250 @@ fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
         width: h,
         height: v,
     }
+}
+
+// ── Layout B (Mission Control, issue #155) ────────────────────────────
+
+/// Inner cell rows needed to fit a Quadrant-pixel-size big-text glyph
+/// (4 inner rows). Add 2 for the surrounding block borders to get the
+/// outer header height. Below this we degrade to an ASCII verdict line.
+const BIG_TEXT_INNER_ROWS: u16 = 4;
+const BIG_TEXT_HEADER_HEIGHT: u16 = BIG_TEXT_INNER_ROWS + 2;
+const ASCII_HEADER_HEIGHT: u16 = 3;
+
+fn render_layout_b(app: &App, theme: &Theme, frame: &mut Frame) {
+    let area = frame.area();
+    let header_height = if area.height >= BIG_TEXT_HEADER_HEIGHT + 8 {
+        BIG_TEXT_HEADER_HEIGHT
+    } else {
+        ASCII_HEADER_HEIGHT
+    };
+    let chunks = TuiLayout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_height),
+            Constraint::Min(6),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    render_layout_b_header(app, theme, frame, chunks[0]);
+    if app.b_zoomed() {
+        render_layout_b_zoomed(app, theme, frame, chunks[1]);
+    } else {
+        render_layout_b_grid(app, theme, frame, chunks[1]);
+    }
+    render_layout_b_hint_bar(app, theme, frame, chunks[2]);
+
+    if app.overlay() == Overlay::Help {
+        // Layout B does not use the Detail overlay; Enter zooms instead.
+        render_help_overlay(theme, frame, area);
+    }
+}
+
+fn render_layout_b_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let snapshots = app.snapshots();
+    let verdict = overall_verdict(snapshots);
+    let word = verdict_word(&verdict);
+    let color = theme_color(theme, &verdict);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" mission control ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height >= BIG_TEXT_INNER_ROWS {
+        let big = BigText::builder()
+            .pixel_size(PixelSize::Quadrant)
+            .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+            .lines(vec![Line::from(word)])
+            .build();
+        frame.render_widget(big, inner);
+    } else {
+        // ASCII fallback when the terminal is too short for tui-big-text.
+        let line = Line::from(Span::styled(
+            word.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+        frame.render_widget(Paragraph::new(line), inner);
+    }
+}
+
+fn render_layout_b_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let rows = TuiLayout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(area);
+
+    for row in 0..2 {
+        let cols = TuiLayout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Ratio(1, 3),
+                Constraint::Ratio(1, 3),
+                Constraint::Ratio(1, 3),
+            ])
+            .split(rows[row]);
+        for col in 0..3 {
+            let idx = row * 3 + col;
+            let q = Quadrant::ALL[idx];
+            let focused = idx == app.b_focus();
+            render_quadrant(app, q, focused, theme, frame, cols[col]);
+        }
+    }
+}
+
+fn render_layout_b_zoomed(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    render_quadrant(app, app.focused_quadrant(), true, theme, frame, area);
+}
+
+fn render_quadrant(
+    app: &App,
+    quadrant: Quadrant,
+    focused: bool,
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let title_text = if focused {
+        format!(" ▶ {} ", quadrant.title())
+    } else {
+        format!(" {} ", quadrant.title())
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(title_text);
+    if focused {
+        block = block.border_style(
+            Style::default()
+                .fg(theme.overlay_key)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    match quadrant {
+        Quadrant::Activity => render_activity_body(app, theme, frame, inner),
+        _ => render_layer_body(app, quadrant, theme, frame, inner),
+    }
+}
+
+fn render_layer_body(
+    app: &App,
+    quadrant: Quadrant,
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let lines: Vec<Line> = match find_snapshot(app.snapshots(), quadrant) {
+        Some(s) => layer_body_lines(s, theme),
+        None => vec![Line::from(Span::styled(
+            "no data",
+            Style::default().fg(theme.muted),
+        ))],
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+fn find_snapshot(snapshots: &[LayerSnapshot], quadrant: Quadrant) -> Option<&LayerSnapshot> {
+    let name = quadrant.layer_name()?;
+    snapshots.iter().find(|s| s.name == name)
+}
+
+fn layer_body_lines(snap: &LayerSnapshot, theme: &Theme) -> Vec<Line<'static>> {
+    let pip_style = Style::default().fg(theme_color(theme, &snap.status));
+    let mut out = vec![Line::from(vec![
+        Span::styled(format!("{} ", pip_glyph(&snap.status)), pip_style),
+        Span::raw(snap.evidence.clone()),
+    ])];
+    let mut findings_added = 0;
+    for f in &snap.findings {
+        if findings_added >= 4 {
+            break;
+        }
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("{} ", pip_glyph(&f.status)),
+                Style::default().fg(theme_color(theme, &f.status)),
+            ),
+            Span::raw(f.message.clone()),
+        ]));
+        findings_added += 1;
+    }
+    if snap.findings.len() > findings_added {
+        out.push(Line::from(Span::styled(
+            format!("    +{} more", snap.findings.len() - findings_added),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    out
+}
+
+fn render_activity_body(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let events = app.namespace_events();
+    if events.is_empty() {
+        let line = Line::from(Span::styled(
+            "no recent namespace events",
+            Style::default().fg(theme.muted),
+        ));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    let max_rows = area.height as usize;
+    let lines: Vec<Line> = events
+        .iter()
+        .take(max_rows)
+        .map(|e| {
+            let status = severity_status(e);
+            let color = theme_color(theme, &status);
+            Line::from(vec![
+                Span::styled(
+                    format!("{} ", pip_glyph(&status)),
+                    Style::default().fg(color),
+                ),
+                Span::raw(format!("{}  ", e.ts.format("%H:%M:%S"))),
+                Span::styled(
+                    format!("{:<8}", e.source),
+                    Style::default().fg(theme.muted),
+                ),
+                Span::raw(format!(" {}", e.kind)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+fn severity_status(event: &nico_correlate::Event) -> Status {
+    match event.severity {
+        nico_correlate::Severity::Info => Status::Ok,
+        nico_correlate::Severity::Warning => Status::Warn,
+        nico_correlate::Severity::Error => Status::Fail,
+    }
+}
+
+fn render_layout_b_hint_bar(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let mut hint = String::from(" ");
+    if app.b_zoomed() {
+        hint.push_str("Esc:restore  ");
+    } else {
+        hint.push_str("Enter:zoom  ");
+    }
+    hint.push_str("hjkl/arrows:focus  m/Esc:back to A  R:refresh  ?:help  q:quit ");
+    let mut spans: Vec<Span> = vec![Span::styled(hint, Style::default().fg(theme.muted))];
+    if app.paused() {
+        spans.push(Span::styled(
+            " PAUSED ",
+            Style::default()
+                .fg(theme.warn)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 #[cfg(test)]
@@ -990,5 +1242,126 @@ mod tests {
         use nico_common::theme::GRUVBOX;
         let color = pip_color_for(&GRUVBOX, Status::Ok);
         assert_eq!(color, GRUVBOX.ok);
+    }
+
+    // ── Layout B (Mission Control, issue #155) ─────────────────────────
+
+    fn app_in_layout_b() -> App {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::ToggleLayout);
+        app
+    }
+
+    #[test]
+    fn layout_b_renders_all_six_quadrant_titles() {
+        let app = app_in_layout_b();
+        let s = render_to_string(&app, 140, 30);
+        for title in ["Cluster", "Workflows", "Services", "Postgres", "Logs", "Activity"] {
+            assert!(s.contains(title), "{title} quadrant missing:\n{s}");
+        }
+    }
+
+    #[test]
+    fn layout_b_header_renders_verdict_word_via_big_text() {
+        let app = app_in_layout_b();
+        let s = render_to_string(&app, 140, 30);
+        // The big-text widget emits Quadrant glyphs (▀▄█▌▐ etc.) for the
+        // verdict word — assert that at least one such glyph is present.
+        let has_quadrant_glyph = s
+            .chars()
+            .any(|c| matches!(c, '▀' | '▄' | '█' | '▌' | '▐' | '▘' | '▝' | '▖' | '▗'));
+        assert!(has_quadrant_glyph, "expected tui-big-text glyphs:\n{s}");
+        assert!(s.contains("mission control"), "header title missing:\n{s}");
+    }
+
+    #[test]
+    fn layout_b_activity_quadrant_shows_namespace_events() {
+        let mut app = app_in_layout_b();
+        let now = chrono::Utc::now();
+        app.handle(Action::NamespaceEvents(vec![
+            nico_correlate::Event {
+                ts: now,
+                source: "k8s".into(),
+                kind: "OOMKilled".into(),
+                message: "boom".into(),
+                severity: nico_correlate::Severity::Warning,
+                tags: Default::default(),
+            },
+            nico_correlate::Event {
+                ts: now,
+                source: "temporal".into(),
+                kind: "HostProvisioning".into(),
+                message: "hp-1".into(),
+                severity: nico_correlate::Severity::Info,
+                tags: Default::default(),
+            },
+        ]));
+        let s = render_to_string(&app, 160, 36);
+        assert!(s.contains("OOMKilled"), "k8s event missing:\n{s}");
+        assert!(s.contains("HostProvisioning"), "temporal event missing:\n{s}");
+    }
+
+    #[test]
+    fn layout_b_activity_quadrant_empty_state_when_no_events() {
+        let app = app_in_layout_b();
+        let s = render_to_string(&app, 140, 30);
+        assert!(
+            s.contains("no recent namespace events"),
+            "empty Activity hint missing:\n{s}"
+        );
+    }
+
+    #[test]
+    fn layout_b_focused_quadrant_marker_is_rendered() {
+        let app = app_in_layout_b();
+        let s = render_to_string(&app, 140, 30);
+        // Default focus is index 0 → Cluster.
+        assert!(s.contains("▶ Cluster"), "focus marker missing:\n{s}");
+    }
+
+    #[test]
+    fn layout_b_zoomed_renders_only_focused_quadrant() {
+        let mut app = app_in_layout_b();
+        app.handle(Action::ZoomQuadrant);
+        let s = render_to_string(&app, 140, 30);
+        // Zoomed-in view shows the focused quadrant title; the others
+        // should not appear as quadrant headers.
+        assert!(s.contains("▶ Cluster"), "focused title missing:\n{s}");
+        // Body content (cluster snapshot evidence) should be visible.
+        assert!(
+            s.contains("3 nodes ready") || s.contains("checks ok"),
+            "zoomed quadrant body missing:\n{s}"
+        );
+        // Activity title should not appear (it's not the focused quadrant).
+        assert!(
+            !s.contains("Activity"),
+            "non-focused quadrant should not paint while zoomed:\n{s}"
+        );
+    }
+
+    #[test]
+    fn layout_b_falls_back_to_ascii_verdict_at_short_height() {
+        let app = app_in_layout_b();
+        // height < 14 → header ASCII fallback path.
+        let s = render_to_string(&app, 140, 12);
+        assert!(s.contains("WARN"), "ASCII verdict word missing:\n{s}");
+        let has_quadrant_glyph = s
+            .chars()
+            .any(|c| matches!(c, '▀' | '▄' | '█' | '▌' | '▐' | '▘' | '▝' | '▖' | '▗'));
+        assert!(
+            !has_quadrant_glyph,
+            "tui-big-text should be skipped at short heights:\n{s}"
+        );
+    }
+
+    #[test]
+    fn layout_b_hint_bar_changes_with_zoom() {
+        let mut app = app_in_layout_b();
+        let unzoomed = render_to_string(&app, 140, 30);
+        assert!(unzoomed.contains("Enter:zoom"), "missing zoom hint:\n{unzoomed}");
+        app.handle(Action::ZoomQuadrant);
+        let zoomed = render_to_string(&app, 140, 30);
+        assert!(zoomed.contains("Esc:restore"), "missing restore hint:\n{zoomed}");
     }
 }
