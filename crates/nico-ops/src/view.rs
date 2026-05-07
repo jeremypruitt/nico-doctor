@@ -11,7 +11,22 @@ use ratatui::{
 
 use crate::app::App;
 use crate::events::Overlay;
-use crate::model::{Finding, LayerSnapshot, overall_verdict};
+use crate::model::{Finding, overall_verdict};
+use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
+
+/// How many recent verdicts the header breadcrumb shows. The ring buffer
+/// caps at `RING_CAPACITY` (32); the breadcrumb shows a smaller window so
+/// it stays glanceable at narrow terminal widths.
+pub const BREADCRUMB_CAP: usize = 10;
+
+/// Glyph used for each entry in the header breadcrumb. Color carries the
+/// verdict — flat shape keeps the strip scannable at any width.
+pub const BREADCRUMB_GLYPH: &str = "■";
+
+/// Maximum number of data points rendered in a per-scorecard sparkline.
+/// Capped so very wide terminals don't paint a visually dense strip; the
+/// renderer also clamps to the available cell width.
+pub const SPARKLINE_MAX: usize = 24;
 
 pub const HELP_LINES: &[&str] = &[
     "R         refresh",
@@ -75,6 +90,17 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             .add_modifier(Modifier::BOLD),
     ));
 
+    let crumbs = breadcrumb_verdicts(app.history(), BREADCRUMB_CAP);
+    if !crumbs.is_empty() {
+        spans.push(Span::raw("    "));
+        for v in &crumbs {
+            spans.push(Span::styled(
+                BREADCRUMB_GLYPH.to_string(),
+                Style::default().fg(theme_color(theme, v)),
+            ));
+        }
+    }
+
     let timestamp = match (app.last_refreshed(), app.refreshing()) {
         (_, true) => "refreshing…".to_string(),
         (Some(t), false) => format!("refreshed {}", format_time(&t)),
@@ -109,7 +135,7 @@ fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let rows = snapshots.len().div_ceil(cols);
 
     let row_constraints: Vec<Constraint> =
-        std::iter::repeat_n(Constraint::Length(4), rows).collect();
+        std::iter::repeat_n(Constraint::Length(SCORECARD_ROW_HEIGHT), rows).collect();
     let row_areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints(row_constraints)
@@ -132,21 +158,26 @@ fn render_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             } else {
                 continue;
             };
-            render_scorecard(snapshots, idx, app.focus(), theme, frame, cell);
+            render_scorecard(app, idx, theme, frame, cell);
         }
     }
 }
 
+/// Row height for one scorecard: top border + evidence line + sparkline +
+/// bottom border = 4. The sparkline shares the inner area with the
+/// evidence block; the renderer reserves the bottom row for it.
+const SCORECARD_ROW_HEIGHT: u16 = 5;
+
 fn render_scorecard(
-    snapshots: &[LayerSnapshot],
+    app: &App,
     idx: usize,
-    focus: usize,
     theme: &Theme,
     frame: &mut Frame,
     area: Rect,
 ) {
+    let snapshots = app.snapshots();
     let snap = &snapshots[idx];
-    let focused = idx == focus;
+    let focused = idx == app.focus();
     let title = if focused {
         format!("▶ {} ", snap.name)
     } else {
@@ -163,6 +194,15 @@ fn render_scorecard(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if inner.height == 0 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
     let line = Line::from(vec![
         Span::styled(
             format!("{} ", pip_glyph(&snap.status)),
@@ -170,7 +210,19 @@ fn render_scorecard(
         ),
         Span::raw(snap.evidence.clone()),
     ]);
-    frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), inner);
+    frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), chunks[0]);
+
+    let spark_width = (chunks[1].width as usize).min(SPARKLINE_MAX);
+    let sparkline = sparkline_for_layer(app.history(), &snap.name, spark_width);
+    if !sparkline.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                sparkline,
+                Style::default().fg(theme_color(theme, &snap.status)),
+            ))),
+            chunks[1],
+        );
+    }
 }
 
 fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
@@ -363,6 +415,7 @@ fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::action::{Action, Dir};
+    use crate::model::LayerSnapshot;
     use nico_common::theme::DEFAULT;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -567,6 +620,109 @@ mod tests {
         app.handle(Action::OpenDetail);
         let s = render_to_string(&app, 120, 24);
         assert!(s.contains("detail — logs"), "overlay title missing:\n{s}");
+    }
+
+    fn drive_runs(app: &mut App, finding_counts: &[usize]) {
+        for &fc in finding_counts {
+            let findings = (0..fc)
+                .map(|i| Finding {
+                    status: Status::Warn,
+                    message: format!("warn {i}"),
+                    next_command: None,
+                })
+                .collect();
+            let mut snaps = six_layers();
+            // Inject a varying finding count on the "logs" layer.
+            if let Some(logs) = snaps.iter_mut().find(|s| s.name == "logs") {
+                logs.findings = findings;
+                logs.status = if fc > 0 { Status::Warn } else { Status::Ok };
+            }
+            app.handle(Action::Snapshots(snaps));
+        }
+    }
+
+    #[test]
+    fn scorecard_sparkline_appears_after_two_or_more_runs() {
+        let mut app = App::new();
+        drive_runs(&mut app, &[0, 4, 8]);
+        let s = render_to_string(&app, 120, 24);
+        let has_spark = s.chars().any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
+        assert!(has_spark, "expected sparkline glyph in render:\n{s}");
+    }
+
+    #[test]
+    fn scorecard_sparkline_blank_after_first_run_only() {
+        let mut app = App::new();
+        drive_runs(&mut app, &[3]);
+        let s = render_to_string(&app, 120, 24);
+        let has_spark = s.chars().any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
+        assert!(!has_spark, "no sparkline expected for <2 runs:\n{s}");
+    }
+
+    #[test]
+    fn render_does_not_panic_at_narrow_widths_with_history() {
+        for (w, h) in [(40u16, 24u16), (60, 24), (90, 24)] {
+            let mut app = App::new();
+            drive_runs(&mut app, &[0, 4, 8, 2, 6, 1, 0, 7, 3, 5, 4, 6]);
+            // No assertion beyond "renders cleanly" — this test guards against
+            // panics or layout glitches on the narrow grid reflows.
+            let _ = render_to_string(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn pre_populated_ring_renders_both_sparkline_and_breadcrumb() {
+        let mut app = App::new();
+        // Drive enough varied runs to seed both widgets.
+        drive_runs(&mut app, &[0, 4, 8, 2, 6]);
+        let s = render_to_string(&app, 120, 24);
+        assert!(s.contains('■'), "breadcrumb missing:\n{s}");
+        let has_spark = s.chars().any(|c| matches!(c, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'));
+        assert!(has_spark, "sparkline missing:\n{s}");
+    }
+
+    #[test]
+    fn header_breadcrumb_renders_one_square_per_past_verdict() {
+        let mut app = App::new();
+        for st in [Status::Warn, Status::Ok, Status::Fail] {
+            app.handle(Action::Snapshots(vec![LayerSnapshot {
+                name: "logs".into(),
+                status: st,
+                evidence: String::new(),
+                findings: vec![],
+                duration_ms: 0,
+            }]));
+        }
+        let s = render_to_string(&app, 120, 20);
+        let count = s.chars().filter(|c| *c == '■').count();
+        assert!(count >= 3, "expected ≥3 breadcrumb squares, found {count}:\n{s}");
+    }
+
+    #[test]
+    fn header_breadcrumb_absent_before_any_run() {
+        let app = App::new();
+        let s = render_to_string(&app, 120, 20);
+        assert!(
+            !s.contains('■'),
+            "breadcrumb must not paint before any run:\n{s}"
+        );
+    }
+
+    #[test]
+    fn header_breadcrumb_caps_at_breadcrumb_cap() {
+        let mut app = App::new();
+        for _ in 0..(BREADCRUMB_CAP + 5) {
+            app.handle(Action::Snapshots(vec![LayerSnapshot {
+                name: "logs".into(),
+                status: Status::Ok,
+                evidence: String::new(),
+                findings: vec![],
+                duration_ms: 0,
+            }]));
+        }
+        let s = render_to_string(&app, 120, 20);
+        let count = s.chars().filter(|c| *c == '■').count();
+        assert_eq!(count, BREADCRUMB_CAP, "breadcrumb must cap at BREADCRUMB_CAP:\n{s}");
     }
 
     #[test]
