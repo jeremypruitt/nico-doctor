@@ -3,6 +3,11 @@ use nico_common::output::{OutputMode, Status};
 use crate::baseline::Delta;
 use crate::runner::Report;
 
+/// Maximum detail bullets rendered per layer in the default human-mode findings
+/// block. See ADR-0003 (2026-05-07 amendment) and issue #179. `--verbose`
+/// bypasses the cap; `--json` is unaffected.
+pub const FINDINGS_CAP: usize = 5;
+
 pub fn format_report(
     report: &Report,
     mode: &OutputMode,
@@ -65,11 +70,16 @@ pub fn format_report(
                     .collect();
                 if bad.is_empty() { continue; }
                 out.push_str(&format!("{}:\n", layer.name));
-                for check in bad {
+                let total = bad.len();
+                let shown = total.min(FINDINGS_CAP);
+                for check in &bad[..shown] {
                     out.push_str(&format!("  • {} ({})\n", check.value, check.name));
                     if let Some(cmd) = &check.next_command {
                         out.push_str(&format!("    → {}\n", cmd));
                     }
+                }
+                if total > shown {
+                    out.push_str(&format!("  … +{} more · --verbose for full list\n", total - shown));
                 }
             }
         }
@@ -842,6 +852,119 @@ mod tests {
             "Summary: warn  1 warnings, 0 failures\n",
             "Hint: --verbose for details on passing checks, --json for machine output\n",
         ));
+    }
+
+    // ── findings-block cap (issue #179) ───────────────────────────────────────
+
+    fn make_pod_errors(n: usize) -> Vec<Check> {
+        (0..n).map(|i| Check {
+            name: "pod_error",
+            status: Status::Warn,
+            value: format!("pod-{i}: ERROR: boom"),
+            next_command: Some(format!("kubectl logs pod-{i} -n nico")),
+        }).collect()
+    }
+
+    /// Returns the findings-block bullet lines for `layer_name` in `out`.
+    /// A bullet line is `  • ...`; the elision line `  … +M more ...` is also
+    /// included so tests can assert on it.
+    fn findings_bullets(out: &str, layer_name: &str) -> Vec<String> {
+        let header = format!("{layer_name}:");
+        let mut lines = out.lines();
+        // Skip until we hit the layer header.
+        for line in lines.by_ref() {
+            if line == header { break; }
+        }
+        let mut bullets = Vec::new();
+        for line in lines {
+            if line.starts_with("  • ") || line.starts_with("  … ") {
+                bullets.push(line.to_string());
+            } else if line.starts_with("    → ") {
+                continue;
+            } else {
+                break;
+            }
+        }
+        bullets
+    }
+
+    #[test]
+    fn under_cap_default_mode_omits_elision_line() {
+        // 3 detail bullets, cap is 5 → no elision line.
+        let report = Report { layers: vec![layer("logs", make_pod_errors(3))] };
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
+        let bullets = findings_bullets(&out, "logs");
+
+        assert_eq!(bullets.len(), 3, "expected 3 bullets, no elision:\n{out}");
+        assert!(!out.contains("more · --verbose"), "no elision line expected:\n{out}");
+    }
+
+    #[test]
+    fn at_cap_default_mode_omits_elision_line() {
+        // Boundary: exactly N bullets → still no elision.
+        let report = Report { layers: vec![layer("logs", make_pod_errors(FINDINGS_CAP))] };
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
+        let bullets = findings_bullets(&out, "logs");
+
+        assert_eq!(bullets.len(), FINDINGS_CAP, "expected exactly {FINDINGS_CAP} bullets, no elision:\n{out}");
+        assert!(!out.contains("more · --verbose"), "no elision line at the boundary:\n{out}");
+    }
+
+    #[test]
+    fn over_cap_default_mode_emits_elision_line() {
+        let report = Report { layers: vec![layer("logs", make_pod_errors(8))] };
+        let out = format_report(&report, &plain(), false, &no_deltas(), false);
+        let bullets = findings_bullets(&out, "logs");
+
+        assert_eq!(bullets.len(), FINDINGS_CAP + 1,
+            "expected {} bullets + 1 elision line, got {}:\n{out}", FINDINGS_CAP, bullets.len());
+        for (i, bullet) in bullets.iter().take(FINDINGS_CAP).enumerate() {
+            assert!(bullet.contains(&format!("pod-{i}: ERROR: boom")),
+                "bullet {i} mismatch:\n{out}");
+        }
+        assert_eq!(bullets[FINDINGS_CAP], "  … +3 more · --verbose for full list");
+    }
+
+    #[test]
+    fn over_cap_verbose_mode_renders_every_bullet() {
+        // --verbose bypasses the cap: all 8 detail rows must render and no
+        // elision line appears.
+        let report = Report { layers: vec![layer("logs", make_pod_errors(8))] };
+        let out = format_report(&report, &plain(), true, &no_deltas(), false);
+
+        for i in 0..8 {
+            assert!(out.contains(&format!("pod-{i}: ERROR: boom")),
+                "expected pod-{i} in verbose output:\n{out}");
+        }
+        assert!(!out.contains("more · --verbose"), "no elision in verbose mode:\n{out}");
+    }
+
+    #[test]
+    fn over_cap_json_includes_every_check() {
+        // JSON contract: cap does not affect machine output.
+        let report = Report { layers: vec![layer("logs", make_pod_errors(8))] };
+        let json: serde_json::Value = serde_json::from_str(
+            &format_json(&report, "nico", serde_json::json!({"ok": true}), &no_deltas())
+        ).unwrap();
+        let checks = json["layers"][0]["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 8, "JSON must include all 8 checks regardless of cap");
+        for (i, check) in checks.iter().enumerate() {
+            assert_eq!(check["value"], format!("pod-{i}: ERROR: boom"));
+        }
+    }
+
+    #[test]
+    fn json_byte_for_byte_unchanged_under_cap_vs_over_cap() {
+        // Over-cap and under-cap inputs of equal length produce structurally
+        // identical JSON shape (every field present); cap never short-circuits.
+        let over = Report { layers: vec![layer("logs", make_pod_errors(20))] };
+        let json_str = format_json(&over, "nico", serde_json::json!({"ok": true}), &no_deltas());
+        // Re-parse and confirm every check is present.
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(json["layers"][0]["checks"].as_array().unwrap().len(), 20);
+        // No elision marker may leak into JSON.
+        assert!(!json_str.contains("--verbose"), "JSON must never contain elision text");
+        assert!(!json_str.contains("…"), "JSON must never contain ellipsis");
     }
 
     // ── JSON delta field ──────────────────────────────────────────────────────
