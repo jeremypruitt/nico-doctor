@@ -88,12 +88,14 @@ pub async fn run_doctor(args: DoctorArgs) -> i32 {
 
     let bootstrapped = match bootstrap(&args).await {
         Ok(b) => b,
-        Err(BootstrapErr::Preflight { human_message, json_payload, format }) => {
+        Err(BootstrapErr::Preflight { human_message: _, json_payload, format }) => {
             if matches!(format, OutputFormat::Json) {
                 println!("{}", json_payload);
-            } else {
-                eprintln!("{}", human_message);
             }
+            // Non-JSON modes already had the failure card painted on
+            // stderr by the boot-probe orchestrator (see
+            // `BootProbe::finish_failure`); reprinting `human_message`
+            // duplicates the same fields with a less polished layout.
             return 3;
         }
         Err(BootstrapErr::Fatal { message, code }) => {

@@ -17,6 +17,10 @@ use super::state::{ProbeState, Section, StepState};
 pub const THROBBER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 pub const ASCII_THROBBER_FRAMES: &[char] = &['|', '/', '-', '\\'];
 
+/// Visible width of the timing column on each row. Single-duration
+/// strings from `format_dur` are at most 5 chars (e.g. "10.0s").
+const TIMING_COL_WIDTH: usize = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderMode {
     pub color: bool,
@@ -136,13 +140,10 @@ pub fn render_block(state: &ProbeState, mode: RenderMode, frame: usize) -> Strin
             let glyph = glyph_for(st, mode, frame);
             let label = &def.label;
             let timing = match st {
-                StepState::Pending => format_dur(def.budget),
-                StepState::Active { elapsed } => {
-                    format!("{} / {}", format_dur(*elapsed), format_dur(def.budget))
-                }
+                StepState::Pending | StepState::Skipped => "-.-s".to_string(),
+                StepState::Active { elapsed } => format_dur(*elapsed),
                 StepState::Passed { elapsed } => format_dur(*elapsed),
                 StepState::Failed { elapsed, .. } => format_dur(*elapsed),
-                StepState::Skipped => format_dur(def.budget),
             };
 
             // Per-row format from ADR-0013:
@@ -152,7 +153,7 @@ pub fn render_block(state: &ProbeState, mode: RenderMode, frame: usize) -> Strin
             // - Failed: bright label in red
             // - Skipped: dim everything
             let (label_styled, glyph_styled, timing_styled) = if !mode.color {
-                (label.clone(), glyph, timing)
+                (label.clone(), glyph, timing.clone())
             } else {
                 match st {
                     StepState::Pending | StepState::Skipped => (
@@ -178,8 +179,14 @@ pub fn render_block(state: &ProbeState, mode: RenderMode, frame: usize) -> Strin
                 }
             };
 
+            // Pad the timing column to a fixed *visible* width so labels
+            // line up regardless of ANSI escape codes on the styled
+            // strings. `format_dur` outputs at most 5 chars in practice
+            // (e.g. "10.0s"), so 5 is the steady-state column width.
+            let timing_pad = " ".repeat(TIMING_COL_WIDTH.saturating_sub(timing.chars().count()));
+
             out.push_str(&format!(
-                "      {glyph_styled}  {label_styled:<32} {timing_styled}\n",
+                "      {glyph_styled}  {timing_styled}{timing_pad} {label_styled}\n",
             ));
         }
     }
@@ -407,16 +414,21 @@ mod tests {
     }
 
     #[test]
-    fn render_block_pending_row_shows_budget() {
+    fn render_block_pending_row_shows_placeholder_not_budget() {
         let s = three_step_state();
         let out = render_block(&s, RenderMode::plain(), 0);
-        // Pending rows should display the budget so users can sum the
-        // worst-case wait at a glance.
-        assert!(out.contains("5.0s"), "expected budget '5.0s' in:\n{out}");
+        // Pending rows must not parrot the timeout budget — that reads
+        // as a static elapsed counter that never moves. Use a clearly
+        // unstarted placeholder instead.
+        assert!(out.contains("-.-s"), "expected '-.-s' placeholder in:\n{out}");
+        assert!(
+            !out.contains("5.0s"),
+            "pending rows must not display the budget value, got:\n{out}"
+        );
     }
 
     #[test]
-    fn render_block_active_row_shows_elapsed_slash_budget() {
+    fn render_block_active_row_shows_elapsed() {
         let mut s = three_step_state();
         s.set_state(
             StepId::ReachApiServer,
@@ -425,10 +437,88 @@ mod tests {
             },
         );
         let out = render_block(&s, RenderMode::plain(), 0);
+        let line = out
+            .lines()
+            .find(|l| l.contains("reach API server"))
+            .expect("expected reach API server row");
+        assert!(line.contains("0.4s"), "expected elapsed '0.4s' on row, got: {line}");
         assert!(
-            out.contains("0.4s / 5.0s"),
-            "expected 'elapsed / budget' format, got:\n{out}"
+            !line.contains(" / "),
+            "active row should not include budget after switch to single timing column, got: {line}"
         );
+    }
+
+    #[test]
+    fn render_block_label_column_aligns_under_color() {
+        // Labels of different lengths styled with different colors must
+        // still align in the *visible* output (i.e. after stripping
+        // ANSI escape codes). Guards against the prior bug where
+        // `:<32` padded the styled string and let escape-code length
+        // shift visible columns.
+        let mut s = three_step_state();
+        s.set_state(
+            StepId::LoadKubeconfig,
+            StepState::Passed {
+                elapsed: Duration::from_millis(0),
+            },
+        );
+        s.set_state(
+            StepId::ReachApiServer,
+            StepState::Failed {
+                elapsed: Duration::from_secs(5),
+                message: "boom".into(),
+                timed_out: true,
+                next_command: "kubectl cluster-info".into(),
+            },
+        );
+        let mode = RenderMode {
+            color: true,
+            ascii: false,
+        };
+        let out = render_block(&s, mode, 0);
+        let line1 = strip_ansi(
+            out.lines()
+                .find(|l| l.contains("load kubeconfig"))
+                .expect("expected kubeconfig row"),
+        );
+        let line2 = strip_ansi(
+            out.lines()
+                .find(|l| l.contains("reach API server"))
+                .expect("expected reach API server row"),
+        );
+        let pos1 = line1
+            .find("load kubeconfig")
+            .expect("kubeconfig label position");
+        let pos2 = line2
+            .find("reach API server")
+            .expect("reach API server label position");
+        assert_eq!(
+            pos1, pos2,
+            "label columns should be visually aligned despite styling differences\n\
+             line1: {line1}\nline2: {line2}",
+        );
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        // Tiny CSI stripper: drops `ESC [ ... m` sequences.
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'm' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).expect("input was valid utf-8")
     }
 
     #[test]
@@ -489,3 +579,4 @@ mod tests {
         );
     }
 }
+
