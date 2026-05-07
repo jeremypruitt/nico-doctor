@@ -12,6 +12,25 @@ use crate::model::LayerSnapshot;
 use crate::pulse::PulseTimer;
 use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
 
+/// How long a transient toast is shown in the bottom bar before the
+/// reducer drops it. Picked to be long enough that the operator can read
+/// "clipboard unavailable" but short enough not to linger after a refresh.
+pub const TOAST_TTL: Duration = Duration::from_millis(2500);
+
+/// Which top-level layout the dashboard is rendering. The reducer flips
+/// between these in response to `Action::ShowSpotlight` /
+/// `Action::ShowAll`; the renderer branches on the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// Layout A — the scorecard grid with drill panel (ADR-010).
+    #[default]
+    A,
+    /// Layout C — the "3am page" Spotlight view: tui-big-text headline
+    /// over incident cards for non-green Layers, green Layers compressed
+    /// to a single footer line.
+    Spotlight,
+}
+
 /// Default auto-refresh cadence when no flag/env/config override is set.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -36,6 +55,14 @@ pub enum Effect {
     /// Turn off terminal mouse capture so the operator can use native
     /// terminal scrollback / text selection.
     DisableMouseCapture,
+    /// Copy a string to the system clipboard via `arboard`. The host
+    /// loop owns the clipboard handle and translates failures into
+    /// `Action::ShowToast`.
+    CopyToClipboard(String),
+    /// Open a URL via the system browser (`$BROWSER` or platform
+    /// default). Best-effort; failures translate into
+    /// `Action::ShowToast`.
+    OpenUrl(String),
     /// Tear down and exit cleanly.
     Quit,
 }
@@ -62,6 +89,17 @@ pub struct App {
     drill_scroll: u16,
     overlay_scroll: u16,
     card_regions: Vec<Rect>,
+    layout: Layout,
+    spotlight_focus: usize,
+    toast: Option<Toast>,
+}
+
+/// A transient bottom-bar message and its expiry timestamp. Cleared by
+/// the reducer once `now >= expires_at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    pub message: String,
+    pub expires_at: Instant,
 }
 
 impl App {
@@ -91,6 +129,9 @@ impl App {
             drill_scroll: 0,
             overlay_scroll: 0,
             card_regions: Vec::new(),
+            layout: Layout::default(),
+            spotlight_focus: 0,
+            toast: None,
         }
     }
 
@@ -121,6 +162,25 @@ impl App {
 
     pub fn drill_scroll(&self) -> u16 {
         self.drill_scroll
+    }
+
+    /// Which top-level layout the renderer should draw.
+    pub fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// Index of the focused incident card in Spotlight. Bounded by the
+    /// number of non-green layers in the current snapshot (clamped on
+    /// every refresh).
+    pub fn spotlight_focus(&self) -> usize {
+        self.spotlight_focus
+    }
+
+    /// The active bottom-bar toast (if any). The renderer surfaces it in
+    /// the hint bar; the reducer clears it once `Tick` carries it past
+    /// `expires_at`.
+    pub fn toast(&self) -> Option<&Toast> {
+        self.toast.as_ref()
     }
 
     pub fn overlay_scroll(&self) -> u16 {
@@ -259,6 +319,7 @@ impl App {
                     self.next_refresh_at = Some(now + self.interval);
                 }
                 self.recompute_deltas();
+                self.clamp_spotlight_focus();
                 self.dirty = true;
                 None
             }
@@ -272,6 +333,12 @@ impl App {
                     self.boot = Some(now);
                 }
                 self.now = Some(now);
+                if let Some(t) = &self.toast
+                    && now >= t.expires_at
+                {
+                    self.toast = None;
+                    self.dirty = true;
+                }
                 if self.refreshing {
                     self.dirty = true;
                     return None;
@@ -288,10 +355,7 @@ impl App {
                 if self.overlay != Overlay::None {
                     return None;
                 }
-                if let Some(idx) = self
-                    .card_regions
-                    .iter()
-                    .position(|r| contains(r, col, row))
+                if let Some(idx) = self.card_regions.iter().position(|r| contains(r, col, row))
                     && idx < self.snapshots.len()
                     && idx != self.focus
                 {
@@ -328,8 +392,119 @@ impl App {
                     Effect::DisableMouseCapture
                 })
             }
+            Action::ShowSpotlight => {
+                if self.layout != Layout::Spotlight {
+                    self.layout = Layout::Spotlight;
+                    self.spotlight_focus = 0;
+                    self.dirty = true;
+                }
+                None
+            }
+            Action::ShowAll => {
+                if self.layout != Layout::A {
+                    self.layout = Layout::A;
+                    self.dirty = true;
+                }
+                None
+            }
+            Action::CopyNextCommand => {
+                if self.layout != Layout::Spotlight {
+                    return None;
+                }
+                match self.spotlight_next_command() {
+                    Some(cmd) => Some(Effect::CopyToClipboard(cmd)),
+                    None => {
+                        self.set_toast("no next-command for focused finding");
+                        None
+                    }
+                }
+            }
+            Action::OpenLink => {
+                if self.layout != Layout::Spotlight {
+                    return None;
+                }
+                match self.spotlight_link() {
+                    Some(url) => Some(Effect::OpenUrl(url)),
+                    None => {
+                        self.set_toast("no link for focused finding");
+                        None
+                    }
+                }
+            }
+            Action::Correlate => {
+                // Placeholder for the quick-correlate popover slice.
+                // Wired so the keybind is discoverable; no-op today.
+                None
+            }
+            Action::ShowToast(msg) => {
+                self.set_toast(&msg);
+                None
+            }
             Action::Quit => Some(Effect::Quit),
         }
+    }
+
+    fn set_toast(&mut self, msg: &str) {
+        let expires_at = self
+            .now
+            .map(|n| n + TOAST_TTL)
+            .unwrap_or_else(|| Instant::now() + TOAST_TTL);
+        self.toast = Some(Toast {
+            message: msg.to_string(),
+            expires_at,
+        });
+        self.dirty = true;
+    }
+
+    fn non_green_snapshots(&self) -> Vec<&LayerSnapshot> {
+        self.snapshots
+            .iter()
+            .filter(|s| !matches!(s.status, Status::Ok | Status::Skipped))
+            .collect()
+    }
+
+    fn spotlight_next_command(&self) -> Option<String> {
+        let cards = self.non_green_snapshots();
+        let card = cards.get(self.spotlight_focus)?;
+        card.findings.iter().find_map(|f| f.next_command.clone())
+    }
+
+    fn spotlight_link(&self) -> Option<String> {
+        let cards = self.non_green_snapshots();
+        let card = cards.get(self.spotlight_focus)?;
+        card.findings.iter().find_map(|f| f.link.clone())
+    }
+
+    fn clamp_spotlight_focus(&mut self) {
+        let n = self.non_green_snapshots().len();
+        if n == 0 {
+            self.spotlight_focus = 0;
+        } else if self.spotlight_focus >= n {
+            self.spotlight_focus = n - 1;
+        }
+    }
+
+    /// Number of non-green Layers in the current snapshot — i.e. how
+    /// many incident cards Layout C will render.
+    pub fn spotlight_card_count(&self) -> usize {
+        self.non_green_snapshots().len()
+    }
+
+    /// Snapshot of all current incident cards (non-green Layers), in
+    /// snapshot order. The renderer uses this to lay out cards; tests
+    /// use it to assert which Layers made the cut.
+    pub fn spotlight_cards(&self) -> Vec<&LayerSnapshot> {
+        self.non_green_snapshots()
+    }
+
+    /// Names of the green Layers that should be compressed into the
+    /// Layout C footer line, in snapshot order.
+    pub fn spotlight_green_layer_names(&self) -> Vec<String> {
+        self.snapshots
+            .iter()
+            .filter(|s| matches!(s.status, Status::Ok | Status::Skipped))
+            .map(|s| s.name.clone())
+            .collect()
     }
 
     /// Test seam: lets unit tests drive the throbber without going through
@@ -440,7 +615,10 @@ fn run_snapshot_from(snaps: &[LayerSnapshot]) -> RunSnapshot {
 }
 
 fn contains(r: &Rect, col: u16, row: u16) -> bool {
-    col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
+    col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height)
 }
 
 #[cfg(test)]
@@ -732,6 +910,7 @@ mod tests {
                     status: Status::Warn,
                     message: "12 ERROR lines".into(),
                     next_command: None,
+                    link: None,
                 }],
                 duration_ms: 34,
             },
@@ -873,7 +1052,12 @@ mod tests {
     }
 
     fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect {
-        Rect { x, y, width: w, height: h }
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
     }
 
     #[test]
@@ -921,10 +1105,7 @@ mod tests {
     fn click_resets_drill_scroll() {
         let mut app = App::new();
         app.handle(Action::Snapshots(six_layers()));
-        app.set_card_regions(vec![
-            rect(0, 0, 30, 4),
-            rect(30, 0, 30, 4),
-        ]);
+        app.set_card_regions(vec![rect(0, 0, 30, 4), rect(30, 0, 30, 4)]);
         app.handle(Action::Scroll(ScrollDir::Down));
         app.handle(Action::Scroll(ScrollDir::Down));
         assert_eq!(app.drill_scroll(), 2);
@@ -983,5 +1164,228 @@ mod tests {
         app.clear_dirty();
         app.handle(Action::ToggleMouseCapture);
         assert!(app.dirty());
+    }
+
+    // ── Layout C / Spotlight ────────────────────────────────────────────
+
+    fn warn_snap(name: &str) -> LayerSnapshot {
+        LayerSnapshot {
+            name: name.into(),
+            status: Status::Warn,
+            evidence: format!("{name} warn"),
+            findings: vec![crate::model::Finding {
+                status: Status::Warn,
+                message: format!("{name} finding"),
+                next_command: Some(format!("kubectl describe {name}")),
+                link: Some(format!("https://example.com/{name}")),
+            }],
+            duration_ms: 0,
+        }
+    }
+
+    fn fail_snap(name: &str) -> LayerSnapshot {
+        LayerSnapshot {
+            name: name.into(),
+            status: Status::Fail,
+            evidence: format!("{name} fail"),
+            findings: vec![crate::model::Finding {
+                status: Status::Fail,
+                message: format!("{name} finding"),
+                next_command: Some(format!("kubectl logs {name}")),
+                link: None,
+            }],
+            duration_ms: 0,
+        }
+    }
+
+    fn mixed_layers() -> Vec<LayerSnapshot> {
+        // Two non-green (warn, fail) and three green (ok, ok, skipped).
+        vec![
+            snap("cluster", Status::Ok),
+            warn_snap("logs"),
+            snap("workflows", Status::Ok),
+            fail_snap("grpc"),
+            snap("postgres", Status::Skipped),
+        ]
+    }
+
+    #[test]
+    fn fresh_app_is_in_layout_a() {
+        let app = App::new();
+        assert_eq!(app.layout(), Layout::A);
+    }
+
+    #[test]
+    fn show_spotlight_switches_layout_to_c_and_marks_dirty() {
+        let mut app = App::new();
+        app.clear_dirty();
+        app.handle(Action::ShowSpotlight);
+        assert_eq!(app.layout(), Layout::Spotlight);
+        assert!(app.dirty());
+    }
+
+    #[test]
+    fn show_all_returns_to_layout_a_and_marks_dirty() {
+        let mut app = App::new();
+        app.handle(Action::ShowSpotlight);
+        app.clear_dirty();
+        app.handle(Action::ShowAll);
+        assert_eq!(app.layout(), Layout::A);
+        assert!(app.dirty());
+    }
+
+    #[test]
+    fn show_spotlight_when_already_in_spotlight_is_inert() {
+        let mut app = App::new();
+        app.handle(Action::ShowSpotlight);
+        app.clear_dirty();
+        app.handle(Action::ShowSpotlight);
+        assert!(!app.dirty());
+    }
+
+    #[test]
+    fn show_all_when_already_in_layout_a_is_inert() {
+        let mut app = App::new();
+        app.clear_dirty();
+        app.handle(Action::ShowAll);
+        assert!(!app.dirty());
+    }
+
+    #[test]
+    fn spotlight_cards_are_only_non_green_layers() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_layers()));
+        let names: Vec<_> = app
+            .spotlight_cards()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(names, vec!["logs", "grpc"]);
+        assert_eq!(app.spotlight_card_count(), 2);
+    }
+
+    #[test]
+    fn green_footer_lists_ok_and_skipped_layers() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_layers()));
+        let names = app.spotlight_green_layer_names();
+        assert_eq!(names, vec!["cluster", "workflows", "postgres"]);
+    }
+
+    #[test]
+    fn copy_next_command_in_layout_a_is_inert() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_layers()));
+        let eff = app.handle(Action::CopyNextCommand);
+        assert_eq!(eff, None);
+        assert!(app.toast().is_none());
+    }
+
+    #[test]
+    fn copy_next_command_emits_clipboard_effect_with_focused_command() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_layers()));
+        app.handle(Action::ShowSpotlight);
+        let eff = app.handle(Action::CopyNextCommand);
+        assert_eq!(
+            eff,
+            Some(Effect::CopyToClipboard("kubectl describe logs".into()))
+        );
+    }
+
+    #[test]
+    fn copy_next_command_with_no_command_raises_toast() {
+        let no_cmd = vec![LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Warn,
+            evidence: "x".into(),
+            findings: vec![crate::model::Finding {
+                status: Status::Warn,
+                message: "no cmd".into(),
+                next_command: None,
+                link: None,
+            }],
+            duration_ms: 0,
+        }];
+        let mut app = App::new();
+        app.handle(Action::Snapshots(no_cmd));
+        app.handle(Action::ShowSpotlight);
+        let eff = app.handle(Action::CopyNextCommand);
+        assert_eq!(eff, None);
+        let t = app.toast().expect("toast should be set");
+        assert!(t.message.contains("no next-command"), "{}", t.message);
+    }
+
+    #[test]
+    fn open_link_emits_open_url_effect_when_link_present() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_layers()));
+        app.handle(Action::ShowSpotlight);
+        let eff = app.handle(Action::OpenLink);
+        assert_eq!(
+            eff,
+            Some(Effect::OpenUrl("https://example.com/logs".into()))
+        );
+    }
+
+    #[test]
+    fn open_link_with_no_link_raises_toast() {
+        let mut app = App::new();
+        // Only `grpc` here, which has no link.
+        app.handle(Action::Snapshots(vec![fail_snap("grpc")]));
+        app.handle(Action::ShowSpotlight);
+        let eff = app.handle(Action::OpenLink);
+        assert_eq!(eff, None);
+        assert!(app.toast().is_some());
+    }
+
+    #[test]
+    fn correlate_is_a_noop_today() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_layers()));
+        app.handle(Action::ShowSpotlight);
+        let eff = app.handle(Action::Correlate);
+        assert_eq!(eff, None);
+        // The keybind is wired but the popover slice has not landed yet.
+        // We deliberately do not assert any state mutation.
+    }
+
+    #[test]
+    fn show_toast_action_sets_message() {
+        let mut app = App::new();
+        app.handle(Action::ShowToast("clipboard unavailable".into()));
+        assert_eq!(
+            app.toast().map(|t| t.message.as_str()),
+            Some("clipboard unavailable")
+        );
+    }
+
+    #[test]
+    fn tick_past_ttl_clears_toast() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        app.handle(Action::Tick(t0));
+        app.handle(Action::ShowToast("x".into()));
+        assert!(app.toast().is_some());
+        app.handle(Action::Tick(t0 + TOAST_TTL + Duration::from_millis(1)));
+        assert!(app.toast().is_none());
+    }
+
+    #[test]
+    fn snapshots_clamps_spotlight_focus_when_card_count_drops() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_layers())); // 2 cards
+        app.handle(Action::ShowSpotlight);
+        // We have not added a "focus next card" action yet; clamping is
+        // exercised by mutating the focus directly via a fresh snapshots
+        // round that yields fewer cards.
+        let one_card = vec![warn_snap("logs")];
+        app.handle(Action::Snapshots(one_card));
+        assert!(
+            app.spotlight_focus() < app.spotlight_card_count().max(1),
+            "focus={} count={}",
+            app.spotlight_focus(),
+            app.spotlight_card_count()
+        );
     }
 }

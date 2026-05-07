@@ -55,6 +55,24 @@ pub enum Action {
     /// `M` — toggle terminal mouse capture so the operator can reach
     /// native scrollback when they need to.
     ToggleMouseCapture,
+    /// `s` from Layout A — switch to the Spotlight layout (incident-only
+    /// 3am page view; only non-green Layers get full cards).
+    ShowSpotlight,
+    /// `a` (or `s`, or `Esc`) from Layout C — return to Layout A's
+    /// show-all scorecard grid.
+    ShowAll,
+    /// `y` in Spotlight — copy the focused Finding's next-command to the
+    /// system clipboard. Failure (e.g. headless Linux) raises a toast.
+    CopyNextCommand,
+    /// `o` in Spotlight — open the focused Finding's link via the system
+    /// browser. Best-effort; toast on failure (or when no link is set).
+    OpenLink,
+    /// `c` in Spotlight — placeholder for the quick-correlate popover
+    /// slice. Wired so the keybind is discoverable; today this is a no-op.
+    Correlate,
+    /// Show a transient toast in the bottom bar (e.g. "clipboard
+    /// unavailable"). Auto-clears after `TOAST_TTL`.
+    ShowToast(String),
     /// `q` / `Ctrl-C` — exit cleanly.
     Quit,
 }
