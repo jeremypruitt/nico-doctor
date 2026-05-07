@@ -14,6 +14,8 @@ tokio-stream = "0.1"
 futures = "0.3"
 chrono = "0.4"
 humantime = "2"
+arboard = { version = "3", default-features = false }
+tui-big-text = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

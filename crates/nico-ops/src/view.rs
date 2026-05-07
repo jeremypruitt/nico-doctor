@@ -3,17 +3,18 @@ use nico_common::output::Status;
 use nico_common::theme::Theme;
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use tui_big_text::{BigText, PixelSize};
 
 use nico_doctor::baseline::Delta;
 
-use crate::app::App;
+use crate::app::{App, Layout as AppLayout};
 use crate::events::Overlay;
-use crate::model::{Finding, overall_verdict};
+use crate::model::{Finding, LayerSnapshot, overall_verdict};
 use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
 
 /// How many recent verdicts the header breadcrumb shows. The ring buffer
@@ -35,6 +36,11 @@ pub const HELP_LINES: &[&str] = &[
     "Space     pause / resume auto-refresh",
     "↑↓←→/hjkl move focus",
     "Enter     open detail",
+    "s         spotlight (incident-only) view",
+    "a / Esc   show all (return from spotlight)",
+    "y         copy focused next-command (spotlight)",
+    "o         open focused link (spotlight)",
+    "c         correlate (spotlight; reserved)",
     "Esc       close overlay",
     "?         this help",
     "q / ^C    quit",
@@ -46,6 +52,13 @@ pub const HELP_LINES: &[&str] = &[
 /// rectangles back to the reducer for click hit-testing — the regions are
 /// only known here and have to round-trip to the reducer somehow.
 pub fn render(app: &mut App, theme: &Theme, frame: &mut Frame) {
+    match app.layout() {
+        AppLayout::A => render_layout_a(app, theme, frame),
+        AppLayout::Spotlight => render_spotlight(app, theme, frame),
+    }
+}
+
+fn render_layout_a(app: &mut App, theme: &Theme, frame: &mut Frame) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -68,6 +81,181 @@ pub fn render(app: &mut App, theme: &Theme, frame: &mut Frame) {
         Overlay::Help => render_help_overlay(theme, frame, area),
         Overlay::None => {}
     }
+}
+
+fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
+    let area = frame.area();
+    // Layout: big-text headline, vertical incident cards, green footer,
+    // hint bar.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(SPOTLIGHT_HEADER_HEIGHT),
+            Constraint::Min(SPOTLIGHT_CARD_HEIGHT),
+            Constraint::Length(1), // green footer
+            Constraint::Length(1), // hint bar
+        ])
+        .split(area);
+
+    render_spotlight_header(app, theme, frame, chunks[0]);
+    render_spotlight_cards(app, theme, frame, chunks[1]);
+    render_spotlight_green_footer(app, theme, frame, chunks[2]);
+    render_spotlight_hint_bar(app, theme, frame, chunks[3]);
+
+    // Layout C still honors the help overlay (`?`) so the operator can
+    // see all keybinds, including the Spotlight-only ones.
+    if matches!(app.overlay(), Overlay::Help) {
+        render_help_overlay(theme, frame, area);
+    }
+}
+
+/// Approximate row height of the tui-big-text headline at
+/// `PixelSize::Quadrant`. A glyph is 8 pixels tall and Quadrant maps two
+/// pixels to one cell, so the rendered headline is 4 rows; we add 1 row
+/// of padding above/below so it doesn't crowd the cards.
+const SPOTLIGHT_HEADER_HEIGHT: u16 = 5;
+
+/// Per-card row height in Layout C: title + evidence + dim next-cmd +
+/// action row + 2 border rows.
+const SPOTLIGHT_CARD_HEIGHT: u16 = 6;
+
+const SPOTLIGHT_ACTION_LINE: &str = "[y] copy   [o] open   [c] correlate   s/a/Esc: show all";
+
+fn render_spotlight_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let verdict = overall_verdict(app.snapshots());
+    let word = verdict_word(&verdict);
+    let color = theme_color(theme, &verdict);
+    let big = BigText::builder()
+        .pixel_size(PixelSize::Quadrant)
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+        .lines(vec![Line::from(word.to_string())])
+        .build();
+    frame.render_widget(big, area);
+}
+
+fn render_spotlight_cards(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let cards = app.spotlight_cards();
+    if cards.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" no incidents ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let line = Line::from(Span::styled(
+            "All layers are green. Press s / a / Esc to return to the show-all view.",
+            Style::default().fg(theme.muted),
+        ));
+        frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), inner);
+        return;
+    }
+
+    let row_constraints: Vec<Constraint> =
+        std::iter::repeat_n(Constraint::Length(SPOTLIGHT_CARD_HEIGHT), cards.len()).collect();
+    let row_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(row_constraints)
+        .split(area);
+    for (i, card) in cards.iter().enumerate() {
+        if i >= row_areas.len() {
+            break;
+        }
+        render_spotlight_card(app, i, card, theme, frame, row_areas[i]);
+    }
+}
+
+fn render_spotlight_card(
+    app: &App,
+    idx: usize,
+    snap: &LayerSnapshot,
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let focused = idx == app.spotlight_focus();
+    let pip_color = theme_color(theme, &snap.status);
+    let title = if focused {
+        format!(" ▶ {} ", snap.name)
+    } else {
+        format!("   {} ", snap.name)
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::styled(
+                pip_glyph(&snap.status).to_string(),
+                Style::default().fg(pip_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(title),
+        ]));
+    if focused {
+        block = block.border_style(
+            Style::default()
+                .fg(theme.overlay_key)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    let evidence_line = Line::from(Span::raw(snap.evidence.clone()));
+    let next_cmd = snap.findings.iter().find_map(|f| f.next_command.clone());
+    let next_line = match next_cmd {
+        Some(cmd) => Line::from(Span::styled(
+            format!("next: {cmd}"),
+            Style::default().fg(theme.muted),
+        )),
+        None => Line::from(Span::styled(
+            "next: (no command suggested)",
+            Style::default().fg(theme.muted),
+        )),
+    };
+    let action_line = Line::from(Span::styled(
+        SPOTLIGHT_ACTION_LINE.to_string(),
+        Style::default().fg(theme.overlay_key),
+    ));
+    let lines = vec![evidence_line, next_line, action_line];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn render_spotlight_green_footer(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let names = app.spotlight_green_layer_names();
+    if names.is_empty() {
+        return;
+    }
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled("● ", Style::default().fg(theme.ok)));
+        spans.push(Span::styled(name.clone(), Style::default().fg(theme.muted)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_spotlight_hint_bar(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    if let Some(t) = app.toast() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {} ", t.message),
+                Style::default()
+                    .fg(theme.warn)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            ))),
+            area,
+        );
+        return;
+    }
+    let line = Line::from(Span::styled(
+        " spotlight  R:refresh  ?:help  [y] copy  [o] open  [c] correlate  s/a/Esc: show all  q:quit "
+            .to_string(),
+        Style::default().fg(theme.muted),
+    ));
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
@@ -270,10 +458,22 @@ fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 }
 
 fn render_hint_bar(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    if let Some(t) = app.toast() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {} ", t.message),
+                Style::default()
+                    .fg(theme.warn)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            ))),
+            area,
+        );
+        return;
+    }
     let mouse = if app.mouse_capture() { "on" } else { "off" };
     let mut spans: Vec<Span> = vec![Span::styled(
         format!(
-            " R:refresh  Space:pause  hjkl/arrows:focus  Enter:detail  M:mouse({mouse})  ?:help  q:quit "
+            " R:refresh  Space:pause  hjkl/arrows:focus  Enter:detail  s:spotlight  M:mouse({mouse})  ?:help  q:quit "
         ),
         Style::default().fg(theme.muted),
     )];
@@ -485,6 +685,7 @@ mod tests {
                     status: Status::Warn,
                     message: "12 ERROR lines in carbide-controller".into(),
                     next_command: Some("kubectl logs -n nico carbide-controller".into()),
+                    link: None,
                 }],
                 duration_ms: 34,
             },
@@ -849,6 +1050,7 @@ mod tests {
                     status: Status::Warn,
                     message: format!("warn {i}"),
                     next_command: None,
+                    link: None,
                 })
                 .collect();
             let mut snaps = six_layers();
@@ -1073,6 +1275,7 @@ mod tests {
                     status: Status::Warn,
                     message: format!("finding number {i:02}"),
                     next_command: None,
+                    link: None,
                 })
                 .collect(),
             duration_ms: 0,
@@ -1100,6 +1303,7 @@ mod tests {
                     status: Status::Warn,
                     message: format!("overlay finding {i:02}"),
                     next_command: None,
+                    link: None,
                 })
                 .collect(),
             duration_ms: 0,
@@ -1118,4 +1322,230 @@ mod tests {
     }
 
     use crate::action::ScrollDir;
+
+    // ── Layout C / Spotlight ────────────────────────────────────────────
+
+    fn mixed_for_spotlight() -> Vec<LayerSnapshot> {
+        // 2 non-green (warn, fail), 3 green (ok, ok, skipped).
+        vec![
+            LayerSnapshot {
+                name: "cluster".into(),
+                status: Status::Ok,
+                evidence: "3 nodes ready".into(),
+                findings: vec![],
+                duration_ms: 0,
+            },
+            LayerSnapshot {
+                name: "logs".into(),
+                status: Status::Warn,
+                evidence: "12 errors".into(),
+                findings: vec![Finding {
+                    status: Status::Warn,
+                    message: "12 ERROR lines".into(),
+                    next_command: Some("kubectl logs -n nico foo".into()),
+                    link: Some("https://example.com/logs".into()),
+                }],
+                duration_ms: 0,
+            },
+            LayerSnapshot {
+                name: "workflows".into(),
+                status: Status::Ok,
+                evidence: "no stuck wf".into(),
+                findings: vec![],
+                duration_ms: 0,
+            },
+            LayerSnapshot {
+                name: "grpc".into(),
+                status: Status::Fail,
+                evidence: "unreachable".into(),
+                findings: vec![Finding {
+                    status: Status::Fail,
+                    message: "dial tcp: i/o timeout".into(),
+                    next_command: Some("kubectl describe svc -n nico grpc".into()),
+                    link: None,
+                }],
+                duration_ms: 0,
+            },
+            LayerSnapshot {
+                name: "postgres".into(),
+                status: Status::Skipped,
+                evidence: "skipped".into(),
+                findings: vec![],
+                duration_ms: 0,
+            },
+        ]
+    }
+
+    fn enter_spotlight(app: &mut App) {
+        app.handle(Action::ShowSpotlight);
+    }
+
+    #[test]
+    fn spotlight_renders_big_text_headline_for_verdict() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        // tui-big-text doesn't emit literal letters; instead, it paints
+        // box-drawing glyphs derived from the 8x8 font. We assert that
+        // the Spotlight headline area is non-empty (not just blanks) and
+        // styled in the verdict colour.
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&mut app, &DEFAULT, f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut found_painted = false;
+        for y in 0..SPOTLIGHT_HEADER_HEIGHT.min(buf.area.height) {
+            for x in 0..buf.area.width {
+                let cell = buf.cell((x, y)).unwrap();
+                if cell.symbol() != " " && cell.fg == DEFAULT.error {
+                    found_painted = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_painted, "expected painted FAIL headline in red");
+    }
+
+    #[test]
+    fn spotlight_renders_one_card_per_non_green_layer() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        let s = render_to_string(&mut app, 120, 30);
+        // The two non-green Layers must each surface as a card title.
+        assert!(s.contains("logs"), "logs card missing:\n{s}");
+        assert!(s.contains("grpc"), "grpc card missing:\n{s}");
+        // Their evidence + next-command lines must show through.
+        assert!(s.contains("12 errors"), "logs evidence missing:\n{s}");
+        assert!(s.contains("unreachable"), "grpc evidence missing:\n{s}");
+        assert!(
+            s.contains("next: kubectl logs"),
+            "logs next-cmd missing:\n{s}"
+        );
+        assert!(
+            s.contains("[y] copy"),
+            "spotlight action keybinds missing:\n{s}"
+        );
+        assert!(
+            s.contains("[o] open"),
+            "spotlight action keybinds missing:\n{s}"
+        );
+        assert!(
+            s.contains("[c] correlate"),
+            "spotlight action keybinds missing:\n{s}"
+        );
+    }
+
+    #[test]
+    fn spotlight_compresses_green_layers_to_footer_line() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        let s = render_to_string(&mut app, 120, 30);
+        for name in ["cluster", "workflows", "postgres"] {
+            assert!(
+                s.contains(name),
+                "green layer {name} should be in footer:\n{s}"
+            );
+        }
+        // The green-strip pip glyph is `●`.
+        assert!(s.contains("●"), "green pip missing in footer:\n{s}");
+    }
+
+    #[test]
+    fn spotlight_does_not_render_layout_a_grid() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        let s = render_to_string(&mut app, 120, 30);
+        // Layout A's "nico ops" header title must not appear in
+        // Spotlight.
+        assert!(
+            !s.contains("nico ops"),
+            "Layout A header leaked into Spotlight:\n{s}"
+        );
+        // Layout A's drill panel title must not appear either.
+        assert!(
+            !s.contains("findings —"),
+            "Layout A drill leaked into Spotlight:\n{s}"
+        );
+    }
+
+    #[test]
+    fn spotlight_with_no_incidents_renders_friendly_empty_state() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(vec![LayerSnapshot {
+            name: "cluster".into(),
+            status: Status::Ok,
+            evidence: "ok".into(),
+            findings: vec![],
+            duration_ms: 0,
+        }]));
+        enter_spotlight(&mut app);
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(
+            s.contains("no incidents") || s.contains("All layers are green"),
+            "expected empty-state hint:\n{s}"
+        );
+    }
+
+    #[test]
+    fn spotlight_toast_renders_in_hint_bar() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        app.handle(Action::ShowToast("clipboard unavailable".into()));
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(
+            s.contains("clipboard unavailable"),
+            "toast missing in render:\n{s}"
+        );
+    }
+
+    #[test]
+    fn layout_a_hint_bar_advertises_spotlight_keybind() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        let s = render_to_string(&mut app, 120, 24);
+        assert!(s.contains("s:spotlight"), "spotlight hint missing:\n{s}");
+    }
+
+    #[test]
+    fn help_overlay_lists_spotlight_keybinds() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        app.handle(Action::OpenHelp);
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(
+            s.contains("spotlight"),
+            "help should mention spotlight:\n{s}"
+        );
+        assert!(
+            s.contains("show all"),
+            "help should mention show-all return:\n{s}"
+        );
+    }
+
+    #[test]
+    fn spotlight_help_overlay_renders_on_top_of_layout_c() {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(mixed_for_spotlight()));
+        enter_spotlight(&mut app);
+        app.handle(Action::OpenHelp);
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(
+            s.contains("keybinds"),
+            "help overlay missing in spotlight:\n{s}"
+        );
+    }
+
+    #[test]
+    fn render_in_spotlight_does_not_panic_at_narrow_widths() {
+        for (w, h) in [(40u16, 24u16), (60, 24), (90, 24), (120, 30)] {
+            let mut app = App::new();
+            app.handle(Action::Snapshots(mixed_for_spotlight()));
+            enter_spotlight(&mut app);
+            let _ = render_to_string(&mut app, w, h);
+        }
+    }
 }

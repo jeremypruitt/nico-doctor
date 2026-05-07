@@ -6,6 +6,11 @@ pub struct Finding {
     pub status: Status,
     pub message: String,
     pub next_command: Option<String>,
+    /// Optional deep-link a Layer can attach so the Spotlight `[o]` action
+    /// has a sensible URL to hand to the system browser (e.g. a Grafana
+    /// dashboard or Temporal Web UI workflow page). `None` means the
+    /// `[o]` action raises a toast instead.
+    pub link: Option<String>,
 }
 
 /// What a single Layer scorecard shows: its aggregate status, a one-line
