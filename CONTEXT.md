@@ -33,8 +33,8 @@ every output line points at where to dig deeper.
   HostProvisioning).
 - **Activity** — atomic step inside a workflow, retried independently.
 - **Site Agent** — the in-cluster worker that executes activities.
-- **Layer** (nico-doctor specific) — one of the six categories the doctor
-  checks: cluster, logs, workflows, health, grpc, postgres. Layers run
+- **Layer** (nico-doctor specific) — one of the seven categories the doctor
+  checks: cluster, logs, workflows, health, grpc, postgres, dpu. Layers run
   concurrently, are independently skippable, produce Findings, and contribute
   to exit codes 0/1/2.
 - **LayerResult** (nico-doctor specific) — what a Layer produces: a name, an
@@ -85,6 +85,7 @@ every output line points at where to dig deeper.
   _Avoid_: data source, backend, plugin
 - **Stuck** — a Workflow that has been in Running status longer than `stuck_threshold` (default 30m, configurable globally in `[temporal]`). A Stuck workflow produces a Finding in the `workflows` Layer.
   _Avoid_: hung, frozen, stalled
+- **`dpu` layer** (nico-doctor specific) — fleet-wide DPU/HBN roll-up. Five parallel sub-checks (each its own headline Check; layer aggregate = worst-of) reading one bulk `DpuNetworkStatus` + forgedb-config query: `drift-managed-host`, `drift-instance` (per-axis because the two version axes have different normal-churn profiles — fabric topology vs tenant churn), `cert-fleet`, `quarantine` (always Warn, never Fail — quarantine is sometimes deliberate), `lost-connection` (Fail on > 30m absolute OR > 5% of fleet). Drift detail lines link to `nico doctor hbn <id>` (#205) for per-DPU drill-down. Thresholds configurable in `[dpu]` config block. Encodes the muscle-memory tell from `docs/learning/topics/01-hbn.md`: most weird stuck states are version-drift, not network failure — so the default ladder asks "are any DPUs drifting?" before deeper diagnosis.
 - **Event** — a normalized, timestamped, Source-attributed occurrence in a Correlation's Timeline. Raw inputs (Temporal workflow events, k8s Warning events) are mapped into Events by their Source. Use "Temporal event" or "k8s event" when referring to the raw form.
   _Avoid_: entry, record, log line
 - **Timeline** — the chronologically sorted sequence of Events in a Correlation, normalized across all Sources. The default human output format for `nico-correlate`.
@@ -121,6 +122,7 @@ Read-only. No remediation. Output is human-readable by default and JSON under
 4. Are services healthy?       → `health` layer
 5. Is gRPC reachable?          → `grpc` layer
 6. Is Postgres pressured?      → `postgres` layer
+7. Are DPUs drifting/healthy?  → `dpu` layer
 
 ## Key design choices made:
 - RunOpts holds config only (namespace, since, timeout) — no clients. Each layer holds its own Arc<dyn K8sClient>. Keeps
