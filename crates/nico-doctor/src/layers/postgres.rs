@@ -188,6 +188,7 @@ mod tests {
             namespace: "nico".into(),
             since: Duration::from_secs(600),
             timeout: Duration::from_secs(5),
+            ..Default::default()
         }
     }
 

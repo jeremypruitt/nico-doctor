@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 
-use crate::log_source::{LogCollection, LogSource};
+use crate::log_source::{LogCollection, LogSource, PodLogsCache};
 
 pub struct LokiLine {
     pub pod: String,
@@ -126,6 +126,7 @@ impl LogSource for LokiLogSource {
         namespace: &str,
         since: Duration,
         limit: usize,
+        _prefetched: &PodLogsCache,
     ) -> Result<LogCollection> {
         match self.client.query_errors(namespace, since, limit).await? {
             LokiQueryResult::Lines(lines) => Ok(LogCollection {

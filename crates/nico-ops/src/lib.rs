@@ -163,6 +163,7 @@ async fn run_event_loop<C: Clock>(
         temporal_namespace,
         k8s_client,
         log_source,
+        log_collector,
         _pf_guards,
         ..
     } = bootstrapped;
@@ -188,9 +189,10 @@ async fn run_event_loop<C: Clock>(
             namespace: opts.namespace.clone(),
             since: opts.since,
         },
+        log_collector,
     };
 
-    spawn_refresh(layers.clone(), opts.clone(), tx.clone());
+    spawn_refresh(layers.clone(), opts.clone(), refresh_ctx.log_collector.clone(), tx.clone());
     spawn_activity_refresh(&refresh_ctx.activity, tx.clone());
     spawn_logs_refresh(&refresh_ctx.logs, tx.clone());
     let _ = app.handle(Action::Refresh);
@@ -254,10 +256,12 @@ pub fn resolve_interval(
 /// All non-layer fan-out dependencies the host loop spawns alongside a
 /// `StartRefresh`. One `R` press kicks off layer collection (via
 /// `spawn_refresh`) plus the Activity feed and the snapshot logs panel
-/// in lockstep.
+/// in lockstep. `log_collector` runs once per refresh before layers fan
+/// out (issue #201).
 struct RefreshCtx {
     activity: ActivityCtx,
     logs: LogsCtx,
+    log_collector: Option<Arc<nico_doctor::log_collector::LogCollectorStage>>,
 }
 
 struct ActivityCtx {
@@ -285,7 +289,12 @@ fn dispatch(
     match app.handle(action) {
         Some(Effect::Quit) => true,
         Some(Effect::StartRefresh) => {
-            spawn_refresh(layers.clone(), opts.clone(), tx.clone());
+            spawn_refresh(
+                layers.clone(),
+                opts.clone(),
+                refresh.log_collector.clone(),
+                tx.clone(),
+            );
             spawn_activity_refresh(&refresh.activity, tx.clone());
             spawn_logs_refresh(&refresh.logs, tx.clone());
             false
@@ -453,10 +462,11 @@ fn open_url(url: &str) -> Result<(), String> {
 fn spawn_refresh(
     layers: Arc<Vec<Box<dyn nico_doctor::layer::Layer>>>,
     opts: nico_doctor::layer::RunOpts,
+    log_collector: Option<Arc<nico_doctor::log_collector::LogCollectorStage>>,
     tx: mpsc::Sender<Action>,
 ) {
     tokio::spawn(async move {
-        let snapshots: Vec<LayerSnapshot> = data::collect(layers, opts).await;
+        let snapshots: Vec<LayerSnapshot> = data::collect(layers, opts, log_collector).await;
         let _ = tx.send(Action::Snapshots(snapshots)).await;
     });
 }
@@ -493,7 +503,15 @@ fn spawn_logs_refresh(ctx: &LogsCtx, tx: mpsc::Sender<Action>) {
     let namespace = ctx.namespace.clone();
     let since = ctx.since;
     tokio::spawn(async move {
-        let lines = match source.collect(&namespace, since, LOG_PANEL_FETCH_LIMIT).await {
+        // The snapshot panel runs outside the doctor refresh path, so
+        // there is no shared `LogCollectorStage` cache to read from.
+        // Pass an empty map and let `K8sLogSource` fall back to
+        // a direct `pod_logs` fetch.
+        let prefetched = std::collections::HashMap::new();
+        let lines = match source
+            .collect(&namespace, since, LOG_PANEL_FETCH_LIMIT, &prefetched)
+            .await
+        {
             Ok(c) => log_lines_from_entries(c.entries),
             Err(_) => Vec::new(),
         };

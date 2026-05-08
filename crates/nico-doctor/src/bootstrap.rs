@@ -13,6 +13,7 @@ use nico_common::reach::ReachManager;
 use crate::cli::DoctorArgs;
 use crate::layer::{self, Layer, RunOpts};
 use crate::layers;
+use crate::log_collector::LogCollectorStage;
 use crate::log_source;
 use crate::loki;
 use crate::http;
@@ -76,6 +77,12 @@ pub struct Bootstrapped {
     /// by `nico-ops` for the snapshot logs panel (issue #158). `None` when
     /// neither Loki nor a k8s client is reachable.
     pub log_source: Option<Arc<dyn log_source::LogSource>>,
+    /// Per-refresh log collector: runs once before each `runner::run`
+    /// fan-out and populates the shared `pod_logs` cache that
+    /// `ClusterLayer` and `K8sLogSource` consume (issue #201). `None`
+    /// when no kubeconfig is reachable — layers fall back to direct
+    /// fetches per their own contracts.
+    pub log_collector: Option<Arc<LogCollectorStage>>,
     /// Kept alive until the caller is done running layers; dropping closes port-forwards.
     pub _pf_guards: Vec<nico_common::reach::ForwardedEndpoint>,
 }
@@ -281,6 +288,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         namespace: config.cluster.namespace.clone(),
         since,
         timeout,
+        ..Default::default()
     };
 
     let probe_outcome = run_boot_probe(
@@ -391,6 +399,9 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
     };
 
     let log_source = build_log_source(&inputs);
+    let log_collector = bootstrap_k8s
+        .clone()
+        .map(|k8s| Arc::new(LogCollectorStage::new(k8s)));
     let layers = prepare_layers(&inputs);
 
     Ok(Bootstrapped {
@@ -406,6 +417,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         temporal_namespace: config.temporal.namespace.clone(),
         k8s_client: bootstrap_k8s,
         log_source,
+        log_collector,
         _pf_guards: pf_guards,
     })
 }

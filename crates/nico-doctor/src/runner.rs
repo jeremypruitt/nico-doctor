@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use nico_common::output::Status;
 use crate::layer::{Layer, LayerResult, RunOpts};
+use crate::log_collector::LogCollectorStage;
 
 pub struct Report {
     pub layers: Vec<LayerResult>,
@@ -44,6 +46,37 @@ pub async fn run(layers: &[Box<dyn Layer>], opts: &RunOpts) -> Report {
     Report { layers: results }
 }
 
+/// Refresh entrypoint: runs the [`LogCollectorStage`] (if any) once,
+/// populates `opts.pod_logs` with its result, and then calls [`run`].
+/// This is the only path that satisfies the "at most one `pod_logs` call
+/// per pod per refresh" guarantee from issue #201; callers that bypass it
+/// (e.g. fixed-fixture tests) get an empty cache and the per-pod detail
+/// checks degrade gracefully.
+pub async fn run_with_log_collector(
+    layers: &[Box<dyn Layer>],
+    opts: &RunOpts,
+    collector: Option<&LogCollectorStage>,
+) -> Report {
+    let opts = with_collected_logs(opts, collector).await;
+    run(layers, &opts).await
+}
+
+pub(crate) async fn with_collected_logs(
+    opts: &RunOpts,
+    collector: Option<&LogCollectorStage>,
+) -> RunOpts {
+    match collector {
+        Some(c) => {
+            let cache = c.collect(&opts.namespace, opts.since).await;
+            RunOpts {
+                pod_logs: Arc::new(cache),
+                ..opts.clone()
+            }
+        }
+        None => opts.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,7 +113,12 @@ mod tests {
     }
 
     fn opts() -> RunOpts {
-        RunOpts { namespace: "nico".into(), since: Duration::from_secs(600), timeout: Duration::from_secs(5) }
+        RunOpts {
+            namespace: "nico".into(),
+            since: Duration::from_secs(600),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        }
     }
 
     struct SlowLayer { name: &'static str, delay: Duration }
@@ -110,6 +148,7 @@ mod tests {
             namespace: "nico".into(),
             since: Duration::from_secs(600),
             timeout: Duration::from_millis(10),
+            ..Default::default()
         };
         let report = run(&layers, &tight_opts).await;
         assert_eq!(report.layer("slow").unwrap().status, Status::Unknown);
@@ -123,5 +162,62 @@ mod tests {
         assert_eq!(report.summary_status(), Status::Ok);
         assert_eq!(report.layer("cluster").unwrap().status, Status::Ok);
         assert_eq!(report.layer("logs").unwrap().status, Status::Ok);
+    }
+
+    /// Layer that snapshots `opts.pod_logs` so tests can verify the
+    /// runner populated the per-refresh cache before fanning out.
+    type CacheSnapshot = std::sync::Mutex<Option<std::collections::HashMap<String, Vec<String>>>>;
+    struct CacheCapture {
+        seen: Arc<CacheSnapshot>,
+    }
+
+    #[async_trait]
+    impl Layer for CacheCapture {
+        fn name(&self) -> &'static str {
+            "capture"
+        }
+        async fn collect(&self, opts: &RunOpts) -> LayerOutcome {
+            *self.seen.lock().unwrap() = Some((*opts.pod_logs).clone());
+            LayerOutcome::Checks(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn run_with_log_collector_populates_pod_logs_before_layers_run() {
+        use nico_common::k8s::testing::MockK8sClient;
+        use nico_common::k8s::RawPod;
+
+        let k8s = Arc::new(
+            MockK8sClient::new()
+                .with_pods(vec![RawPod {
+                    name: "p1".into(),
+                    namespace: "nico".into(),
+                    phase: None,
+                    ready: true,
+                    restart_count: 0,
+                    succeeded: false,
+                    crash_loop: false,
+                }])
+                .with_logs(vec!["ERROR boom".into()]),
+        );
+        let collector = LogCollectorStage::new(k8s);
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let layers: Vec<Box<dyn Layer>> = vec![Box::new(CacheCapture { seen: seen.clone() })];
+
+        let _ = run_with_log_collector(&layers, &opts(), Some(&collector)).await;
+
+        let captured = seen.lock().unwrap().clone().expect("layer ran");
+        assert_eq!(captured.get("p1").unwrap(), &vec!["ERROR boom".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn run_with_log_collector_with_none_runs_layers_with_empty_cache() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let layers: Vec<Box<dyn Layer>> = vec![Box::new(CacheCapture { seen: seen.clone() })];
+
+        let _ = run_with_log_collector(&layers, &opts(), None).await;
+
+        let captured = seen.lock().unwrap().clone().expect("layer ran");
+        assert!(captured.is_empty());
     }
 }

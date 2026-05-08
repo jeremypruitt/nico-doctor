@@ -46,14 +46,12 @@ impl Layer for ClusterLayer {
             .unwrap_or_default();
         let warning_events = filter_warning_events(&raw_events, SystemTime::now(), opts.since);
         let pods: Vec<&RawPod> = all_pods.iter().filter(|p| !p.succeeded).collect();
-        let top_restarting = top_k_restarting(&pods, POD_LOG_TAIL_TOP_K);
-        let pod_logs = fetch_pod_logs(&*self.k8s, &opts.namespace, &top_restarting, opts.since).await;
         LayerOutcome::Checks(checks_from(
             &pods,
             &warning_events,
             &opts.namespace,
             opts.since,
-            &pod_logs,
+            &opts.pod_logs,
         ))
     }
 }
@@ -64,23 +62,6 @@ fn top_k_restarting<'a>(pods: &[&'a RawPod], k: usize) -> Vec<&'a RawPod> {
     restarting.sort_by_key(|p| std::cmp::Reverse(p.restart_count));
     restarting.truncate(k);
     restarting
-}
-
-async fn fetch_pod_logs(
-    k8s: &dyn K8sClient,
-    namespace: &str,
-    pods: &[&RawPod],
-    since: Duration,
-) -> HashMap<String, Vec<String>> {
-    let mut out = HashMap::new();
-    for p in pods {
-        let lines = k8s
-            .pod_logs(namespace, &p.name, since)
-            .await
-            .unwrap_or_default();
-        out.insert(p.name.clone(), lines);
-    }
-    out
 }
 
 fn since_flag(since: Duration) -> String {
@@ -365,6 +346,16 @@ mod tests {
             namespace: "nico".into(),
             since: Duration::from_secs(600),
             timeout: Duration::from_secs(5),
+            ..Default::default()
+        }
+    }
+
+    fn opts_with_pod_logs(logs: HashMap<String, Vec<String>>) -> RunOpts {
+        RunOpts {
+            namespace: "nico".into(),
+            since: Duration::from_secs(600),
+            timeout: Duration::from_secs(5),
+            pod_logs: Arc::new(logs),
         }
     }
 
@@ -730,14 +721,17 @@ mod tests {
     #[tokio::test]
     async fn single_restarting_pod_with_error_log_emits_one_pod_log_tail_detail_check() {
         let client = Arc::new(
-            MockK8sClient::new()
-                .with_pods(vec![pod("core-abc", true, 3, false)])
-                .with_logs(vec![
-                    "INFO startup ok".into(),
-                    "ERROR connection refused".into(),
-                ]),
+            MockK8sClient::new().with_pods(vec![pod("core-abc", true, 3, false)]),
         );
-        let result = ClusterLayer::new(client).run(&opts()).await;
+        let mut logs = HashMap::new();
+        logs.insert(
+            "core-abc".to_string(),
+            vec![
+                "INFO startup ok".to_string(),
+                "ERROR connection refused".to_string(),
+            ],
+        );
+        let result = ClusterLayer::new(client).run(&opts_with_pod_logs(logs)).await;
 
         let tails: Vec<_> = result
             .checks
@@ -807,18 +801,18 @@ mod tests {
 
     #[tokio::test]
     async fn pod_log_tail_bounded_to_top_k_most_restarted_pods() {
-        let client = Arc::new(
-            MockK8sClient::new()
-                .with_pods(vec![
-                    pod("p1", true, 1, false),
-                    pod("p2", true, 7, false),
-                    pod("p3", true, 5, false),
-                    pod("p4", true, 9, false),
-                    pod("p5", true, 3, false),
-                ])
-                .with_logs(vec!["ERROR boom".into()]),
-        );
-        let result = ClusterLayer::new(client).run(&opts()).await;
+        let client = Arc::new(MockK8sClient::new().with_pods(vec![
+            pod("p1", true, 1, false),
+            pod("p2", true, 7, false),
+            pod("p3", true, 5, false),
+            pod("p4", true, 9, false),
+            pod("p5", true, 3, false),
+        ]));
+        let mut logs = HashMap::new();
+        for name in ["p1", "p2", "p3", "p4", "p5"] {
+            logs.insert(name.to_string(), vec!["ERROR boom".to_string()]);
+        }
+        let result = ClusterLayer::new(client).run(&opts_with_pod_logs(logs)).await;
 
         let tails: Vec<_> = result
             .checks
@@ -841,11 +835,11 @@ mod tests {
     #[tokio::test]
     async fn cluster_with_no_restarting_pods_emits_no_pod_log_tail_checks() {
         let client = Arc::new(
-            MockK8sClient::new()
-                .with_pods(vec![pod("core-abc", true, 0, false)])
-                .with_logs(vec!["ERROR boom".into()]),
+            MockK8sClient::new().with_pods(vec![pod("core-abc", true, 0, false)]),
         );
-        let result = ClusterLayer::new(client).run(&opts()).await;
+        let mut logs = HashMap::new();
+        logs.insert("core-abc".to_string(), vec!["ERROR boom".to_string()]);
+        let result = ClusterLayer::new(client).run(&opts_with_pod_logs(logs)).await;
         assert_eq!(result.checks.iter().filter(|c| c.name == "pod_log_tail").count(), 0);
     }
 

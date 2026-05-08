@@ -109,7 +109,12 @@ mod tests {
     }
 
     fn opts() -> RunOpts {
-        RunOpts { namespace: "nico".into(), since: Duration::from_secs(600), timeout: Duration::from_secs(5) }
+        RunOpts {
+            namespace: "nico".into(),
+            since: Duration::from_secs(600),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        }
     }
 
     #[tokio::test]

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use nico_common::output::Status;
@@ -7,6 +9,25 @@ pub struct RunOpts {
     pub namespace: String,
     pub since: Duration,
     pub timeout: Duration,
+    /// Per-refresh pod log cache populated by
+    /// [`crate::log_collector::LogCollectorStage`] *before* `runner::run`
+    /// fans out the layers. `ClusterLayer` (`pod_log_tail`) and
+    /// `K8sLogSource` both read from this map instead of issuing their
+    /// own `pod_logs` calls; this caps log fetches at one per pod per
+    /// refresh. Empty for callers who skip the stage (e.g. test fixtures
+    /// using `RunOpts::default()` and the snapshot logs panel).
+    pub pod_logs: Arc<HashMap<String, Vec<String>>>,
+}
+
+impl Default for RunOpts {
+    fn default() -> Self {
+        Self {
+            namespace: String::new(),
+            since: Duration::from_secs(600),
+            timeout: Duration::from_secs(5),
+            pod_logs: Arc::new(HashMap::new()),
+        }
+    }
 }
 
 /// A `Check` is either a **headline** (summarizes the layer at a glance,
@@ -184,6 +205,7 @@ mod tests {
             namespace: "nico".into(),
             since: Duration::from_secs(60),
             timeout: Duration::from_secs(5),
+            ..Default::default()
         }
     }
 

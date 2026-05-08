@@ -22,7 +22,11 @@ impl Layer for LogsLayer {
 
     async fn collect(&self, opts: &RunOpts) -> LayerOutcome {
         let (pod_errors, source_label, source_ok) =
-            match self.source.collect(&opts.namespace, opts.since, LOG_LINE_LIMIT).await {
+            match self
+                .source
+                .collect(&opts.namespace, opts.since, LOG_LINE_LIMIT, &opts.pod_logs)
+                .await
+            {
                 Ok(c) => (c.entries, c.label, c.primary_ok),
                 Err(_) => (Vec::new(), "unavailable".to_string(), false),
             };
@@ -93,10 +97,15 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use crate::layer::aggregate_status;
-    use crate::log_source::{LogCollection, LogSource};
+    use crate::log_source::{LogCollection, LogSource, PodLogsCache};
 
     fn opts() -> RunOpts {
-        RunOpts { namespace: "nico".into(), since: Duration::from_secs(600), timeout: Duration::from_secs(5) }
+        RunOpts {
+            namespace: "nico".into(),
+            since: Duration::from_secs(600),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        }
     }
 
     struct FakeLogSource {
@@ -119,7 +128,13 @@ mod tests {
     impl LogSource for FakeLogSource {
         fn name(&self) -> &str { &self.label }
 
-        async fn collect(&self, _: &str, _: Duration, _: usize) -> Result<LogCollection> {
+        async fn collect(
+            &self,
+            _: &str,
+            _: Duration,
+            _: usize,
+            _: &PodLogsCache,
+        ) -> Result<LogCollection> {
             Ok(LogCollection {
                 label: self.label.clone(),
                 primary_ok: self.primary_ok,
