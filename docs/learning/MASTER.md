@@ -4,6 +4,67 @@
 
 -----
 
+## Daily rhythm (start here every day)
+
+Three kinds of day. Pick whichever fits the time you have and your energy.
+
+### Topic day (1–4 days of work; one topic at a time)
+1. Start a fresh Claude Code session in this repo.
+2. Paste the prompt from the **Workflow** section below, filling in the topic ID (e.g. `01-hbn`).
+3. Work the topic until its file is `draft complete`. Claude updates the manifest table and status log when done.
+
+### Kata day (30–60 min; can do daily, with or without Claude)
+1. Open `docs/learning/kata/INDEX.md`. Pick a row whose status is `seeded`.
+2. Run it. Solo against devspace/lab, or paste the kata seed (see below) into any active Claude session.
+3. **End every kata with two writes**, even if you did it solo:
+   - Notes go in `docs/learning/kata/kNN-<slug>.md` (created on first run).
+   - Flip the INDEX.md status from `seeded` to `run`.
+   This is the *only* way progress is tracked — if you skip the index update, no future session (yours or Claude's) will know the kata happened.
+
+### Resume day (coming back after a gap)
+Read in this order:
+1. Bottom of this doc — **Status log**, append-only, latest entry last.
+2. **Manifest table** below — the Status column shows which topics are `in progress` / `draft complete`.
+3. The in-flight topic file's "Status & next" section at the bottom — that's the per-topic continuation point.
+4. `kata/INDEX.md` — kata `seeded` but not `run` are the easiest things to pick up.
+5. `cli-features.md` — only if you're picking up `nico` CLI work today.
+
+-----
+
+## What "kata seed" means
+
+When this doc says "paste the kata seed into Claude," it means: the one-line entry from `kata/INDEX.md` plus the proposing topic file. Example for k08:
+
+```
+Run k08 with me. Seed: "grpcurl GetManagedHostNetworkConfig and identify every field"
+(from docs/learning/kata/INDEX.md and docs/learning/topics/01-hbn.md §4 in this repo,
+which is at /Volumes/MacMiniDock/dev/rust/crates/nico-doctor2 — sibling repos
+infra-controller-core and infra-controller-rest are at the same parent path).
+
+I have devspace running locally. Help me work out the procedure as we go.
+Write notes to docs/learning/kata/k08-grpcurl-dpu-config.md, capturing every
+non-obvious step. When done, flip the INDEX.md row from seeded to run, and
+add a status-log line in MASTER.md.
+```
+
+Once a kata file exists from a prior run, the seed is just: "Re-run k08, the file's at `kata/k08-grpcurl-dpu-config.md`." Subsequent runs are usually faster and may not need Claude at all.
+
+-----
+
+## How progress gets tracked
+
+Three artifacts, in priority order:
+
+| Artifact | What it records | Source of truth for |
+|---|---|---|
+| `MASTER.md` manifest table + status log | Per-topic status; dated work-session log | "Where am I across the whole plan?" |
+| `kata/INDEX.md` | Per-kata status (`seeded` → `run` → `repeatable`) | "Which exercises have I actually done?" |
+| `topics/NN-slug.md` "Status & next" | Per-topic continuation point | "What do I do next on this specific topic?" |
+
+**Claude doesn't observe your work directly.** If you do a kata solo at the terminal and never write it down, neither you nor any future Claude session will know. The discipline is: every learning action ends with a doc update. That's the only way the system stays honest.
+
+-----
+
 ## What this doc is
 
 This is the orchestrator for a focused, time-boxed effort to become IREN’s in-house expert on NICo networking, anchored on a 100x GB300 install 4–6 weeks out.
@@ -20,7 +81,7 @@ It is a syllabus, a manifest, and a workflow guide in one file. It does **not** 
 
 **Starting a topic.** Open Claude Code in this repo and say:
 
-> Read `docs/learning/MASTER.md`, then start topic `01-hbn`. Use the prompt template in the Workflow section. The NICo repos are at `../ncx-infra-controller-core` and `../ncx-infra-controller-rest` (clone them as siblings if not present).
+> Read `docs/learning/MASTER.md`, then start topic `01-hbn`. Use the prompt template in the Workflow section. The NICo repos are at `../infra-controller-core` and `../infra-controller-rest` (clone them as siblings if not present).
 
 Claude Code reads the master, reads the topic’s scope from the manifest, clones/reads the NICo repos, and produces `docs/learning/topics/01-hbn.md` plus any kata, diagrams, or CLI feature stubs.
 
@@ -47,9 +108,9 @@ Topic for this conversation: [NN-slug, e.g. 01-hbn]
 Topic file (create if absent): docs/learning/topics/[NN-slug].md
 
 Sources of truth:
-- ../ncx-infra-controller-core (NVIDIA/ncx-infra-controller-core, Rust + gRPC)
-- ../ncx-infra-controller-rest (NVIDIA/ncx-infra-controller-rest, REST/Go)
-- NICo book: ncx-infra-controller-core/book/src/
+- ../infra-controller-core (NVIDIA/infra-controller-core, Rust + gRPC)
+- ../infra-controller-rest (NVIDIA/infra-controller-rest, REST/Go)
+- NICo docs: infra-controller-core/docs/ (architecture/, glossary.md, components.md, dpu-operations.md, playbooks/, provisioning/, release-notes.md)
 - NVIDIA NCP Software Reference Guide (web, when needed)
 
 My background: 17 years at Juniper in roles other than network engineering;
@@ -84,7 +145,7 @@ Order matters for the first six rows. After that, parallelize as I please.
 
 |# |Topic                                                          |Status     |Prereqs     |Est. time|Why this slot                                                                           |
 |--|---------------------------------------------------------------|-----------|------------|---------|----------------------------------------------------------------------------------------|
-|01|HBN (Host-Based Networking) on BlueField                       |not started|—           |1–2 days |Conceptual center of NICo. Everything else is downstream.                               |
+|01|HBN (Host-Based Networking) on BlueField                       |draft complete|—        |1–2 days |Conceptual center of NICo. Everything else is downstream.                               |
 |02|NICo control plane shape                                       |not started|01          |0.5 day  |Map of the components so every later topic knows where it lives.                        |
 |03|Bare-metal lifecycle end-to-end                                |not started|01, 02      |1 day    |The spine of every NICo design conversation.                                            |
 |04|DPU lifecycle & zero-trust model                               |not started|01, 02      |1 day    |Deepens 03 around the DPU specifically.                                                 |
@@ -256,4 +317,6 @@ Defined here so every topic file can assume them.
 
 Append-only. One line per work session.
 
-- `[YYYY-MM-DD]` Master doc created. Next: stand up devspace and start topic 01-hbn.
+- `[2026-05-07]` Master doc created. Next: stand up devspace and start topic 01-hbn.
+- `[2026-05-07]` Topic 01-hbn drafted from infra-controller-core (`crates/agent/src/hbn.rs`, proto, dpu_configuration.md) and infra-controller-rest (`site-workflow`). Status → draft complete. Three kata seeded (k08–k10) for devspace; one stretch (k11) for lab. Five CLI candidates queued for `cli-features.md`. Seven open questions. Note: MASTER refers to NICo repos as `ncx-infra-controller-*` but on disk they're `infra-controller-*`; book/src is empty in this checkout.
+- `[2026-05-07]` MASTER.md restructured: added "Daily rhythm" + "What kata seed means" + "How progress gets tracked" sections at the top so the daily-facing workflow is immediately visible. Repo paths corrected from `ncx-infra-controller-*` to `infra-controller-*`. NICo doc path corrected from `book/src/` to `docs/`.
