@@ -146,7 +146,12 @@ mod tests {
     }
 
     fn opts() -> RunOpts {
-        RunOpts { namespace: "nico".into(), since: Duration::from_secs(600), timeout: Duration::from_secs(5) }
+        RunOpts {
+            namespace: "nico".into(),
+            since: Duration::from_secs(600),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        }
     }
 
     fn client(overrides: Vec<(&str, std::result::Result<u16, &str>)>, default_status: u16) -> Arc<MockHttpClient> {

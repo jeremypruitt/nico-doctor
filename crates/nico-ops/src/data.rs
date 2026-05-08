@@ -1,20 +1,28 @@
 use std::sync::Arc;
 
 use nico_doctor::layer::{Layer, LayerResult, RunOpts};
+use nico_doctor::log_collector::LogCollectorStage;
 use tokio::sync::mpsc;
 
 use crate::model::{Finding, LayerSnapshot};
 
 /// Run all layers concurrently and return the resulting snapshots in
-/// `LAYER_ORDER` (whatever order `prepare_layers` produced).
-pub async fn collect(layers: Arc<Vec<Box<dyn Layer>>>, opts: RunOpts) -> Vec<LayerSnapshot> {
+/// `LAYER_ORDER` (whatever order `prepare_layers` produced). When
+/// `collector` is `Some`, the per-refresh `pod_logs` cache is populated
+/// once before the fan-out (issue #201).
+pub async fn collect(
+    layers: Arc<Vec<Box<dyn Layer>>>,
+    opts: RunOpts,
+    collector: Option<Arc<LogCollectorStage>>,
+) -> Vec<LayerSnapshot> {
     let names: Vec<&'static str> = layers.iter().map(|l| l.name()).collect();
     let (tx, mut rx) = mpsc::channel::<LayerResult>(layers.len().max(1));
 
     let layers_for_stream = layers.clone();
     let task_opts = opts.clone();
+    let task_collector = collector.clone();
     let task = tokio::spawn(async move {
-        nico_doctor::run_streaming(layers_for_stream, task_opts, tx).await;
+        nico_doctor::run_streaming(layers_for_stream, task_opts, task_collector, tx).await;
     });
 
     let mut by_name = std::collections::HashMap::<&'static str, LayerResult>::new();

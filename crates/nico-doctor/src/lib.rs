@@ -12,6 +12,7 @@ pub mod grpc;
 pub mod http;
 pub mod layer;
 pub mod layers;
+pub mod log_collector;
 pub mod log_source;
 pub mod loki;
 pub mod postgres;
@@ -22,22 +23,40 @@ pub use bootstrap::{bootstrap, prepare_layers, Bootstrapped, BootstrapErr, Layer
 pub use cli::DoctorArgs;
 pub use runner::Report;
 
-/// Run all layers once, returning a [`Report`].
+/// Run all layers once, returning a [`Report`]. Equivalent to
+/// [`run_once_with_log_collector`] with no collector.
 pub async fn run_once(layers: &[Box<dyn layer::Layer>], opts: &layer::RunOpts) -> Report {
     runner::run(layers, opts).await
+}
+
+/// Run the per-refresh [`log_collector::LogCollectorStage`] (when one is
+/// available) to populate `opts.pod_logs`, then run all layers and return
+/// a [`Report`]. The shared cache is what gives us "at most one
+/// `pod_logs` call per pod per refresh" (issue #201).
+pub async fn run_once_with_log_collector(
+    layers: &[Box<dyn layer::Layer>],
+    opts: &layer::RunOpts,
+    collector: Option<&log_collector::LogCollectorStage>,
+) -> Report {
+    runner::run_with_log_collector(layers, opts, collector).await
 }
 
 /// Run all layers and stream each [`layer::LayerResult`] as it completes.
 ///
 /// Layers run concurrently with the same per-layer timeout policy as
 /// [`run_once`]. When a layer times out, an `Unknown` result is sent.
-/// The channel is closed when all layers have reported.
+/// The channel is closed when all layers have reported. If `collector`
+/// is `Some`, it is run once before the fan-out and its result is
+/// installed into `opts.pod_logs` for every layer to read.
 pub async fn run_streaming(
     layers: Arc<Vec<Box<dyn layer::Layer>>>,
     opts: layer::RunOpts,
+    collector: Option<Arc<log_collector::LogCollectorStage>>,
     tx: tokio::sync::mpsc::Sender<layer::LayerResult>,
 ) {
     use futures::stream::{FuturesUnordered, StreamExt};
+
+    let opts = runner::with_collected_logs(&opts, collector.as_deref()).await;
 
     let mut in_flight: FuturesUnordered<_> = (0..layers.len())
         .map(|idx| {
@@ -106,7 +125,12 @@ pub async fn run_doctor(args: DoctorArgs) -> i32 {
 
     let baseline_prior = baseline::load();
 
-    let report = run_once(&bootstrapped.layers, &bootstrapped.opts).await;
+    let report = run_once_with_log_collector(
+        &bootstrapped.layers,
+        &bootstrapped.opts,
+        bootstrapped.log_collector.as_deref(),
+    )
+    .await;
 
     drop(bootstrapped._pf_guards);
 
