@@ -32,6 +32,7 @@ Claude Code reads the master, reads the topic’s scope from the manifest, clone
 
 **Updating the manifest.** When a topic moves status, edit the table below and commit. Master doc is the source of truth for “what’s done.”
 
+
 -----
 
 ## Workflow: prompt template for starting a topic
