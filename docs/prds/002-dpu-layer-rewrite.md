@@ -1,6 +1,10 @@
-# DPU Layer Rewrite — Schema Realignment + New Axes
+# PRD-002 — DPU layer rewrite: schema realignment + new axes
 
-Status: Proposed (2026-05-09).
+- **Status:** Specced (2026-05-09); awaiting `/to-issues` breakdown.
+- **Epic:** #253 (carries `prd-002` label; tracks slice progress).
+- **Touches:** `CONTEXT.md` (`dpu` layer entry; new layer entries for `dpu_health`, `dpu_services`, `infiniband`).
+- **Pre-existing bugs this fixes:** #213, #147.
+- **Upstream dep:** #237.
 
 PRD covering the rewrite of nico-doctor's per-DPU drill-down layers
 against the actual core schema, plus three new axes (`dpu_health`,
