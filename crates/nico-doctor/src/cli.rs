@@ -97,6 +97,16 @@ pub enum DoctorCommand {
     /// `expiring-soon`, `healthy`, or `no-recent-status`. Default
     /// warning threshold is 30 days.
     DpuCert(DpuCertArgs),
+
+    /// Single-DPU agent-health drill-down (issue #262).
+    ///
+    /// Surfaces non-BGP / non-config-error alerts from the producer-side
+    /// `machines.dpu_agent_health_report` JSON, agent-version drift
+    /// using `agent_version_superseded_at`, and per-interface DHCP
+    /// staleness from `machine_interfaces.last_dhcp`. BGP-typed alerts
+    /// stay in `nico doctor hbn`; the `network_config_error` headline
+    /// is also owned by `hbn`.
+    DpuHealth(DpuHealthArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -128,4 +138,15 @@ pub struct DpuCertArgs {
     /// Accepts any humantime duration, e.g. `7d`, `336h`, `60m`.
     #[arg(long, value_name = "DURATION")]
     pub warn: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DpuHealthArgs {
+    /// DPU machine ID to inspect.
+    pub dpu_id: String,
+
+    /// Override the per-interface DHCP staleness threshold (default 4h).
+    /// Accepts any humantime duration, e.g. `30m`, `4h`, `24h`.
+    #[arg(long, value_name = "DURATION")]
+    pub dhcp_stale: Option<String>,
 }
