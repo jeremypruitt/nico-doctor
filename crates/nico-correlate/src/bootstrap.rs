@@ -234,7 +234,15 @@ pub async fn prepare_sources(
         correlate_steps(&cfg.config),
         cfg.config.cluster.reach_mode.as_str(),
         cfg.reach_source,
-    );
+    )
+    .with_deployment_type(
+        cfg.config
+            .cluster
+            .deployment_type
+            .map(|d| d.label().to_string()),
+        cfg.config.cluster.deployment_type_source.label(),
+    )
+    .with_warnings(cfg.config.override_conflict_warnings());
     let mut probe = BootProbe::new(probe_state, probe_mode, Box::new(StderrSink));
     probe.start_ticking();
     let tracker = probe.tracker();

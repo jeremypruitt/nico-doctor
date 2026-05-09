@@ -120,6 +120,18 @@ pub fn render_block(state: &ProbeState, mode: RenderMode, frame: usize) -> Strin
     }
     out.push('\n');
 
+    // Override-conflict warnings (PRD-001 slice 5). One line per key
+    // immediately under the header, before the first section.
+    for warning in &state.warnings {
+        let line = format!("  {warning}");
+        if mode.color {
+            out.push_str(&line.bright_yellow().to_string());
+        } else {
+            out.push_str(&line);
+        }
+        out.push('\n');
+    }
+
     // Sections, in fixed topological order. We only render sections
     // that actually have steps assigned to them.
     for section in [Section::Connecting, Section::Validating, Section::Serving] {
@@ -249,9 +261,9 @@ pub fn rendered_line_count(state: &ProbeState) -> usize {
             sections_present += 1;
         }
     }
-    // header + (blank + section-label + N rows) per section + blank + bar
+    // header + warnings + (blank + section-label + N rows) per section + blank + bar
     let rows: usize = state.steps.len();
-    1 + sections_present * 2 + rows + 2
+    1 + state.warnings.len() + sections_present * 2 + rows + 2
 }
 
 #[cfg(test)]
@@ -397,6 +409,42 @@ mod tests {
         assert!(
             out.contains("type: force (force)"),
             "expected `type: force (force)` for force mode, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_block_renders_warnings_between_header_and_first_section() {
+        let s = three_step_state().with_warnings(vec![
+            "⚠  cluster.namespace=forge-system overrides deployment-type rest-only-mock default (nico-rest)".into(),
+        ]);
+        let out = render_block(&s, RenderMode::plain(), 0);
+        let header_pos = out.find("booting nico").expect("header missing");
+        let warning_pos = out
+            .find("cluster.namespace=forge-system")
+            .expect("warning missing");
+        let connecting_pos = out.find("connecting").expect("connecting label missing");
+        assert!(header_pos < warning_pos, "warning must be after header");
+        assert!(
+            warning_pos < connecting_pos,
+            "warning must be before first section"
+        );
+    }
+
+    #[test]
+    fn render_block_omits_warnings_section_when_none_present() {
+        let s = three_step_state();
+        let out = render_block(&s, RenderMode::plain(), 0);
+        // No "⚠" character anywhere when there are no warnings.
+        assert!(!out.contains('⚠'), "unexpected warn glyph in:\n{out}");
+    }
+
+    #[test]
+    fn rendered_line_count_grows_with_warnings() {
+        let base = three_step_state();
+        let with_warnings = three_step_state().with_warnings(vec!["a".into(), "b".into()]);
+        assert_eq!(
+            rendered_line_count(&with_warnings),
+            rendered_line_count(&base) + 2
         );
     }
 

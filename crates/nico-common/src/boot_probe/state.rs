@@ -124,6 +124,11 @@ pub struct ProbeState {
     /// + `deployment_type_source = "flag"` reads `type: full (flag)`.
     pub deployment_type: Option<String>,
     pub deployment_type_source: String,
+    /// Override-conflict warnings rendered between the banner header
+    /// and the first section (PRD-001 §"Capability vocabulary >
+    /// Override-conflict warning rule"). One pre-formatted line per
+    /// contradicting key.
+    pub warnings: Vec<String>,
     /// Total wall time elapsed since the probe started — used by the
     /// success receipt and the failure card.
     pub total_elapsed: Duration,
@@ -141,6 +146,7 @@ impl ProbeState {
             reach_source: reach_source.into(),
             deployment_type: None,
             deployment_type_source: "auto".into(),
+            warnings: Vec::new(),
             total_elapsed: Duration::ZERO,
         }
     }
@@ -155,6 +161,14 @@ impl ProbeState {
     ) -> Self {
         self.deployment_type = deployment_type;
         self.deployment_type_source = source.into();
+        self
+    }
+
+    /// Builder-style chain to attach override-conflict warning lines
+    /// (PRD-001 slice 5). Renderer paints them between the banner
+    /// header and the first section.
+    pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
         self
     }
 

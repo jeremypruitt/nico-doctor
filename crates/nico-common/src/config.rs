@@ -431,22 +431,43 @@ impl Config {
         let bootstrap_file = file.bootstrap.unwrap_or_default();
         let dpu_file = file.dpu.unwrap_or_default();
 
-        // Env var layer — overrides file values
+        // Deployment-type resolves first — its default-methods feed the
+        // five capability-bundle keys below as a layer between
+        // hardcoded fallbacks and file (PRD-001 §"Config precedence").
+        // `Force` returns `None` from every default-method, so it
+        // transparently falls through to the existing hardcoded values.
+        let (deployment_type, deployment_type_source) = resolve_deployment_type(
+            overrides.deployment_type_spec.as_deref(),
+            env.get("NICO_DEPLOYMENT_TYPE").map(String::as_str),
+            cluster.deployment_type.as_deref(),
+        )?;
+        let dt_namespace = deployment_type.and_then(|dt| dt.default_cluster_namespace());
+        let dt_grpc = deployment_type.and_then(|dt| dt.default_grpc_address());
+        let dt_postgres_ns = deployment_type.and_then(|dt| dt.default_postgres_namespace());
+        let dt_temporal_addr = deployment_type.and_then(|dt| dt.default_temporal_address());
+        let dt_temporal_ns = deployment_type.and_then(|dt| dt.default_temporal_namespace());
+
+        // Env var layer — overrides file, which overrides deployment-type
+        // defaults (when present), which overrides hardcoded fallbacks.
         let context = env.get("NICO_CONTEXT").cloned().or(cluster.context);
         let namespace = env.get("NICO_NAMESPACE").cloned()
             .or(cluster.namespace)
+            .or(dt_namespace.map(String::from))
             .unwrap_or_else(|| "nico".into());
         let postgres_namespace = env.get("NICO_POSTGRES_NAMESPACE").cloned()
             .or(cluster.postgres_namespace)
+            .or(dt_postgres_ns.map(String::from))
             .unwrap_or_else(|| "postgres".into());
         let postgres_url = env.get("NICO_POSTGRES_URL").cloned()
             .or(postgres.url)
             .unwrap_or_else(|| "postgres://nico:nico@localhost:5432/nico".into());
         let temporal_address = env.get("NICO_TEMPORAL_ADDRESS").cloned()
             .or(temporal.address)
+            .or(dt_temporal_addr.map(String::from))
             .unwrap_or_else(|| "localhost:7233".into());
         let temporal_namespace = env.get("NICO_TEMPORAL_NAMESPACE").cloned()
             .or(temporal.namespace)
+            .or(dt_temporal_ns.map(String::from))
             .unwrap_or_else(|| "default".into());
 
         let stuck_threshold_str = env.get("NICO_STUCK_THRESHOLD").cloned()
@@ -486,17 +507,9 @@ impl Config {
             None => ReachMode::auto_detect(env),
         };
 
-        let grpc_address = env.get("NICO_GRPC_ADDRESS").cloned().or(cluster.grpc_address);
-
-        // Deployment-type: CLI spec > env > file. `auto` (or absent) →
-        // (None, Auto). `force` → (Some(Force), Force) regardless of
-        // origin. Other resolved values → source = Flag (CLI) or
-        // Config (env/file).
-        let (deployment_type, deployment_type_source) = resolve_deployment_type(
-            overrides.deployment_type_spec.as_deref(),
-            env.get("NICO_DEPLOYMENT_TYPE").map(String::as_str),
-            cluster.deployment_type.as_deref(),
-        )?;
+        let grpc_address = env.get("NICO_GRPC_ADDRESS").cloned()
+            .or(cluster.grpc_address)
+            .or(dt_grpc.map(String::from));
 
         // Bootstrap timeouts — defaults < file < env < CLI override spec.
         let mut timeouts = BootstrapTimeouts::default();
@@ -611,6 +624,83 @@ impl Config {
             dpu,
         })
     }
+}
+
+impl Config {
+    /// Per PRD-001 §"Capability vocabulary > Override-conflict warning rule":
+    /// for each of the five capability-bundle keys, if the resolved value
+    /// differs from the active deployment-type's default for that key,
+    /// emit one stderr line. `Force` returns `None` from every default,
+    /// so it silences all warnings. `auto` (no resolved type yet) also
+    /// produces no warnings — there's nothing to compare against.
+    pub fn override_conflict_warnings(&self) -> Vec<String> {
+        let Some(dt) = self.cluster.deployment_type else {
+            return Vec::new();
+        };
+        let mut warnings = Vec::new();
+        let dt_label = dt.label();
+
+        // Order is stable (matches the PRD's key list) so callers and
+        // tests get deterministic output.
+        if let Some(default) = dt.default_cluster_namespace()
+            && self.cluster.namespace != default
+        {
+            warnings.push(format_override_warning(
+                "cluster.namespace",
+                &self.cluster.namespace,
+                dt_label,
+                default,
+            ));
+        }
+        if let Some(default) = dt.default_grpc_address()
+            && let Some(resolved) = self.cluster.grpc_address.as_deref()
+            && resolved != default
+        {
+            warnings.push(format_override_warning(
+                "cluster.grpc_address",
+                resolved,
+                dt_label,
+                default,
+            ));
+        }
+        if let Some(default) = dt.default_postgres_namespace()
+            && self.cluster.postgres_namespace != default
+        {
+            warnings.push(format_override_warning(
+                "cluster.postgres_namespace",
+                &self.cluster.postgres_namespace,
+                dt_label,
+                default,
+            ));
+        }
+        if let Some(default) = dt.default_temporal_address()
+            && self.temporal.address != default
+        {
+            warnings.push(format_override_warning(
+                "temporal.address",
+                &self.temporal.address,
+                dt_label,
+                default,
+            ));
+        }
+        if let Some(default) = dt.default_temporal_namespace()
+            && self.temporal.namespace != default
+        {
+            warnings.push(format_override_warning(
+                "temporal.namespace",
+                &self.temporal.namespace,
+                dt_label,
+                default,
+            ));
+        }
+        warnings
+    }
+}
+
+fn format_override_warning(key: &str, resolved: &str, type_label: &str, default: &str) -> String {
+    format!(
+        "⚠  {key}={resolved} overrides deployment-type {type_label} default ({default})"
+    )
 }
 
 /// Resolve `(deployment_type, source)` from the precedence chain
@@ -1160,5 +1250,213 @@ deployment_type = "core-only"
     fn deployment_type_invalid_in_file_errors() {
         let toml = "[cluster]\ndeployment_type = \"weird\"";
         assert!(Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).is_err());
+    }
+
+    // PRD-001 slice 5: capability bundle wiring.
+    //
+    // Precedence chain for the five default-keys becomes
+    //   hardcoded < deployment-type < file < env < CLI
+    // and when the resolved value contradicts the deployment-type's
+    // default, the config builder records a one-line warning per
+    // contradicting key. `Force` returns `None` from every default so
+    // it both opts out of the new layer and silences all warnings.
+
+    #[test]
+    fn deployment_type_default_layer_supplies_cluster_namespace_when_unset_elsewhere() {
+        // rest-only-mock from --deployment-type, no file/env/CLI overrides
+        // → cluster.namespace resolves to the deployment-type default.
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("rest-only-mock".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        assert_eq!(cfg.cluster.namespace, "nico-rest");
+        assert!(cfg.override_conflict_warnings().is_empty());
+    }
+
+    #[test]
+    fn deployment_type_default_supplies_grpc_address_when_unset_elsewhere() {
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("full".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        assert_eq!(
+            cfg.cluster.grpc_address.as_deref(),
+            Some("carbide-api.forge-system:1079")
+        );
+        assert!(cfg.override_conflict_warnings().is_empty());
+    }
+
+    #[test]
+    fn override_conflict_warning_emits_when_file_namespace_contradicts_deployment_type() {
+        // PRD contradiction matrix: rest-only-mock + file pin to forge-system → warn.
+        let toml = "[cluster]\nnamespace = \"forge-system\"";
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("rest-only-mock".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides).unwrap();
+        assert_eq!(cfg.cluster.namespace, "forge-system");
+        let warnings = cfg.override_conflict_warnings();
+        assert_eq!(warnings.len(), 1, "expected one warning, got: {warnings:?}");
+        assert!(
+            warnings[0].contains("cluster.namespace=forge-system"),
+            "warning missing key=value: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("rest-only-mock"),
+            "warning missing type label: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("nico-rest"),
+            "warning missing deployment-type default: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn override_conflict_warning_emits_for_weird_value() {
+        // Weird-but-valid override: user passed a totally unrelated namespace.
+        let mut env = HashMap::new();
+        env.insert("NICO_NAMESPACE".to_string(), "weird-ns".to_string());
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("full".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(None, &env, &overrides).unwrap();
+        assert_eq!(cfg.cluster.namespace, "weird-ns");
+        let warnings = cfg.override_conflict_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("cluster.namespace=weird-ns"));
+        assert!(warnings[0].contains("full"));
+        assert!(warnings[0].contains("forge-system"));
+    }
+
+    #[test]
+    fn override_conflict_warning_no_warn_when_value_matches_deployment_type_default() {
+        // file pins to the deployment-type's own default → silent.
+        let toml = "[cluster]\nnamespace = \"forge-system\"";
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("full".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides).unwrap();
+        assert_eq!(cfg.cluster.namespace, "forge-system");
+        assert!(cfg.override_conflict_warnings().is_empty());
+    }
+
+    #[test]
+    fn override_conflict_warnings_silenced_under_force() {
+        // Even if the user overrides every key, force is the no-enforcement
+        // escape hatch — no warnings.
+        let toml = r#"
+[cluster]
+namespace = "weird-ns"
+grpc_address = "weird:9999"
+"#;
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("force".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides).unwrap();
+        assert!(cfg.override_conflict_warnings().is_empty());
+    }
+
+    #[test]
+    fn override_conflict_warnings_silenced_under_auto() {
+        // No deployment-type resolved yet (auto, pre-detection) → nothing
+        // to compare against, so no warnings.
+        let toml = "[cluster]\nnamespace = \"weird-ns\"";
+        let cfg = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        assert!(cfg.override_conflict_warnings().is_empty());
+    }
+
+    #[test]
+    fn override_conflict_warning_grpc_address_contradiction() {
+        // Pin gRPC address via env, deployment-type=rest-only-mock.
+        let mut env = HashMap::new();
+        env.insert(
+            "NICO_GRPC_ADDRESS".to_string(),
+            "carbide-api.forge-system:1079".to_string(),
+        );
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("rest-only-mock".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(None, &env, &overrides).unwrap();
+        let warnings = cfg.override_conflict_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("cluster.grpc_address=carbide-api.forge-system:1079"));
+        assert!(warnings[0].contains("rest-only-mock"));
+        assert!(warnings[0].contains("nico-rest-mock-core.nico-rest:11079"));
+    }
+
+    #[test]
+    fn override_conflict_warning_multiple_keys_each_emit() {
+        // Two contradictions → two warning lines, in stable key order.
+        let toml = r#"
+[cluster]
+namespace = "weird-ns"
+grpc_address = "weird:9999"
+"#;
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("full".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides).unwrap();
+        let warnings = cfg.override_conflict_warnings();
+        assert_eq!(warnings.len(), 2, "got: {warnings:?}");
+    }
+
+    #[test]
+    fn override_conflict_warning_format_matches_prd_spec() {
+        // PRD format: `⚠  <key>=<resolved> overrides deployment-type <name> default (<default>)`
+        let toml = "[cluster]\nnamespace = \"forge-system\"";
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("rest-only-mock".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(toml), &HashMap::new(), &overrides).unwrap();
+        let warnings = cfg.override_conflict_warnings();
+        assert_eq!(
+            warnings[0],
+            "⚠  cluster.namespace=forge-system overrides deployment-type \
+             rest-only-mock default (nico-rest)"
+        );
+    }
+
+    #[test]
+    fn cli_namespace_override_layered_above_deployment_type_default() {
+        // Precedence: CLI > deployment-type default. Resolved value comes
+        // from CLI; if it contradicts, warning fires.
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("rest-only-mock".into()),
+            namespace: Some("forge-system".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        assert_eq!(cfg.cluster.namespace, "forge-system");
+        let warnings = cfg.override_conflict_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("cluster.namespace=forge-system"));
+    }
+
+    #[test]
+    fn deployment_type_default_only_applies_when_no_higher_layer_set() {
+        // Hardcoded default for namespace is "nico". Without a
+        // deployment-type, that's the resolved value.
+        let cfg = Config::load(None, &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        assert_eq!(cfg.cluster.namespace, "nico");
+        // With deployment-type=full, the deployment-type default replaces
+        // the hardcoded fallback (no file/env/CLI in play).
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("full".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        assert_eq!(cfg.cluster.namespace, "forge-system");
     }
 }
