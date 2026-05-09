@@ -10,7 +10,7 @@ use nico_common::config::{
     Config, ConfigOverrides, ColorMode, DeploymentType, OutputFormat, ReachMode,
 };
 use nico_common::deployment_detect::{
-    namespace_inventory_probe, workload_probe, ClusterShapeProbe, KubeClusterShapeProbe,
+    run_detection_ladder, ClusterShapeProbe, KubeClusterShapeProbe,
 };
 use nico_common::output::OutputMode;
 use nico_common::reach::ReachManager;
@@ -641,14 +641,10 @@ async fn run_validating_section(
 /// - `Some(_)` (resolved from CLI / env / file, including `Force`) →
 ///   pass instantly; detection is skipped per PRD-001's hybrid trust
 ///   model.
-/// - `None` (auto) + a shape probe is wired → run the signal ladder in
-///   order, first match wins:
-///     1. workload probe (slice 2) — known Services
-///     2. namespace inventory (slice 3) — `forge-system` / `nico-rest`
-///        presence
-///
-///   Slice 4 will append CRD inventory. Pass on any match; fail with a
-///   combined diagnostic when every signal is inconclusive.
+/// - `None` (auto) + a shape probe is wired → run the full detection
+///   ladder (workload → namespace → CRD). Pass on first match; fail
+///   on no-match with a diagnostic listing observed namespaces,
+///   services, and CRDs.
 /// - `None` + no shape probe → preserve the slice-1 fallback so
 ///   non-cluster code paths (tests, degraded boot) still surface a
 ///   clear "no detection signals" error.
@@ -667,28 +663,24 @@ async fn detect_deployment_type_step(
             "no detection signals available; pass --deployment-type=<full|core-only|rest-only-mock> or =force"
         ));
     };
-
-    // Signal 1: workload probe. Hold the outcome for the no-match
-    // diagnostic regardless of whether later signals fire.
-    let outcome = workload_probe(probe).await?;
+    let outcome = run_detection_ladder(probe).await?;
     if outcome.matched.is_some() {
         return Ok(());
     }
-
-    // Signal 2: namespace inventory fallback.
-    if namespace_inventory_probe(probe).await?.is_some() {
-        return Ok(());
-    }
-
-    let observed = if outcome.observed_services.is_empty() {
-        "<none>".to_string()
-    } else {
-        outcome.observed_services.join(", ")
+    let fmt_list = |xs: &[String]| -> String {
+        if xs.is_empty() {
+            "<none>".to_string()
+        } else {
+            xs.join(", ")
+        }
     };
     Err(anyhow::anyhow!(
-        "workload probe and namespace inventory matched no known \
-         deployment-type (observed services: {observed}); \
-         pass --deployment-type=<full|core-only|rest-only-mock> or =force"
+        "no deployment-type signal matched \
+         (observed namespaces: {ns}; observed services: {svc}; observed CRDs: {crd}); \
+         pass --deployment-type=<full|core-only|rest-only-mock> or =force",
+        ns = fmt_list(&outcome.observed_namespaces),
+        svc = fmt_list(&outcome.observed_services),
+        crd = fmt_list(&outcome.observed_crds),
     ))
 }
 
@@ -1019,37 +1011,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_step_fails_with_combined_diagnostic_when_all_signals_miss() {
+    async fn detect_step_passes_when_crd_inventory_matches() {
         use nico_common::deployment_detect::testing::MockClusterShapeProbe;
-        // No known services AND neither `forge-system` nor `nico-rest`
-        // namespaces present — both signals miss; the step fails with
-        // the combined diagnostic mentioning both signals tried.
-        let probe = MockClusterShapeProbe::new().with_namespace("kube-system");
+        // No services, no `forge-system`/`nico-rest` namespaces, but
+        // CRD inventory definitively says "rest deployed".
+        let probe = MockClusterShapeProbe::new().with_crd("sites.nico.nvidia.io");
+        let res = detect_deployment_type_step(None, Some(&probe)).await;
+        assert!(res.is_ok(), "expected pass via CRD rung; got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn detect_step_fails_with_all_three_observation_lists_when_no_rung_matches() {
+        use nico_common::deployment_detect::testing::MockClusterShapeProbe;
+        // No known services, neither `forge-system` nor `nico-rest`
+        // namespaces, no indicator CRDs — every rung misses. Diagnostic
+        // must list all three observation slots so the operator can see
+        // exactly what was probed.
+        let probe = MockClusterShapeProbe::new()
+            .with_namespace("kube-system")
+            .with_namespace("default")
+            .with_crd("certificates.cert-manager.io");
         let err = detect_deployment_type_step(None, Some(&probe))
             .await
             .expect_err("auto + all-signals-miss must fail");
         let msg = format!("{err}");
         assert!(
-            msg.contains("workload probe and namespace inventory"),
-            "expected combined ladder diagnostic; got: {msg}"
+            msg.contains("no deployment-type signal matched"),
+            "expected ladder no-match diagnostic; got: {msg}"
+        );
+        assert!(
+            msg.contains("observed namespaces:") && msg.contains("kube-system"),
+            "expected observed namespaces list incl. kube-system; got: {msg}"
+        );
+        assert!(
+            msg.contains("observed services: <none>"),
+            "expected observed services list <none>; got: {msg}"
+        );
+        assert!(
+            msg.contains("observed CRDs: <none>"),
+            "expected observed CRDs <none> (cert-manager is not an indicator); got: {msg}"
         );
         assert!(
             msg.contains("--deployment-type"),
             "expected recovery hint mentioning --deployment-type; got: {msg}"
         );
+        assert!(
+            msg.contains("force"),
+            "expected recovery hint mentioning force; got: {msg}"
+        );
     }
 
     #[tokio::test]
-    async fn detect_step_fails_with_none_observed_when_cluster_empty() {
+    async fn detect_step_renders_none_markers_when_cluster_is_empty() {
         use nico_common::deployment_detect::testing::MockClusterShapeProbe;
         let probe = MockClusterShapeProbe::new();
         let err = detect_deployment_type_step(None, Some(&probe))
             .await
             .expect_err("auto + empty cluster must fail");
         let msg = format!("{err}");
-        assert!(
-            msg.contains("<none>"),
-            "expected 'observed services: <none>' marker when nothing seen; got: {msg}"
-        );
+        // All three observation lists rendered as `<none>` when empty.
+        for slot in [
+            "observed namespaces: <none>",
+            "observed services: <none>",
+            "observed CRDs: <none>",
+        ] {
+            assert!(
+                msg.contains(slot),
+                "expected '{slot}' in empty-cluster diagnostic; got: {msg}"
+            );
+        }
     }
 }

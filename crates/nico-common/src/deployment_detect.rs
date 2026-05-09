@@ -14,18 +14,39 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Namespace, Service};
-use kube::api::Api;
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use kube::api::{Api, ListParams};
 use kube::Client;
 
 use crate::config::DeploymentType;
 
+/// CRD names that signal a `rest`-side install. Slice 4: only the
+/// REST controller installs `sites.nico.nvidia.io`.
+const REST_INDICATOR_CRDS: &[&str] = &["sites.nico.nvidia.io"];
+
+/// CRD names that signal a `core`-side install. Slice 4: any one of
+/// these present is enough to call core "deployed". Names mirror the
+/// `carbide`-owned domain entities in `CONTEXT.md`.
+const CORE_INDICATOR_CRDS: &[&str] = &[
+    "machines.forge.nvidia.com",
+    "dpus.forge.nvidia.com",
+];
+
 /// Minimal cluster-shape primitives the detection ladder calls into.
-/// Workload probe (slice 2) only uses these two; namespace inventory
-/// (slice 3) and CRD inventory (slice 4) extend the trait.
+/// Slice 2 wired `service_exists` + `namespace_exists`; slice 4 adds
+/// `list_crd_names` so the CRD-inventory rung can list installed CRDs
+/// (and the all-three-fail diagnostic can surface them).
 #[async_trait]
 pub trait ClusterShapeProbe: Send + Sync {
     async fn service_exists(&self, namespace: &str, name: &str) -> Result<bool>;
     async fn namespace_exists(&self, namespace: &str) -> Result<bool>;
+    /// Names of installed CRDs (e.g. `sites.nico.nvidia.io`). Used by
+    /// the CRD-inventory rung and the all-three-fail diagnostic.
+    async fn list_crd_names(&self) -> Result<Vec<String>>;
+    /// Names of namespaces present on the cluster. Used by the
+    /// all-three-fail diagnostic. Slice 3 will also consume this from
+    /// the namespace-inventory rung.
+    async fn list_namespace_names(&self) -> Result<Vec<String>>;
 }
 
 /// Outcome of running the workload signal — signal 1 of the detection
@@ -113,6 +134,125 @@ pub async fn namespace_inventory_probe(
     })
 }
 
+/// Outcome of the full detection ladder — used by the boot-probe
+/// step. `matched` is the resolved type when any rung matched;
+/// otherwise the caller renders the no-match diagnostic from the
+/// `observed_*` fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LadderOutcome {
+    pub matched: Option<DeploymentType>,
+    pub observed_namespaces: Vec<String>,
+    pub observed_services: Vec<String>,
+    pub observed_crds: Vec<String>,
+}
+
+/// Run the detection ladder against the given cluster-shape probe.
+/// Rungs are evaluated first-match-wins:
+///   1. workload probe (services)        — slice 2 (#279)
+///   2. namespace inventory               — slice 3 (#280)
+///   3. CRD inventory                     — slice 4 (#281, this slice)
+///
+/// On no-match, the outcome carries observed namespaces, services,
+/// and CRDs so the caller can render the recovery diagnostic.
+pub async fn run_detection_ladder(
+    probe: &dyn ClusterShapeProbe,
+) -> Result<LadderOutcome> {
+    // Rung 1: workload probe. On match, return immediately; on
+    // no-match, retain the observed services for the diagnostic.
+    let workload = workload_probe(probe).await?;
+    if workload.matched.is_some() {
+        return Ok(LadderOutcome {
+            matched: workload.matched,
+            observed_namespaces: Vec::new(),
+            observed_services: workload.observed_services,
+            observed_crds: Vec::new(),
+        });
+    }
+
+    // Rung 2: namespace inventory.
+    if let Some(matched) = namespace_inventory_probe(probe).await? {
+        return Ok(LadderOutcome {
+            matched: Some(matched),
+            observed_namespaces: Vec::new(),
+            observed_services: workload.observed_services,
+            observed_crds: Vec::new(),
+        });
+    }
+
+    // Rung 3: CRD inventory.
+    let crd = crd_inventory_probe(probe).await?;
+    if crd.matched.is_some() {
+        return Ok(LadderOutcome {
+            matched: crd.matched,
+            observed_namespaces: Vec::new(),
+            observed_services: workload.observed_services,
+            observed_crds: crd.observed_crds,
+        });
+    }
+
+    // No rung matched — collect everything for the diagnostic.
+    let observed_namespaces = probe.list_namespace_names().await.unwrap_or_default();
+    Ok(LadderOutcome {
+        matched: None,
+        observed_namespaces,
+        observed_services: workload.observed_services,
+        observed_crds: crd.observed_crds,
+    })
+}
+
+/// Outcome of running the CRD-inventory signal — signal 3 of the
+/// detection ladder. `matched` is the resolved type when the installed
+/// CRDs identify a known shape; `observed_crds` carries the indicator
+/// CRDs the probe found (used in the all-three-fail diagnostic).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrdInventoryOutcome {
+    pub matched: Option<DeploymentType>,
+    pub observed_crds: Vec<String>,
+}
+
+/// Signal 3 of the detection ladder: list installed CRDs and resolve
+/// to a [`DeploymentType`] when the installed set matches one of the
+/// three documented shapes. Returns `Ok(matched: None, …)` when no
+/// shape matches — the caller falls through to the all-three-fail
+/// diagnostic.
+pub async fn crd_inventory_probe(
+    probe: &dyn ClusterShapeProbe,
+) -> Result<CrdInventoryOutcome> {
+    let installed = probe.list_crd_names().await?;
+    let installed_set: std::collections::HashSet<&str> =
+        installed.iter().map(String::as_str).collect();
+
+    let mut observed: Vec<String> = Vec::new();
+    let rest_present = REST_INDICATOR_CRDS.iter().any(|name| {
+        if installed_set.contains(name) {
+            observed.push((*name).to_string());
+            true
+        } else {
+            false
+        }
+    });
+    let core_present = CORE_INDICATOR_CRDS.iter().fold(false, |acc, name| {
+        if installed_set.contains(name) {
+            observed.push((*name).to_string());
+            true
+        } else {
+            acc
+        }
+    });
+
+    let matched = match (core_present, rest_present) {
+        (true, true) => Some(DeploymentType::Full),
+        (true, false) => Some(DeploymentType::CoreOnly),
+        (false, true) => Some(DeploymentType::RestOnlyMock),
+        (false, false) => None,
+    };
+
+    Ok(CrdInventoryOutcome {
+        matched,
+        observed_crds: observed,
+    })
+}
+
 /// Real `kube::Client`-backed implementation. `Api::get(...)` returns
 /// 404 for missing resources; we map that to `Ok(false)` and surface any
 /// other error verbatim.
@@ -149,6 +289,32 @@ impl ClusterShapeProbe for KubeClusterShapeProbe {
             )),
         }
     }
+
+    async fn list_crd_names(&self) -> Result<Vec<String>> {
+        let api: Api<CustomResourceDefinition> = Api::all(self.client.clone());
+        let list = api
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to list CRDs: {e}"))?;
+        Ok(list
+            .items
+            .into_iter()
+            .filter_map(|c| c.metadata.name)
+            .collect())
+    }
+
+    async fn list_namespace_names(&self) -> Result<Vec<String>> {
+        let api: Api<Namespace> = Api::all(self.client.clone());
+        let list = api
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to list namespaces: {e}"))?;
+        Ok(list
+            .items
+            .into_iter()
+            .filter_map(|n| n.metadata.name)
+            .collect())
+    }
 }
 
 /// Test fakes — left always-public (no `#[cfg(test)]`) so downstream
@@ -159,13 +325,14 @@ pub mod testing {
     use std::collections::HashSet;
 
     /// In-memory probe that only reports presence for explicitly-set
-    /// services / namespaces. Mirrors the tiny shape `workload_probe`
-    /// queries — set the tuples you want present and the rest reports
-    /// absent.
+    /// services / namespaces / CRDs. Mirrors the shape the detection
+    /// ladder queries — set the tuples you want present and the rest
+    /// reports absent.
     #[derive(Default)]
     pub struct MockClusterShapeProbe {
         services: HashSet<(String, String)>,
         namespaces: HashSet<String>,
+        crds: HashSet<String>,
     }
 
     impl MockClusterShapeProbe {
@@ -186,6 +353,11 @@ pub mod testing {
             self.namespaces.insert(namespace.to_string());
             self
         }
+
+        pub fn with_crd(mut self, name: &str) -> Self {
+            self.crds.insert(name.to_string());
+            self
+        }
     }
 
     #[async_trait]
@@ -198,6 +370,18 @@ pub mod testing {
 
         async fn namespace_exists(&self, namespace: &str) -> Result<bool> {
             Ok(self.namespaces.contains(namespace))
+        }
+
+        async fn list_crd_names(&self) -> Result<Vec<String>> {
+            let mut names: Vec<String> = self.crds.iter().cloned().collect();
+            names.sort();
+            Ok(names)
+        }
+
+        async fn list_namespace_names(&self) -> Result<Vec<String>> {
+            let mut names: Vec<String> = self.namespaces.iter().cloned().collect();
+            names.sort();
+            Ok(names)
         }
     }
 }
@@ -254,6 +438,86 @@ mod tests {
         let outcome = workload_probe(&probe).await.unwrap();
         assert_eq!(outcome.matched, None);
         assert!(outcome.observed_services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn crd_inventory_resolves_rest_only_mock_when_only_sites_crd_present() {
+        let probe = MockClusterShapeProbe::new().with_crd("sites.nico.nvidia.io");
+        let outcome = crd_inventory_probe(&probe).await.unwrap();
+        assert_eq!(outcome.matched, Some(DeploymentType::RestOnlyMock));
+        assert_eq!(outcome.observed_crds, vec!["sites.nico.nvidia.io".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn crd_inventory_resolves_core_only_when_only_core_crds_present() {
+        let probe = MockClusterShapeProbe::new().with_crd("machines.forge.nvidia.com");
+        let outcome = crd_inventory_probe(&probe).await.unwrap();
+        assert_eq!(outcome.matched, Some(DeploymentType::CoreOnly));
+        assert!(outcome
+            .observed_crds
+            .iter()
+            .any(|c| c == "machines.forge.nvidia.com"));
+    }
+
+    #[tokio::test]
+    async fn crd_inventory_resolves_full_when_both_rest_and_core_crds_present() {
+        let probe = MockClusterShapeProbe::new()
+            .with_crd("sites.nico.nvidia.io")
+            .with_crd("dpus.forge.nvidia.com");
+        let outcome = crd_inventory_probe(&probe).await.unwrap();
+        assert_eq!(outcome.matched, Some(DeploymentType::Full));
+    }
+
+    #[tokio::test]
+    async fn ladder_returns_workload_match_without_consulting_crds() {
+        // Workload probe matches definitively — CRD rung must not be
+        // consulted (first-match-wins).
+        let probe = MockClusterShapeProbe::new()
+            .with_service("forge-system", "carbide-api")
+            .with_service("nico-rest", "nico-rest-api")
+            .with_crd("sites.nico.nvidia.io"); // would also match CRD rung
+        let outcome = run_detection_ladder(&probe).await.unwrap();
+        assert_eq!(outcome.matched, Some(DeploymentType::Full));
+        // No CRD inspection happened, so observed_crds is empty.
+        assert!(outcome.observed_crds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ladder_falls_through_workload_to_crd_when_workload_inconclusive() {
+        // Workload no-match, CRD matches → ladder returns CRD verdict.
+        let probe = MockClusterShapeProbe::new().with_crd("sites.nico.nvidia.io");
+        let outcome = run_detection_ladder(&probe).await.unwrap();
+        assert_eq!(outcome.matched, Some(DeploymentType::RestOnlyMock));
+        assert_eq!(outcome.observed_crds, vec!["sites.nico.nvidia.io".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn ladder_returns_none_with_observed_lists_when_all_signals_fail() {
+        // Empty cluster + an unrelated CRD + an unrelated namespace —
+        // none of the rungs match. Diagnostic must carry all three
+        // observation lists so the boot-probe step can surface them.
+        let probe = MockClusterShapeProbe::new()
+            .with_namespace("default")
+            .with_namespace("kube-system")
+            .with_crd("certificates.cert-manager.io");
+        let outcome = run_detection_ladder(&probe).await.unwrap();
+        assert_eq!(outcome.matched, None);
+        assert!(outcome.observed_services.is_empty());
+        assert!(outcome.observed_crds.is_empty());
+        assert!(outcome.observed_namespaces.contains(&"default".to_string()));
+        assert!(outcome
+            .observed_namespaces
+            .contains(&"kube-system".to_string()));
+    }
+
+    #[tokio::test]
+    async fn crd_inventory_returns_none_when_no_indicator_crds_present() {
+        // Cluster has unrelated CRDs (e.g. cert-manager) but none of
+        // ours — fall through to the all-three-fail diagnostic.
+        let probe = MockClusterShapeProbe::new().with_crd("certificates.cert-manager.io");
+        let outcome = crd_inventory_probe(&probe).await.unwrap();
+        assert_eq!(outcome.matched, None);
+        assert!(outcome.observed_crds.is_empty());
     }
 
     #[tokio::test]
