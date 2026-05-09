@@ -102,13 +102,20 @@ Linked-issue resolution uses GraphQL `closingIssuesReferences` — only `Closes 
 
 ### Required setup (`PROJECT_PAT` secret)
 
-The default `GITHUB_TOKEN` lacks project scope, so the workflow needs a fine-grained PAT:
+The default `GITHUB_TOKEN` lacks project scope, so the workflow needs a personal access token. Use a **classic PAT** — fine-grained PATs do *not* support user-owned ProjectsV2 (the "Projects" account-permission entry only renders for org-owned projects). Until/unless project 1 is moved to an org, classic is the only working path.
 
-1. Generate a fine-grained PAT at `https://github.com/settings/tokens?type=beta` scoped to *only* this repo, with:
-   - **Repository permissions:** `Contents: Read`, `Issues: Read`, `Pull requests: Read`
-   - **Account permissions:** `Projects: Read and write` (required to mutate ProjectV2 items)
-2. Save it as the repo secret `PROJECT_PAT` (`gh secret set PROJECT_PAT --repo jeremypruitt/nico-tools`).
-3. Rotation: PATs expire. When `PROJECT_PAT` expires, the workflow steps fail with `401 Bad credentials` — regenerate and re-save.
+1. Open the classic-token page (NOT `?type=beta`): `https://github.com/settings/tokens/new`
+2. Verify the page header reads "New personal access token (classic)".
+3. Scopes — check exactly:
+   - `repo` (auto-selects the sub-scopes)
+   - `project` (auto-selects `read:project` + `write:project`)
+4. Set an expiration (90 days is typical) and generate. Copy the token — it's shown once.
+5. Save as the repo secret:
+   ```
+   gh secret set PROJECT_PAT --repo jeremypruitt/nico-tools
+   ```
+   (paste the token when prompted)
+6. Rotation: classic PATs expire. When `PROJECT_PAT` expires, the workflow's `sync` job fails with `401 Bad credentials` (or empty `GH_TOKEN` if the secret is missing). Regenerate and re-save.
 
 ### Hardcoded IDs in the workflow
 
