@@ -1,7 +1,142 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Deserialize;
+
+/// Capability-based deployment-type label. α-flat shape: detection
+/// resolves to one of the three real shapes, and `Force` is the escape
+/// hatch when the operator wants to skip detection entirely. See
+/// PRD-001 (`docs/prds/001-deployment-type.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeploymentType {
+    /// Full stack: core + rest both deployed (`forge-system` controller ns,
+    /// `carbide-api:1079` gRPC, forgedb present).
+    Full,
+    /// Core-only: carbide-kind without rest (`forge-system` ns, same gRPC,
+    /// forgedb present).
+    CoreOnly,
+    /// Rest-only with mock-core stand-in (`nico-rest` ns,
+    /// `nico-rest-mock-core:11079` gRPC, no forgedb).
+    RestOnlyMock,
+    /// Escape hatch: trust the user's raw config; no detection, no
+    /// capability defaults, no contradiction warnings.
+    Force,
+}
+
+impl DeploymentType {
+    /// Stable public label — what `--deployment-type=<…>`, the
+    /// `[cluster] deployment_type` config key, the `NICO_DEPLOYMENT_TYPE`
+    /// env, and the boot banner all use.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::CoreOnly => "core-only",
+            Self::RestOnlyMock => "rest-only-mock",
+            Self::Force => "force",
+        }
+    }
+
+    /// Parse from the public `label()` vocabulary. `auto` is *not* a
+    /// `DeploymentType` value — it's the absence of a resolved type and
+    /// is handled at the source-tag layer.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "full" => Some(Self::Full),
+            "core-only" => Some(Self::CoreOnly),
+            "rest-only-mock" => Some(Self::RestOnlyMock),
+            "force" => Some(Self::Force),
+            _ => None,
+        }
+    }
+
+    /// Capability: controller namespace ([cluster] namespace) for this
+    /// deployment-type. `None` for `Force` (raw config flows through).
+    pub fn default_cluster_namespace(self) -> Option<&'static str> {
+        match self {
+            Self::Full | Self::CoreOnly => Some("forge-system"),
+            Self::RestOnlyMock => Some("nico-rest"),
+            Self::Force => None,
+        }
+    }
+
+    /// Capability: gRPC service `host:port`. `None` for `Force`.
+    pub fn default_grpc_address(self) -> Option<&'static str> {
+        match self {
+            Self::Full | Self::CoreOnly => Some("carbide-api.forge-system:1079"),
+            Self::RestOnlyMock => Some("nico-rest-mock-core.nico-rest:11079"),
+            Self::Force => None,
+        }
+    }
+
+    /// Capability: postgres namespace. Stubbed in slice 1 — slice 5
+    /// (#282) will fill in real values once the capability bundle wiring
+    /// lands and the vocabulary is re-grilled.
+    pub fn default_postgres_namespace(self) -> Option<&'static str> {
+        None
+    }
+
+    /// Capability: Temporal frontend address. Stubbed; see
+    /// `default_postgres_namespace`.
+    pub fn default_temporal_address(self) -> Option<&'static str> {
+        None
+    }
+
+    /// Capability: Temporal namespace. Stubbed; see
+    /// `default_postgres_namespace`.
+    pub fn default_temporal_namespace(self) -> Option<&'static str> {
+        None
+    }
+
+    /// Capability: whether this deployment-type runs the forgedb postgres
+    /// schema. The `dpu` layer keys off this — `rest-only-mock` skips the
+    /// `dpu` layer because forgedb is absent. `Force` returns `true`
+    /// (no enforcement; let the layer try and surface the real error).
+    pub fn forgedb_present(self) -> bool {
+        match self {
+            Self::Full | Self::CoreOnly | Self::Force => true,
+            Self::RestOnlyMock => false,
+        }
+    }
+}
+
+impl fmt::Display for DeploymentType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Where the resolved `DeploymentType` came from. Drives the
+/// `type: <name> (<source>)` tag in the boot banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeploymentTypeSource {
+    /// User passed `--deployment-type=auto` (or no flag); detection ran.
+    Auto,
+    /// User passed an explicit `--deployment-type=<full|core-only|rest-only-mock|force>`.
+    Flag,
+    /// `[cluster] deployment_type` in `config.toml` or `NICO_DEPLOYMENT_TYPE` env.
+    Config,
+    /// User passed `--deployment-type=force` (or set it in config/env).
+    /// Detection is skipped and capability defaults do not apply.
+    Force,
+}
+
+impl DeploymentTypeSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Flag => "flag",
+            Self::Config => "config",
+            Self::Force => "force",
+        }
+    }
+}
+
+impl fmt::Display for DeploymentTypeSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
 
 pub struct Config {
     pub cluster: ClusterConfig,
@@ -127,6 +262,14 @@ pub struct ClusterConfig {
     pub postgres_namespace: String,
     pub reach_mode: ReachMode,
     pub grpc_address: Option<String>,
+    /// Resolved deployment-type. `None` means `auto` — the boot-probe
+    /// `detect_deployment_type` step runs the detection ladder. `Some(...)`
+    /// means the user (or config / env) pinned a specific type and
+    /// detection is skipped.
+    pub deployment_type: Option<DeploymentType>,
+    /// Where `deployment_type` came from — drives the
+    /// `type: <name> (<source>)` tag in the boot banner.
+    pub deployment_type_source: DeploymentTypeSource,
 }
 
 pub struct PostgresConfig {
@@ -194,6 +337,12 @@ pub struct ConfigOverrides {
     pub tui_refresh: Option<Duration>,
     /// CLI `--timeouts step=Xs,...` spec, applied last (highest precedence).
     pub bootstrap_timeouts_spec: Option<String>,
+    /// CLI `--deployment-type=<auto|full|core-only|rest-only-mock|force>`
+    /// raw spec. Highest precedence over env (`NICO_DEPLOYMENT_TYPE`) and
+    /// file (`[cluster] deployment_type`). `Some("auto")` is meaningful
+    /// — it explicitly opts into detection and overrides any config-set
+    /// pinned value.
+    pub deployment_type_spec: Option<String>,
 }
 
 /// Intermediate deserialization shape — all fields optional so missing fields fall back to defaults.
@@ -242,6 +391,7 @@ struct FileClusterConfig {
     postgres_namespace: Option<String>,
     reach_mode: Option<String>,
     grpc_address: Option<String>,
+    deployment_type: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -338,6 +488,16 @@ impl Config {
 
         let grpc_address = env.get("NICO_GRPC_ADDRESS").cloned().or(cluster.grpc_address);
 
+        // Deployment-type: CLI spec > env > file. `auto` (or absent) →
+        // (None, Auto). `force` → (Some(Force), Force) regardless of
+        // origin. Other resolved values → source = Flag (CLI) or
+        // Config (env/file).
+        let (deployment_type, deployment_type_source) = resolve_deployment_type(
+            overrides.deployment_type_spec.as_deref(),
+            env.get("NICO_DEPLOYMENT_TYPE").map(String::as_str),
+            cluster.deployment_type.as_deref(),
+        )?;
+
         // Bootstrap timeouts — defaults < file < env < CLI override spec.
         let mut timeouts = BootstrapTimeouts::default();
         let file_t = bootstrap_file.timeouts.unwrap_or_default();
@@ -431,7 +591,15 @@ impl Config {
         let tui_refresh = overrides.tui_refresh.unwrap_or(tui_refresh);
 
         Ok(Config {
-            cluster: ClusterConfig { context, namespace, postgres_namespace, reach_mode, grpc_address },
+            cluster: ClusterConfig {
+                context,
+                namespace,
+                postgres_namespace,
+                reach_mode,
+                grpc_address,
+                deployment_type,
+                deployment_type_source,
+            },
             postgres: PostgresConfig { url: postgres_url },
             temporal: TemporalConfig {
                 address: temporal_address,
@@ -443,6 +611,52 @@ impl Config {
             dpu,
         })
     }
+}
+
+/// Resolve `(deployment_type, source)` from the precedence chain
+/// CLI spec > env (`NICO_DEPLOYMENT_TYPE`) > file (`[cluster] deployment_type`).
+/// `auto` (or absent) → `(None, Auto)`. `force` → `(Some(Force), Force)`.
+/// Real types → `Some(...)` with `Flag` (CLI) or `Config` (env/file) source.
+fn resolve_deployment_type(
+    cli_spec: Option<&str>,
+    env_val: Option<&str>,
+    file_val: Option<&str>,
+) -> Result<(Option<DeploymentType>, DeploymentTypeSource)> {
+    // Precedence walk. First non-None spec wins.
+    let (raw, origin): (&str, DeploymentTypeOrigin) = if let Some(s) = cli_spec {
+        (s, DeploymentTypeOrigin::Cli)
+    } else if let Some(s) = env_val {
+        (s, DeploymentTypeOrigin::EnvOrFile)
+    } else if let Some(s) = file_val {
+        (s, DeploymentTypeOrigin::EnvOrFile)
+    } else {
+        return Ok((None, DeploymentTypeSource::Auto));
+    };
+
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("auto") {
+        return Ok((None, DeploymentTypeSource::Auto));
+    }
+
+    let dt = DeploymentType::parse(raw).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid deployment-type {:?}; use auto, full, core-only, rest-only-mock, or force",
+            raw
+        )
+    })?;
+
+    let source = match (dt, origin) {
+        (DeploymentType::Force, _) => DeploymentTypeSource::Force,
+        (_, DeploymentTypeOrigin::Cli) => DeploymentTypeSource::Flag,
+        (_, DeploymentTypeOrigin::EnvOrFile) => DeploymentTypeSource::Config,
+    };
+    Ok((Some(dt), source))
+}
+
+#[derive(Clone, Copy)]
+enum DeploymentTypeOrigin {
+    Cli,
+    EnvOrFile,
 }
 
 impl DpuConfig {
@@ -737,5 +951,214 @@ port_forward = "1s"
         let config = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
         assert!(config.cluster.grpc_address.is_none());
         assert_eq!(config.temporal.address, "temporal:7233");
+    }
+
+    #[test]
+    fn deployment_type_labels_match_prd_vocabulary() {
+        assert_eq!(DeploymentType::Full.label(), "full");
+        assert_eq!(DeploymentType::CoreOnly.label(), "core-only");
+        assert_eq!(DeploymentType::RestOnlyMock.label(), "rest-only-mock");
+        assert_eq!(DeploymentType::Force.label(), "force");
+    }
+
+    #[test]
+    fn deployment_type_parse_round_trips() {
+        for dt in [
+            DeploymentType::Full,
+            DeploymentType::CoreOnly,
+            DeploymentType::RestOnlyMock,
+            DeploymentType::Force,
+        ] {
+            assert_eq!(DeploymentType::parse(dt.label()), Some(dt));
+        }
+        assert_eq!(DeploymentType::parse("auto"), None);
+        assert_eq!(DeploymentType::parse("nope"), None);
+        assert_eq!(DeploymentType::parse(""), None);
+    }
+
+    #[test]
+    fn deployment_type_capabilities_match_prd_table() {
+        // Full / CoreOnly: forge-system + carbide-api + forgedb yes.
+        assert_eq!(
+            DeploymentType::Full.default_cluster_namespace(),
+            Some("forge-system")
+        );
+        assert_eq!(
+            DeploymentType::CoreOnly.default_cluster_namespace(),
+            Some("forge-system")
+        );
+        assert_eq!(
+            DeploymentType::Full.default_grpc_address(),
+            Some("carbide-api.forge-system:1079")
+        );
+        assert_eq!(
+            DeploymentType::CoreOnly.default_grpc_address(),
+            Some("carbide-api.forge-system:1079")
+        );
+        assert!(DeploymentType::Full.forgedb_present());
+        assert!(DeploymentType::CoreOnly.forgedb_present());
+
+        // RestOnlyMock: nico-rest + mock-core + no forgedb.
+        assert_eq!(
+            DeploymentType::RestOnlyMock.default_cluster_namespace(),
+            Some("nico-rest")
+        );
+        assert_eq!(
+            DeploymentType::RestOnlyMock.default_grpc_address(),
+            Some("nico-rest-mock-core.nico-rest:11079")
+        );
+        assert!(!DeploymentType::RestOnlyMock.forgedb_present());
+    }
+
+    #[test]
+    fn deployment_type_force_returns_none_for_capabilities_and_true_for_forgedb() {
+        // Per slice 1 acceptance: methods return None for Force,
+        // forgedb_present returns true (no-enforcement semantics).
+        assert!(DeploymentType::Force.default_cluster_namespace().is_none());
+        assert!(DeploymentType::Force.default_grpc_address().is_none());
+        assert!(DeploymentType::Force.default_postgres_namespace().is_none());
+        assert!(DeploymentType::Force.default_temporal_address().is_none());
+        assert!(DeploymentType::Force.default_temporal_namespace().is_none());
+        assert!(DeploymentType::Force.forgedb_present());
+    }
+
+    #[test]
+    fn deployment_type_source_labels_are_stable() {
+        assert_eq!(DeploymentTypeSource::Auto.label(), "auto");
+        assert_eq!(DeploymentTypeSource::Flag.label(), "flag");
+        assert_eq!(DeploymentTypeSource::Config.label(), "config");
+        assert_eq!(DeploymentTypeSource::Force.label(), "force");
+    }
+
+    #[test]
+    fn deployment_type_defaults_to_auto_when_no_overrides() {
+        let cfg = Config::load(None, &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        assert!(cfg.cluster.deployment_type.is_none());
+        assert_eq!(cfg.cluster.deployment_type_source, DeploymentTypeSource::Auto);
+    }
+
+    #[test]
+    fn deployment_type_explicit_flag_resolves_to_flag_source() {
+        for label in ["full", "core-only", "rest-only-mock"] {
+            let overrides = ConfigOverrides {
+                deployment_type_spec: Some(label.into()),
+                ..Default::default()
+            };
+            let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+            assert_eq!(cfg.cluster.deployment_type, DeploymentType::parse(label));
+            assert_eq!(
+                cfg.cluster.deployment_type_source,
+                DeploymentTypeSource::Flag,
+                "expected Flag source for --deployment-type={label}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_type_force_flag_resolves_to_force_source() {
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("force".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::Force));
+        assert_eq!(cfg.cluster.deployment_type_source, DeploymentTypeSource::Force);
+    }
+
+    #[test]
+    fn deployment_type_auto_flag_resolves_to_auto_source() {
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("auto".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(None, &HashMap::new(), &overrides).unwrap();
+        assert!(cfg.cluster.deployment_type.is_none());
+        assert_eq!(cfg.cluster.deployment_type_source, DeploymentTypeSource::Auto);
+    }
+
+    #[test]
+    fn deployment_type_from_env_resolves_to_config_source() {
+        let mut env = HashMap::new();
+        env.insert(
+            "NICO_DEPLOYMENT_TYPE".to_string(),
+            "rest-only-mock".to_string(),
+        );
+        let cfg = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        assert_eq!(
+            cfg.cluster.deployment_type,
+            Some(DeploymentType::RestOnlyMock)
+        );
+        assert_eq!(
+            cfg.cluster.deployment_type_source,
+            DeploymentTypeSource::Config
+        );
+    }
+
+    #[test]
+    fn deployment_type_from_file_resolves_to_config_source() {
+        let toml = r#"[cluster]
+deployment_type = "core-only"
+"#;
+        let cfg = Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).unwrap();
+        assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::CoreOnly));
+        assert_eq!(
+            cfg.cluster.deployment_type_source,
+            DeploymentTypeSource::Config
+        );
+    }
+
+    #[test]
+    fn deployment_type_cli_overrides_env_and_file() {
+        let toml = "[cluster]\ndeployment_type = \"core-only\"";
+        let mut env = HashMap::new();
+        env.insert("NICO_DEPLOYMENT_TYPE".to_string(), "rest-only-mock".to_string());
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("full".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(toml), &env, &overrides).unwrap();
+        assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::Full));
+        assert_eq!(cfg.cluster.deployment_type_source, DeploymentTypeSource::Flag);
+    }
+
+    #[test]
+    fn deployment_type_env_overrides_file() {
+        let toml = "[cluster]\ndeployment_type = \"core-only\"";
+        let mut env = HashMap::new();
+        env.insert("NICO_DEPLOYMENT_TYPE".to_string(), "full".to_string());
+        let cfg = Config::load(Some(toml), &env, &ConfigOverrides::default()).unwrap();
+        assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::Full));
+        assert_eq!(
+            cfg.cluster.deployment_type_source,
+            DeploymentTypeSource::Config
+        );
+    }
+
+    #[test]
+    fn deployment_type_force_in_config_resolves_to_force_source() {
+        // `force` is `force` regardless of where it came from — the
+        // banner reads `type: force (force)` for the no-enforcement path.
+        let mut env = HashMap::new();
+        env.insert("NICO_DEPLOYMENT_TYPE".to_string(), "force".to_string());
+        let cfg = Config::load(None, &env, &ConfigOverrides::default()).unwrap();
+        assert_eq!(cfg.cluster.deployment_type, Some(DeploymentType::Force));
+        assert_eq!(cfg.cluster.deployment_type_source, DeploymentTypeSource::Force);
+    }
+
+    #[test]
+    fn deployment_type_invalid_value_errors() {
+        let overrides = ConfigOverrides {
+            deployment_type_spec: Some("nope".into()),
+            ..Default::default()
+        };
+        let err = Config::load(None, &HashMap::new(), &overrides).err().expect("expected err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nope"), "msg = {msg}");
+    }
+
+    #[test]
+    fn deployment_type_invalid_in_file_errors() {
+        let toml = "[cluster]\ndeployment_type = \"weird\"";
+        assert!(Config::load(Some(toml), &HashMap::new(), &ConfigOverrides::default()).is_err());
     }
 }

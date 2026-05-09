@@ -62,6 +62,16 @@ pub struct DoctorArgs {
 
     #[arg(long, global = true, env = "NICO_THEME", value_name = "NAME", help = "Color theme: default, dracula, nord, gruvbox")]
     pub theme: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "TYPE",
+        help = "Deployment-type: auto, full, core-only, rest-only-mock, force \
+                (default: auto). `force` skips detection and runs with raw \
+                config (no namespace / gRPC re-pointing)."
+    )]
+    pub deployment_type: Option<String>,
 }
 
 /// Optional subcommand under `nico doctor`. When absent, doctor runs the

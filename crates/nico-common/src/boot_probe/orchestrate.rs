@@ -376,6 +376,12 @@ pub fn standard_steps(
             budget: timeouts.preflight,
         },
         StepDef {
+            id: StepId::DetectDeploymentType,
+            label: "detect deployment-type".into(),
+            section: Validating,
+            budget: timeouts.preflight,
+        },
+        StepDef {
             id: StepId::NamespaceExists,
             label: format!("namespace '{namespace}' exists"),
             section: Validating,
@@ -423,6 +429,9 @@ pub fn next_command_for(id: StepId, namespace: &str) -> String {
         StepId::LoadKubeconfig => "kubectl config view".into(),
         StepId::ReachApiServer => "kubectl cluster-info".into(),
         StepId::Credentials => "kubectl auth whoami".into(),
+        StepId::DetectDeploymentType => {
+            "pass --deployment-type=<full|core-only|rest-only-mock> or =force".into()
+        }
         StepId::NamespaceExists => format!("kubectl get ns {namespace}"),
         StepId::Rbac => format!("kubectl auth can-i list pods -n {namespace}"),
         StepId::PortForwardWorkflows => format!(
@@ -686,9 +695,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_steps_includes_nine_steps() {
+    async fn standard_steps_includes_ten_steps() {
         let t = crate::config::BootstrapTimeouts::default();
         let s = standard_steps("nico", &t);
-        assert_eq!(s.len(), 9);
+        assert_eq!(s.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn standard_steps_places_detect_deployment_type_after_credentials_before_namespace() {
+        let t = crate::config::BootstrapTimeouts::default();
+        let s = standard_steps("nico", &t);
+        let positions: std::collections::HashMap<StepId, usize> = s
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d.id, i))
+            .collect();
+        let cred = positions[&StepId::Credentials];
+        let detect = positions[&StepId::DetectDeploymentType];
+        let ns = positions[&StepId::NamespaceExists];
+        assert!(cred < detect, "Credentials must come before DetectDeploymentType");
+        assert!(detect < ns, "DetectDeploymentType must come before NamespaceExists");
+    }
+
+    #[tokio::test]
+    async fn detect_deployment_type_lives_in_validating_section() {
+        let t = crate::config::BootstrapTimeouts::default();
+        let s = standard_steps("nico", &t);
+        let detect = s.iter().find(|d| d.id == StepId::DetectDeploymentType).unwrap();
+        assert_eq!(detect.section, crate::boot_probe::state::Section::Validating);
     }
 }

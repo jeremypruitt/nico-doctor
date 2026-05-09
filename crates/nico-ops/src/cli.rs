@@ -42,6 +42,15 @@ pub struct OpsArgs {
         help = "Auto-refresh interval (e.g. 5s, 1m). Overrides [output] tui_refresh and NICO_TUI_REFRESH; default 30s"
     )]
     pub interval: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "TYPE",
+        help = "Deployment-type: auto, full, core-only, rest-only-mock, force \
+                (default: auto). `force` skips detection and runs with raw \
+                config (no namespace / gRPC re-pointing)."
+    )]
+    pub deployment_type: Option<String>,
 }
 
 impl Default for OpsArgs {
@@ -58,6 +67,7 @@ impl Default for OpsArgs {
             mode: None,
             theme: None,
             interval: None,
+            deployment_type: None,
         }
     }
 }
@@ -105,6 +115,7 @@ impl OpsArgs {
             mode: self.mode.clone(),
             theme: self.theme.clone(),
             timeouts: None,
+            deployment_type: self.deployment_type.clone(),
         }
     }
 }
