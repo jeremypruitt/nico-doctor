@@ -70,6 +70,56 @@ Use these GitHub features in order of preference:
 
 Use (1) for parent-child relationships within a PRD. Use (3) for ordering constraints between sibling sub-issues. (2) is a nice-to-have summary view at the top of the epic body.
 
+## PRD format and lifecycle
+
+PRDs are forward-looking specs. The canonical doc lives in `docs/prds/NNN-slug.md` (zero-padded numbering, parallel to `docs/adrs/`). The doc is the source of truth for the spec; an Epic GitHub issue (label `epic` + `prd-NNN`) tracks implementation progress with a children tasklist.
+
+### File layout
+
+- `docs/prds/` — forward-looking PRDs awaiting or in implementation. One file per PRD: `001-deployment-type.md`, `002-dpu-layer-rewrite.md`, etc.
+- `docs/design/` — historical design references; baseline / foundational designs that have already shipped (e.g., `nico-doctor-and-correlate.md`). Distinct from PRDs because they're not forward-looking specs.
+- `docs/adrs/` — narrow architectural decisions. PRDs may reference or amend ADRs; ADRs do not depend on PRDs.
+
+### PRD doc structure
+
+Required sections at the top of every `docs/prds/NNN-slug.md`:
+
+```
+# PRD-NNN — <title>
+
+- **Status:** <Specced | In progress | Done | Superseded>
+- **Epic:** #<issue-number> (carries `prd-NNN` label)
+- **Touches:** ADR-XXXX (if applicable)
+- **Deferred follow-up:** #<issue-number> (if any)
+```
+
+Then: Problem · Personas · Goals · Non-goals · High-level design · UX · Open questions. Implementation breakdown goes in the Epic, not the doc — it changes during implementation and is better tracked as a tasklist of issues.
+
+### Allocating a new PRD number
+
+Find the next free number:
+
+```
+ls docs/prds/ | grep -oE '^[0-9]+' | sort -n | tail -1
+```
+
+Create the matching label at the same time:
+
+```
+gh label create prd-NNN --description "PRD-NNN: <short title>" --color 1d76db
+```
+
+### Epic ↔ PRD doc coupling
+
+The Epic issue's body is a thin shell:
+
+- One-paragraph summary
+- Link to `docs/prds/NNN-slug.md`
+- Children tasklist (`- [ ] #N — title` with `Parent: #<epic>` set on each child via `gh api` per §"Dependency tracking")
+- Related issues / pre-existing bugs / upstream deps
+
+The Epic body can be edited freely as implementation progresses. The PRD doc is more stable — major spec changes warrant a new commit (and possibly a new PRD if the change is substantive enough).
+
 ## Project board automation
 
 Every actionable issue and PR appears on project 1 (`https://github.com/users/jeremypruitt/projects/1`). The board's `Status` column is the project's primary SDLC oversight surface — *cards must move through it as work happens*. The `.github/workflows/project-automation.yml` workflow drives this automatically; manual `gh project item-edit` is the escape hatch.
