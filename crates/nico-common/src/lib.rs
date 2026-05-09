@@ -1,6 +1,7 @@
 pub mod boot_probe;
 pub mod bootstrap;
 pub mod config;
+pub mod deployment_detect;
 pub mod k8s;
 pub mod output;
 pub mod reach;

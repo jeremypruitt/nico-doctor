@@ -9,6 +9,9 @@ use nico_common::boot_probe::{
 use nico_common::config::{
     Config, ConfigOverrides, ColorMode, DeploymentType, OutputFormat, ReachMode,
 };
+use nico_common::deployment_detect::{
+    workload_probe, ClusterShapeProbe, KubeClusterShapeProbe,
+};
 use nico_common::output::OutputMode;
 use nico_common::reach::ReachManager;
 
@@ -534,6 +537,7 @@ async fn run_boot_probe(
     // ---------- Validating + Serving in parallel ----------
 
     let pf = preflight::KubePreflightClient::new(raw.clone());
+    let shape_probe = KubeClusterShapeProbe::new(raw.clone());
     let reach_mgr = ReachManager::new(
         reach_mode,
         raw.clone(),
@@ -545,6 +549,7 @@ async fn run_boot_probe(
         run_validating_section(
             &tracker,
             &pf,
+            &shape_probe,
             &ns,
             timeouts.preflight,
             config.cluster.deployment_type,
@@ -593,6 +598,7 @@ async fn probe_state_any_failed(probe: &BootProbe) -> bool {
 async fn run_validating_section(
     tracker: &nico_common::boot_probe::Tracker,
     pf: &preflight::KubePreflightClient,
+    shape_probe: &dyn ClusterShapeProbe,
     ns: &str,
     budget: Duration,
     deployment_type: Option<DeploymentType>,
@@ -609,7 +615,7 @@ async fn run_validating_section(
         StepId::DetectDeploymentType,
         ns,
         budget,
-        async move { detect_deployment_type_step(deployment_type).await },
+        async move { detect_deployment_type_step(deployment_type, Some(shape_probe)).await },
     );
     let ns_fut = run_step(
         tracker,
@@ -630,23 +636,47 @@ async fn run_validating_section(
     cred_ok && detect_ok && ns_ok && rbac_ok
 }
 
-/// Slice 1 behavior of the `detect_deployment_type` step:
+/// Behavior of the `detect_deployment_type` step:
 ///
 /// - `Some(_)` (resolved from CLI / env / file, including `Force`) →
-///   pass instantly. Capability re-pointing lands in slice 5.
-/// - `None` (auto, no detection ladder yet) → fail with the
-///   "no detection signals available" diagnostic. Slices 2–4 add the
-///   real signature probe / namespace inventory / CRD inventory.
+///   pass instantly; detection is skipped per PRD-001's hybrid trust
+///   model.
+/// - `None` (auto) + a shape probe is wired → run signal 1 (workload
+///   probe). Pass on match; fail with an observed-services diagnostic
+///   on no-match. Slices 3 / 4 will fall through to namespace and CRD
+///   inventory before failing.
+/// - `None` + no shape probe → preserve the slice-1 fallback so
+///   non-cluster code paths (tests, degraded boot) still surface a
+///   clear "no detection signals" error.
+///
+/// The matched type is intentionally *not* wired back into config in
+/// slice 2 — capability re-pointing lands in slice 5 (#282).
 async fn detect_deployment_type_step(
     deployment_type: Option<DeploymentType>,
+    shape_probe: Option<&dyn ClusterShapeProbe>,
 ) -> anyhow::Result<()> {
     if deployment_type.is_some() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "no detection signals available; pass --deployment-type=<full|core-only|rest-only-mock> or =force"
-        ))
+        return Ok(());
     }
+    let Some(probe) = shape_probe else {
+        return Err(anyhow::anyhow!(
+            "no detection signals available; pass --deployment-type=<full|core-only|rest-only-mock> or =force"
+        ));
+    };
+    let outcome = workload_probe(probe).await?;
+    if outcome.matched.is_some() {
+        return Ok(());
+    }
+    let observed = if outcome.observed_services.is_empty() {
+        "<none>".to_string()
+    } else {
+        outcome.observed_services.join(", ")
+    };
+    Err(anyhow::anyhow!(
+        "workload probe matched no known deployment-type \
+         (observed services: {observed}); \
+         pass --deployment-type=<full|core-only|rest-only-mock> or =force"
+    ))
 }
 
 async fn run_step<F>(
@@ -908,17 +938,17 @@ mod tests {
             DeploymentType::Force,
         ] {
             assert!(
-                detect_deployment_type_step(Some(dt)).await.is_ok(),
+                detect_deployment_type_step(Some(dt), None).await.is_ok(),
                 "expected pass for {dt:?}"
             );
         }
     }
 
     #[tokio::test]
-    async fn detect_step_fails_with_diagnostic_when_auto_and_no_signals() {
-        let err = detect_deployment_type_step(None)
+    async fn detect_step_fails_with_diagnostic_when_auto_and_no_probe_wired() {
+        let err = detect_deployment_type_step(None, None)
             .await
-            .expect_err("auto + no signals must fail in slice 1");
+            .expect_err("auto + no probe must fail with the slice-1 diagnostic");
         let msg = format!("{err}");
         assert!(
             msg.contains("no detection signals available"),
@@ -931,6 +961,56 @@ mod tests {
         assert!(
             msg.contains("force"),
             "expected recovery hint mentioning force; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_step_passes_when_workload_probe_matches() {
+        use nico_common::deployment_detect::testing::MockClusterShapeProbe;
+        let probe = MockClusterShapeProbe::new()
+            .with_service("forge-system", "carbide-api")
+            .with_service("nico-rest", "nico-rest-api");
+        let res = detect_deployment_type_step(None, Some(&probe)).await;
+        assert!(res.is_ok(), "expected pass; got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn detect_step_fails_with_observed_services_when_workload_probe_no_match() {
+        use nico_common::deployment_detect::testing::MockClusterShapeProbe;
+        // carbide-api visible but `nico-rest` namespace exists without
+        // either of its Services — falls through workload-probe rules.
+        let probe = MockClusterShapeProbe::new()
+            .with_service("forge-system", "carbide-api")
+            .with_namespace("nico-rest");
+        let err = detect_deployment_type_step(None, Some(&probe))
+            .await
+            .expect_err("auto + no-match must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("workload probe matched no known deployment-type"),
+            "expected workload-probe-no-match diagnostic; got: {msg}"
+        );
+        assert!(
+            msg.contains("carbide-api@forge-system"),
+            "expected observed services to include carbide-api@forge-system; got: {msg}"
+        );
+        assert!(
+            msg.contains("--deployment-type"),
+            "expected recovery hint mentioning --deployment-type; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_step_fails_with_none_observed_when_cluster_empty() {
+        use nico_common::deployment_detect::testing::MockClusterShapeProbe;
+        let probe = MockClusterShapeProbe::new();
+        let err = detect_deployment_type_step(None, Some(&probe))
+            .await
+            .expect_err("auto + empty cluster must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("<none>"),
+            "expected 'observed services: <none>' marker when nothing seen; got: {msg}"
         );
     }
 }
