@@ -3,15 +3,18 @@
 //! random tenant outage minutes later because the dpu-agent's client
 //! cert silently expired.
 //!
-//! Reads `client_certificate_expiry_unix_epoch_secs` from the most
-//! recent `DpuNetworkStatus` row and reports days-to-expiry against a
-//! configurable warning threshold.
+//! Reads `client_certificate_expiry` (i64 unix epoch secs) from
+//! `machines.network_status_observation` JSON — the producer-side
+//! storage. See PRD-002 (`docs/prds/002-dpu-layer-rewrite.md`) for the
+//! schema mapping. Reports days-to-expiry against a configurable
+//! warning threshold.
 //!
 //! Four mutually-exclusive verdicts: `expired` > `expiring-soon` >
-//! `healthy`, plus `no-recent-status` for the case where forgedb has
-//! never observed a status row for this DPU. Pure `assess()` over a
-//! small [`CertSnapshot`] keeps the logic testable without touching
-//! Postgres; the [`DpuCertClient`] trait is the seam.
+//! `healthy`, plus `no-recent-status` for the case where the JSON
+//! column is absent or has no `client_certificate_expiry` field for
+//! this machine row. Pure `assess()` over a small [`CertSnapshot`]
+//! keeps the logic testable without touching Postgres; the
+//! [`DpuCertClient`] trait is the seam.
 
 use std::time::Duration;
 use anyhow::Result;
@@ -28,16 +31,19 @@ pub const DEFAULT_WARN_THRESHOLD: Duration = Duration::from_secs(30 * 24 * 60 * 
 
 /// All the data the verdict needs, fetched as one snapshot so the
 /// assessment is pure. `client_certificate_expiry == None` means the
-/// data layer found no recent `DpuNetworkStatus` row for this DPU.
+/// data layer found no `machines` row for this DPU, or its
+/// `network_status_observation` JSON had no `client_certificate_expiry`
+/// field.
 #[derive(Debug, Clone)]
 pub struct CertSnapshot {
     pub dpu_id: String,
     pub client_certificate_expiry: Option<DateTime<Utc>>,
 }
 
-/// Read-only seam over the cert data layer (`DpuNetworkStatus`). The
-/// real impl issues the canonical query against forgedb and degrades
-/// soft when the schema is absent (returns `None`); tests inject mocks.
+/// Read-only seam over the cert data layer
+/// (`machines.network_status_observation` JSON). The real impl issues
+/// the canonical query against forgedb and degrades soft when the
+/// schema is absent (returns `None`); tests inject mocks.
 #[async_trait]
 pub trait DpuCertClient: Send + Sync {
     async fn fetch_snapshot(&self, dpu_id: &str) -> Result<CertSnapshot>;
@@ -45,10 +51,10 @@ pub trait DpuCertClient: Send + Sync {
 
 /// Default sqlx-backed [`DpuCertClient`].
 ///
-/// Follows the same schema-probe-and-degrade pattern as
-/// [`crate::hbn::SqlxHbnClient`]: when `dpu_network_status` is absent
-/// (carbide drift, #213), every DPU reports `no-recent-status` rather
-/// than crashing.
+/// Reads the `client_certificate_expiry` field (i64 unix epoch secs)
+/// out of `machines.network_status_observation` JSON. Schema-probes the
+/// `machines` table first and degrades to `no-recent-status` when
+/// absent (e.g. dev cluster without forgedb).
 pub struct SqlxDpuCertClient {
     pool: sqlx::PgPool,
 }
@@ -68,7 +74,7 @@ impl DpuCertClient for SqlxDpuCertClient {
     async fn fetch_snapshot(&self, dpu_id: &str) -> Result<CertSnapshot> {
         let exists: (bool,) = sqlx::query_as(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-             WHERE table_name = 'dpu_network_status')",
+             WHERE table_name = 'machines')",
         )
         .fetch_one(&self.pool)
         .await
@@ -81,11 +87,10 @@ impl DpuCertClient for SqlxDpuCertClient {
             });
         }
 
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT s.client_certificate_expiry_unix_epoch_secs \
-             FROM dpu_network_status s \
-             WHERE s.dpu_id = $1 \
-             ORDER BY s.last_seen_at DESC \
+        let row: Option<(Option<i64>,)> = sqlx::query_as(
+            "SELECT (network_status_observation->>'client_certificate_expiry')::bigint \
+             FROM machines \
+             WHERE id = $1 \
              LIMIT 1",
         )
         .bind(dpu_id)
@@ -95,7 +100,9 @@ impl DpuCertClient for SqlxDpuCertClient {
 
         Ok(CertSnapshot {
             dpu_id: dpu_id.to_string(),
-            client_certificate_expiry: row.and_then(|(secs,)| DateTime::<Utc>::from_timestamp(secs, 0)),
+            client_certificate_expiry: row
+                .and_then(|(secs,)| secs)
+                .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0)),
         })
     }
 }
@@ -146,7 +153,7 @@ pub fn assemble_checks(dpu_id: &str, verdict: &CertVerdict) -> Vec<Check> {
     let (status, value, next_command) = match verdict {
         CertVerdict::NoRecentStatus => (
             Status::Unknown,
-            format!("dpu {dpu_id} cert: no recent DpuNetworkStatus to check"),
+            format!("dpu {dpu_id} cert: no recent network_status_observation to check"),
             Some(format!(
                 "nico correlate {dpu_id} # last activity for this DPU"
             )),
