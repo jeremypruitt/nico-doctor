@@ -105,8 +105,12 @@ pub fn render_block(state: &ProbeState, mode: RenderMode, frame: usize) -> Strin
 
     // Header
     let header_glyph = if mode.ascii { "[..]" } else { "◐" };
+    let type_segment = match &state.deployment_type {
+        Some(name) => format!("  ·  type: {} ({})", name, state.deployment_type_source),
+        None => "  ·  type: auto".to_string(),
+    };
     let header = format!(
-        "  {header_glyph} booting nico  ·  reach: {} ({})",
+        "  {header_glyph} booting nico  ·  reach: {} ({}){type_segment}",
         state.reach_mode, state.reach_source,
     );
     if mode.color {
@@ -360,6 +364,39 @@ mod tests {
         assert!(
             out.contains("reach: port-forward (auto)"),
             "expected reach mode in header, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_block_header_renders_resolved_deployment_type_with_source() {
+        let s = three_step_state()
+            .with_deployment_type(Some("rest-only-mock".into()), "flag");
+        let out = render_block(&s, RenderMode::plain(), 0);
+        assert!(
+            out.contains("type: rest-only-mock (flag)"),
+            "expected deployment-type tag with source paren in header, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_block_header_renders_auto_when_unresolved() {
+        // Default ProbeState (auto, unresolved) — banner shows `type: auto`.
+        let s = three_step_state();
+        let out = render_block(&s, RenderMode::plain(), 0);
+        assert!(
+            out.contains("type: auto"),
+            "expected `type: auto` for unresolved auto, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_block_header_renders_force_with_force_source() {
+        let s = three_step_state()
+            .with_deployment_type(Some("force".into()), "force");
+        let out = render_block(&s, RenderMode::plain(), 0);
+        assert!(
+            out.contains("type: force (force)"),
+            "expected `type: force (force)` for force mode, got:\n{out}"
         );
     }
 

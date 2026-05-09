@@ -6,7 +6,9 @@ use nico_common::boot_probe::{
     next_command_for, standard_steps, BootProbe, ProbeMode, ProbeOutcome, ProbeState, StderrSink,
     StepId, StepState,
 };
-use nico_common::config::{Config, ConfigOverrides, ColorMode, OutputFormat, ReachMode};
+use nico_common::config::{
+    Config, ConfigOverrides, ColorMode, DeploymentType, OutputFormat, ReachMode,
+};
 use nico_common::output::OutputMode;
 use nico_common::reach::ReachManager;
 
@@ -196,6 +198,7 @@ pub async fn bootstrap(args: &DoctorArgs) -> Result<Bootstrapped, BootstrapErr> 
         format: if args.json { Some(OutputFormat::Json) } else { None },
         reach_mode: mode_override,
         bootstrap_timeouts_spec: args.timeouts.clone(),
+        deployment_type_spec: args.deployment_type.clone(),
         ..Default::default()
     };
 
@@ -401,7 +404,11 @@ async fn run_boot_probe(
     };
 
     let steps = standard_steps(&config.cluster.namespace, &config.bootstrap.timeouts);
-    let probe_state = ProbeState::new(steps, reach_mode.as_str(), reach_source);
+    let probe_state = ProbeState::new(steps, reach_mode.as_str(), reach_source)
+        .with_deployment_type(
+            config.cluster.deployment_type.map(|d| d.label().to_string()),
+            config.cluster.deployment_type_source.label(),
+        );
     let mut probe = BootProbe::new(probe_state, probe_mode, Box::new(StderrSink));
     probe.start_ticking();
     let tracker = probe.tracker();
@@ -449,6 +456,7 @@ async fn run_boot_probe(
                 .skip_remaining(&[
                     StepId::ReachApiServer,
                     StepId::Credentials,
+                    StepId::DetectDeploymentType,
                     StepId::NamespaceExists,
                     StepId::Rbac,
                     StepId::PortForwardWorkflows,
@@ -505,6 +513,7 @@ async fn run_boot_probe(
         tracker
             .skip_remaining(&[
                 StepId::Credentials,
+                StepId::DetectDeploymentType,
                 StepId::NamespaceExists,
                 StepId::Rbac,
                 StepId::PortForwardWorkflows,
@@ -533,7 +542,13 @@ async fn run_boot_probe(
     );
 
     let (validating_ok, serving_results) = tokio::join!(
-        run_validating_section(&tracker, &pf, &ns, timeouts.preflight),
+        run_validating_section(
+            &tracker,
+            &pf,
+            &ns,
+            timeouts.preflight,
+            config.cluster.deployment_type,
+        ),
         run_serving_section(&tracker, &reach_mgr, config, timeouts.port_forward, timeouts.postgres_reach),
     );
 
@@ -580,6 +595,7 @@ async fn run_validating_section(
     pf: &preflight::KubePreflightClient,
     ns: &str,
     budget: Duration,
+    deployment_type: Option<DeploymentType>,
 ) -> bool {
     let cred_fut = run_step(
         tracker,
@@ -587,6 +603,13 @@ async fn run_validating_section(
         ns,
         budget,
         async { pf.check_token_valid().await },
+    );
+    let detect_fut = run_step(
+        tracker,
+        StepId::DetectDeploymentType,
+        ns,
+        budget,
+        async move { detect_deployment_type_step(deployment_type).await },
     );
     let ns_fut = run_step(
         tracker,
@@ -602,8 +625,28 @@ async fn run_validating_section(
         budget,
         async { pf.check_rbac(ns).await },
     );
-    let (cred_ok, ns_ok, rbac_ok) = tokio::join!(cred_fut, ns_fut, rbac_fut);
-    cred_ok && ns_ok && rbac_ok
+    let (cred_ok, detect_ok, ns_ok, rbac_ok) =
+        tokio::join!(cred_fut, detect_fut, ns_fut, rbac_fut);
+    cred_ok && detect_ok && ns_ok && rbac_ok
+}
+
+/// Slice 1 behavior of the `detect_deployment_type` step:
+///
+/// - `Some(_)` (resolved from CLI / env / file, including `Force`) →
+///   pass instantly. Capability re-pointing lands in slice 5.
+/// - `None` (auto, no detection ladder yet) → fail with the
+///   "no detection signals available" diagnostic. Slices 2–4 add the
+///   real signature probe / namespace inventory / CRD inventory.
+async fn detect_deployment_type_step(
+    deployment_type: Option<DeploymentType>,
+) -> anyhow::Result<()> {
+    if deployment_type.is_some() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "no detection signals available; pass --deployment-type=<full|core-only|rest-only-mock> or =force"
+        ))
+    }
 }
 
 async fn run_step<F>(
@@ -853,6 +896,41 @@ mod tests {
         assert_eq!(
             names,
             vec!["cluster", "logs", "workflows", "health", "grpc", "postgres", "dpu"]
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_step_passes_when_explicit_deployment_type_provided() {
+        for dt in [
+            DeploymentType::Full,
+            DeploymentType::CoreOnly,
+            DeploymentType::RestOnlyMock,
+            DeploymentType::Force,
+        ] {
+            assert!(
+                detect_deployment_type_step(Some(dt)).await.is_ok(),
+                "expected pass for {dt:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_step_fails_with_diagnostic_when_auto_and_no_signals() {
+        let err = detect_deployment_type_step(None)
+            .await
+            .expect_err("auto + no signals must fail in slice 1");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no detection signals available"),
+            "expected 'no detection signals available' diagnostic; got: {msg}"
+        );
+        assert!(
+            msg.contains("--deployment-type"),
+            "expected recovery hint mentioning --deployment-type; got: {msg}"
+        );
+        assert!(
+            msg.contains("force"),
+            "expected recovery hint mentioning force; got: {msg}"
         );
     }
 }

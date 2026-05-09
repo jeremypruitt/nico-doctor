@@ -18,6 +18,11 @@ pub enum StepId {
     LoadKubeconfig,
     ReachApiServer,
     Credentials,
+    /// Capability-based deployment-type detection (PRD-001 slice 1).
+    /// Sits between `Credentials` and `NamespaceExists` because the
+    /// latter needs the resolved namespace from the deployment-type's
+    /// capability bundle.
+    DetectDeploymentType,
     NamespaceExists,
     Rbac,
     PortForwardWorkflows,
@@ -35,6 +40,7 @@ impl StepId {
             Self::LoadKubeconfig => "kube_client",
             Self::ReachApiServer => "reachability",
             Self::Credentials => "token_expiry",
+            Self::DetectDeploymentType => "detect_deployment_type",
             Self::NamespaceExists => "namespace_exists",
             Self::Rbac => "rbac",
             Self::PortForwardWorkflows => "port_forward_workflows",
@@ -112,6 +118,12 @@ pub struct ProbeState {
     /// `◐ booting nico  ·  reach: <mode> (<source>)` line.
     pub reach_mode: String,
     pub reach_source: String,
+    /// Resolved deployment-type label for the banner's `type: …` segment
+    /// (PRD-001). `None` means `auto` and detection has not produced a
+    /// resolved type yet — the banner reads `type: auto`. `Some("full")`
+    /// + `deployment_type_source = "flag"` reads `type: full (flag)`.
+    pub deployment_type: Option<String>,
+    pub deployment_type_source: String,
     /// Total wall time elapsed since the probe started — used by the
     /// success receipt and the failure card.
     pub total_elapsed: Duration,
@@ -127,8 +139,23 @@ impl ProbeState {
             steps: steps.into_iter().map(|d| (d, StepState::Pending)).collect(),
             reach_mode: reach_mode.into(),
             reach_source: reach_source.into(),
+            deployment_type: None,
+            deployment_type_source: "auto".into(),
             total_elapsed: Duration::ZERO,
         }
+    }
+
+    /// Builder-style chain to populate the deployment-type banner tag.
+    /// Pass `Some(label)` for a resolved type and the source-tag string
+    /// (`auto | flag | config | force`).
+    pub fn with_deployment_type(
+        mut self,
+        deployment_type: Option<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        self.deployment_type = deployment_type;
+        self.deployment_type_source = source.into();
+        self
     }
 
     pub fn step_state(&self, id: StepId) -> Option<&StepState> {
@@ -187,6 +214,10 @@ mod tests {
         assert_eq!(StepId::LoadKubeconfig.technical_name(), "kube_client");
         assert_eq!(StepId::ReachApiServer.technical_name(), "reachability");
         assert_eq!(StepId::Credentials.technical_name(), "token_expiry");
+        assert_eq!(
+            StepId::DetectDeploymentType.technical_name(),
+            "detect_deployment_type"
+        );
         assert_eq!(StepId::NamespaceExists.technical_name(), "namespace_exists");
         assert_eq!(StepId::Rbac.technical_name(), "rbac");
         assert_eq!(
