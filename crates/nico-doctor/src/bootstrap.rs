@@ -411,7 +411,8 @@ async fn run_boot_probe(
         .with_deployment_type(
             config.cluster.deployment_type.map(|d| d.label().to_string()),
             config.cluster.deployment_type_source.label(),
-        );
+        )
+        .with_warnings(config.override_conflict_warnings());
     let mut probe = BootProbe::new(probe_state, probe_mode, Box::new(StderrSink));
     probe.start_ticking();
     let tracker = probe.tracker();
