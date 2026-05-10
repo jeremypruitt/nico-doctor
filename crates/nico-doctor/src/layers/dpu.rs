@@ -105,6 +105,12 @@ mod tests {
     }
 
     fn snap(dpu_id: &str) -> DpuSnapshot {
+        // Default: healthy across every axis. Tests override fields to
+        // drive a specific verdict. A cert expiry far in the future is
+        // required because `cert_verdict` returns `Unknown` for
+        // `None` ("no recent network_status_observation"), which would
+        // otherwise contaminate the layer aggregate in `Ok`-expecting
+        // tests.
         DpuSnapshot {
             dpu_id: dpu_id.into(),
             applied_managed_host_config_version: "v1".into(),
@@ -113,8 +119,13 @@ mod tests {
             desired_instance_network_config_version: "v1".into(),
             quarantine_state: None,
             last_seen_at: Utc::now(),
-            client_certificate_expiry: None,
+            client_certificate_expiry: Some(Utc::now() + ChronoDuration::days(365)),
             health_alerts: Vec::new(),
+            network_config_error: None,
+            hbn_version: String::new(),
+            bgp_alerts: Vec::new(),
+            extension_services_observed_at: None,
+            extension_services: Vec::new(),
         }
     }
 
@@ -126,41 +137,46 @@ mod tests {
         assert_eq!(result.status, Status::Ok);
     }
 
+    /// Per PRD-003 slice 6, quarantine is reduced through the shared
+    /// `isolation_verdict`, which classifies a quarantine-requested DPU
+    /// as `Fail` (not the old fleet-only `Warn` cap). The fleet rollup
+    /// now reports exactly what the per-DPU drill-down would.
     #[tokio::test]
-    async fn quarantined_only_yields_warn_layer_status() {
+    async fn quarantined_only_flips_isolation_axis_to_fail() {
         let mut s = snap("dpu-1");
         s.quarantine_state = Some("BlockAllTraffic".into());
         let layer = DpuLayer::new(StubClient::ok(vec![s]), DpuConfig::default());
         let result = layer.run(&RunOpts::default()).await;
-        assert_eq!(result.status, Status::Warn);
+        assert_eq!(result.status, Status::Fail);
+        assert!(result.checks.iter().any(|c| c.name == "dpu_isolation"
+            && c.kind == CheckKind::Headline
+            && c.status == Status::Fail));
     }
 
-    /// Issue acceptance: layer aggregate is worst-of children. Fail in
-    /// any sub-check → Fail layer regardless of other Warn sub-checks.
+    /// Layer aggregate is worst-of children. Drift on one DPU folds into
+    /// the `hbn` axis verdict (Fail); a separate DPU lost-connection
+    /// folds into `dpu_isolation` (Fail). Both per-axis headlines surface.
     #[tokio::test]
-    async fn mixed_subcheck_statuses_yield_worst_of_layer_status() {
+    async fn mixed_axis_statuses_yield_worst_of_layer_status() {
         let now = Utc::now();
-        // One DPU drifting > 60m (managed_host Fail), one quarantined (Warn).
         let mut drifter = snap("drifter");
         drifter.applied_managed_host_config_version = "v1".into();
         drifter.desired_managed_host_config_version = "v2".into();
-        drifter.last_seen_at = now - ChronoDuration::seconds(70 * 60);
-        let mut quar = snap("quar");
-        quar.quarantine_state = Some("BlockAllTraffic".into());
+        let mut silent = snap("silent");
+        silent.last_seen_at = now - ChronoDuration::seconds(300);
 
         let layer = DpuLayer::new(
-            StubClient::ok(vec![drifter, quar]),
+            StubClient::ok(vec![drifter, silent]),
             DpuConfig::default(),
         );
         let result = layer.run(&RunOpts::default()).await;
         assert_eq!(result.status, Status::Fail);
-        // Both sub-check headlines should be present.
-        assert!(result.checks.iter().any(|c| c.name == "drift-managed-host"
+        assert!(result.checks.iter().any(|c| c.name == "hbn"
             && c.kind == CheckKind::Headline
             && c.status == Status::Fail));
-        assert!(result.checks.iter().any(|c| c.name == "quarantine"
+        assert!(result.checks.iter().any(|c| c.name == "dpu_isolation"
             && c.kind == CheckKind::Headline
-            && c.status == Status::Warn));
+            && c.status == Status::Fail));
     }
 
     #[tokio::test]
