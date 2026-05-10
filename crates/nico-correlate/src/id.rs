@@ -49,7 +49,18 @@ pub fn detect_id_type(id: &str) -> Option<IdType> {
     if id.starts_with("req-") {
         return Some(IdType::Request);
     }
+    // Bare carbide-style machine IDs: long, no prefix, only [a-z0-9_-]
+    // (Crockford-base32 ULID-derived plus separators). machines.id is
+    // varchar(64) and observed values are in the ~26-58 char range.
+    // Both Host and DPU resolve to a `machines` row, so default to Host.
+    if id.len() >= 26 && id.chars().all(is_machine_id_char) {
+        return Some(IdType::Host);
+    }
     None
+}
+
+fn is_machine_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
 
 #[cfg(test)]
@@ -71,6 +82,29 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(detect_id_type(input), expected, "input: {input:?}");
         }
+    }
+
+    #[test]
+    fn bare_carbide_machine_id_detects_as_host() {
+        // Carbide stores both Hosts and DPUs in `machines.id` as bare
+        // ~58-char IDs with no prefix. Default detection should treat
+        // them as Host (the postgres source maps Host and Dpu to the
+        // same `machines` row anyway). Operators can still pin it to
+        // Dpu via `--type dpu`.
+        let id = "01HXP1ABCDEFGHJKMNPQRSTVWXYZ0123456789ABCDEFGHJKMNPQRSTVWX";
+        assert_eq!(detect_id_type(id), Some(IdType::Host));
+    }
+
+    #[test]
+    fn long_unknown_string_with_special_chars_is_not_host() {
+        assert_eq!(detect_id_type("not a machine id, has spaces"), None);
+        assert_eq!(detect_id_type("01HXP1!@#$%^&*()not_an_id_x_x_x_x_x_x_x"), None);
+    }
+
+    #[test]
+    fn short_unprefixed_string_is_not_detected() {
+        assert_eq!(detect_id_type("short"), None);
+        assert_eq!(detect_id_type("01HXP1ABC"), None);
     }
 
     #[test]

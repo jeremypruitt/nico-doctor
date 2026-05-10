@@ -135,8 +135,8 @@ fn is_undefined_table(e: &sqlx::Error) -> bool {
     }
 }
 
-async fn fetch_table_rows(pool: &sqlx::PgPool, table: &str, id_col: &str, id: &str) -> Result<Vec<PgRow>> {
-    // table and id_col are always internal constants, not user input.
+async fn fetch_entity_rows(pool: &sqlx::PgPool, table: &str, id_col: &str, id: &str) -> Result<Vec<PgRow>> {
+    // table and id_col come from entity_query_plan, never user input.
     let sql = format!("SELECT * FROM {table} WHERE {id_col} = $1 LIMIT 20");
     match sqlx::query(&sql).bind(id).fetch_all(pool).await {
         Ok(rows) => Ok(rows.iter().map(|r| sqlx_row_to_pg_row(r, table)).collect()),
@@ -145,18 +145,26 @@ async fn fetch_table_rows(pool: &sqlx::PgPool, table: &str, id_col: &str, id: &s
     }
 }
 
-async fn fetch_audit_events(pool: &sqlx::PgPool, entity_id: &str) -> Result<Vec<PgAuditEvent>> {
-    let sql = "SELECT ts, action, detail FROM audit_log \
-               WHERE entity_id = $1 ORDER BY ts DESC LIMIT 100";
-    match sqlx::query(sql).bind(entity_id).fetch_all(pool).await {
+async fn fetch_state_history_events(
+    pool: &sqlx::PgPool,
+    table: &str,
+    id_col: &str,
+    entity_id: &str,
+) -> Result<Vec<PgAuditEvent>> {
+    let sql = format!(
+        "SELECT timestamp, state_version FROM {table} \
+         WHERE {id_col} = $1 ORDER BY timestamp DESC LIMIT 100"
+    );
+    match sqlx::query(&sql).bind(entity_id).fetch_all(pool).await {
         Ok(rows) => {
             use sqlx::Row;
             Ok(rows
                 .iter()
-                .map(|r| PgAuditEvent {
-                    ts: r.try_get("ts").unwrap_or_else(|_| chrono::Utc::now()),
-                    action: r.try_get("action").unwrap_or_default(),
-                    detail: r.try_get("detail").unwrap_or_default(),
+                .map(|r| {
+                    let ts: chrono::DateTime<chrono::Utc> =
+                        r.try_get("timestamp").unwrap_or_else(|_| chrono::Utc::now());
+                    let state_version: String = r.try_get("state_version").unwrap_or_default();
+                    state_history_event(ts, &state_version)
                 })
                 .collect())
         }
@@ -168,15 +176,51 @@ async fn fetch_audit_events(pool: &sqlx::PgPool, entity_id: &str) -> Result<Vec<
 #[async_trait]
 impl PostgresClient for SqlxPostgresClient {
     async fn query_entity(&self, id: &str, id_type: &IdType) -> Result<PgEntityData> {
-        let mut rows = Vec::new();
-        match id_type {
-            IdType::Host => rows.extend(fetch_table_rows(&self.pool, "hosts", "id", id).await?),
-            IdType::Dpu => rows.extend(fetch_table_rows(&self.pool, "hosts", "dpu_id", id).await?),
-            IdType::Workflow => rows.extend(fetch_table_rows(&self.pool, "workflows", "id", id).await?),
-            IdType::Request => {}
-        }
-        let audit_events = fetch_audit_events(&self.pool, id).await?;
+        let rows = match entity_query_plan(id_type) {
+            Some((table, id_col)) => fetch_entity_rows(&self.pool, table, id_col, id).await?,
+            None => Vec::new(),
+        };
+        let audit_events = match audit_query_plan(id_type) {
+            Some((table, id_col)) => {
+                fetch_state_history_events(&self.pool, table, id_col, id).await?
+            }
+            None => Vec::new(),
+        };
         Ok(PgEntityData { rows, audit_events })
+    }
+}
+
+/// Map an `IdType` to the carbide table + ID column we should `SELECT *` from
+/// for entity rows. Returns `None` when the type has no row-level postgres
+/// representation (workflows live in Temporal; requests have no postgres
+/// landing table).
+///
+/// Carbide stores both Hosts and DPUs in `machines.id`, so they share a plan.
+pub fn entity_query_plan(id_type: &IdType) -> Option<(&'static str, &'static str)> {
+    match id_type {
+        IdType::Host | IdType::Dpu => Some(("machines", "id")),
+        IdType::Workflow | IdType::Request => None,
+    }
+}
+
+/// Map an `IdType` to the per-entity state-history table + ID column.
+/// Returns `None` for types that don't have a state-history table.
+pub fn audit_query_plan(id_type: &IdType) -> Option<(&'static str, &'static str)> {
+    match id_type {
+        IdType::Host | IdType::Dpu => Some(("machine_state_history", "machine_id")),
+        IdType::Workflow | IdType::Request => None,
+    }
+}
+
+/// Synthesize a `PgAuditEvent` from one `*_state_history` row. Carbide's
+/// state-history tables don't carry an `action`/`detail` pair — they capture
+/// full state snapshots — so we project each row to a `state_change` event
+/// labelled with its `state_version`.
+pub fn state_history_event(ts: DateTime<Utc>, state_version: &str) -> PgAuditEvent {
+    PgAuditEvent {
+        ts,
+        action: "state_change".into(),
+        detail: format!("state_version {state_version}"),
     }
 }
 
@@ -212,29 +256,67 @@ mod tests {
         Utc.timestamp_opt(secs, 0).unwrap()
     }
 
+    #[test]
+    fn entity_query_plan_host_and_dpu_target_machines() {
+        assert_eq!(entity_query_plan(&IdType::Host), Some(("machines", "id")));
+        assert_eq!(entity_query_plan(&IdType::Dpu), Some(("machines", "id")));
+    }
+
+    #[test]
+    fn entity_query_plan_workflow_and_request_have_no_table() {
+        assert_eq!(entity_query_plan(&IdType::Workflow), None);
+        assert_eq!(entity_query_plan(&IdType::Request), None);
+    }
+
+    #[test]
+    fn audit_query_plan_host_and_dpu_use_machine_state_history() {
+        let plan = audit_query_plan(&IdType::Host);
+        assert_eq!(plan, Some(("machine_state_history", "machine_id")));
+        assert_eq!(
+            audit_query_plan(&IdType::Dpu),
+            Some(("machine_state_history", "machine_id"))
+        );
+    }
+
+    #[test]
+    fn audit_query_plan_workflow_and_request_have_no_table() {
+        assert_eq!(audit_query_plan(&IdType::Workflow), None);
+        assert_eq!(audit_query_plan(&IdType::Request), None);
+    }
+
+    #[test]
+    fn state_history_event_renders_state_change() {
+        let e = state_history_event(ts(1700000000), "v42");
+        assert_eq!(e.ts, ts(1700000000));
+        assert_eq!(e.action, "state_change");
+        assert_eq!(e.detail, "state_version v42");
+    }
+
     #[tokio::test]
-    async fn host_row_becomes_state_entries() {
+    async fn machines_row_becomes_state_entries() {
         let data = PgEntityData {
             rows: vec![PgRow {
-                table: "hosts".into(),
+                table: "machines".into(),
                 columns: vec![
-                    ("id".into(), "host-r12u5".into()),
-                    ("status".into(), "ready".into()),
+                    ("id".into(), "01HXP1ABCDEFGHJKMNPQRSTVWX".into()),
+                    ("dpu_mode".into(), "true".into()),
                 ],
             }],
             audit_events: vec![],
         };
         let source = PostgresSource::new(Box::new(FakePostgresClient::ok(data)));
-        let result = source.collect("host-r12u5", &IdType::Host).await;
+        let result = source
+            .collect("01HXP1ABCDEFGHJKMNPQRSTVWX", &IdType::Host)
+            .await;
         let output = match result {
             SourceResult::Output(o) => o,
             _ => panic!("expected Output"),
         };
         assert_eq!(output.state.len(), 2);
-        assert_eq!(output.state[0].key, "hosts.id");
-        assert_eq!(output.state[0].value, "host-r12u5");
-        assert_eq!(output.state[1].key, "hosts.status");
-        assert_eq!(output.state[1].value, "ready");
+        assert_eq!(output.state[0].key, "machines.id");
+        assert_eq!(output.state[0].value, "01HXP1ABCDEFGHJKMNPQRSTVWX");
+        assert_eq!(output.state[1].key, "machines.dpu_mode");
+        assert_eq!(output.state[1].value, "true");
         assert!(output.events.is_empty());
     }
 
@@ -295,15 +377,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_rows_become_workflow_state_entries() {
+    async fn workflow_id_returns_no_postgres_state() {
+        // Carbide has no `workflows` table — workflows live in Temporal.
+        // The adapter must still produce a clean (empty) Output rather
+        // than failing the source.
         let data = PgEntityData {
-            rows: vec![PgRow {
-                table: "workflows".into(),
-                columns: vec![
-                    ("id".into(), "hp-abc".into()),
-                    ("status".into(), "running".into()),
-                ],
-            }],
+            rows: vec![],
             audit_events: vec![],
         };
         let source = PostgresSource::new(Box::new(FakePostgresClient::ok(data)));
@@ -311,11 +390,7 @@ mod tests {
             SourceResult::Output(o) => o,
             _ => panic!("expected Output"),
         };
-        assert_eq!(output.state.len(), 2);
-        assert_eq!(output.state[0].key, "workflows.id");
-        assert_eq!(output.state[0].value, "hp-abc");
-        assert_eq!(output.state[1].key, "workflows.status");
-        assert_eq!(output.state[1].value, "running");
+        assert!(output.state.is_empty());
         assert!(output.events.is_empty());
     }
 
@@ -336,23 +411,23 @@ mod tests {
         let data = PgEntityData {
             rows: vec![
                 PgRow {
-                    table: "hosts".into(),
-                    columns: vec![("id".into(), "host-r12u5".into()), ("rack".into(), "r12".into())],
+                    table: "machines".into(),
+                    columns: vec![("id".into(), "01HXP1ABC".into()), ("rack".into(), "r12".into())],
                 },
                 PgRow {
-                    table: "hosts".into(),
-                    columns: vec![("id".into(), "host-r13u5".into()), ("rack".into(), "r13".into())],
+                    table: "machines".into(),
+                    columns: vec![("id".into(), "01HXP1DEF".into()), ("rack".into(), "r13".into())],
                 },
             ],
             audit_events: vec![],
         };
         let source = PostgresSource::new(Box::new(FakePostgresClient::ok(data)));
-        let output = match source.collect("host-r12u5", &IdType::Host).await {
+        let output = match source.collect("01HXP1ABC", &IdType::Host).await {
             SourceResult::Output(o) => o,
             _ => panic!("expected Output"),
         };
         assert_eq!(output.state.len(), 4);
-        assert!(output.state.iter().all(|s| s.key.starts_with("hosts.")));
+        assert!(output.state.iter().all(|s| s.key.starts_with("machines.")));
     }
 
     #[tokio::test]
@@ -387,7 +462,9 @@ mod tests {
             .await
             .expect("connect with NICO_POSTGRES_URL");
         // Does not panic; Ok or Err both accepted (schema may differ per environment).
-        let _ = client.query_entity("host-r12u5", &IdType::Host).await;
-        let _ = client.query_entity("dpu-bf3-r12u5", &IdType::Dpu).await;
+        // Bare carbide-style machine ID, used for both Host and DPU lookups.
+        let machine_id = "01HXP1ABCDEFGHJKMNPQRSTVWX";
+        let _ = client.query_entity(machine_id, &IdType::Host).await;
+        let _ = client.query_entity(machine_id, &IdType::Dpu).await;
     }
 }
