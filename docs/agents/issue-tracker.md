@@ -80,9 +80,20 @@ Score → band mapping (matches priority-score skill bands):
 
 ### Auto-maintenance workflow
 
-`.github/workflows/project-automation.yml` has a `priority` job that fires on `projects_v2_item.edited`. When the Score field changes, it derives the band, updates the Priority single-select, and applies the band label (removing the others). Manual edits to Priority or label are **not reverted** — they stick until the next Score change. This lets a human override the derived band temporarily while keeping Score as the canonical numeric anchor.
+`.github/workflows/project-automation.yml` has a `priority-reconcile` job that runs on a 15-minute cron (and on `workflow_dispatch` for manual runs). Each pass scans every open issue on project 1, derives the band from Score, and updates Priority single-select + label if either has drifted. The job is idempotent — items already in the correct state are not written.
+
+**Write paths:**
+
+1. **Claude writes the trio inline** (Score + Priority field + band label) at scoring time. Instant correctness.
+2. **Cron reconciles drift** from manual board edits to Score that bypass Claude. Lag = up to 15 min.
+
+**Why cron and not events:** GitHub does not deliver `projects_v2_item` events to repo workflows when the project is user-owned (only org-owned projects fire these events). An earlier event-driven design failed silently for this reason; cron is the only path that works for board-side Score edits.
+
+**Override path:** to temporarily set Priority/label to a band that disagrees with Score, write all three deliberately (Score per the math, Priority + label per the override). The next cron pass will revert the override since Score is the source of truth — if the override should stick, the underlying Score must be updated to match.
 
 Field IDs are baked into the workflow `env:` block (Score, Priority, plus the five Priority option IDs). Re-resolve via the same GraphQL query used for Status field IDs (see §"Project board automation") if the project is rebuilt.
+
+**Manual reconciliation:** `gh workflow run project-automation.yml` triggers an immediate reconciliation pass without waiting for the next cron tick.
 
 ### When scoring happens
 

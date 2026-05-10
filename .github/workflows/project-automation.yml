@@ -10,8 +10,13 @@ on:
     types: [opened, labeled, closed, reopened]
   pull_request:
     types: [opened, ready_for_review, converted_to_draft, closed, reopened]
-  projects_v2_item:
-    types: [edited]
+  schedule:
+    # Reconcile Score → Priority + label every 15 minutes. Catches manual
+    # board edits to Score that bypass Claude's inline writes. user-owned
+    # ProjectsV2 doesn't fire `projects_v2_item` events to repo workflows
+    # so this is the only path for board-side edits to propagate.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -36,7 +41,7 @@ env:
 
 jobs:
   sync:
-    if: github.event_name != 'projects_v2_item'
+    if: github.event_name == 'issues' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.PROJECT_PAT }}
@@ -157,116 +162,118 @@ jobs:
             echo "synced $CID → $STATE"
           done
 
-  priority:
-    # Fires on Score field changes; derives band, sets Priority single-select +
-    # band label. Manual edits to Priority/label stick until Score changes again.
-    if: github.event_name == 'projects_v2_item' && github.event.action == 'edited'
+  priority-reconcile:
+    # Periodic reconciliation: derives band from Score and writes Priority
+    # single-select + band label for every open issue. Catches manual board
+    # edits that bypass Claude's inline writes. Idempotent — items already
+    # in the correct state are skipped (no API write).
+    #
+    # User-owned ProjectsV2 doesn't deliver `projects_v2_item` events to
+    # repo workflows, so cron is the only path for Score-on-board edits to
+    # propagate. Lag = up to 15 min; acceptable for a manual workflow where
+    # Claude writes the trio inline at scoring time.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.PROJECT_PAT }}
     steps:
-      - name: Filter to Score field changes
-        id: filter
-        env:
-          CHANGED_FIELD_ID: ${{ github.event.changes.field_value.field_node_id }}
-        run: |
-          set -euo pipefail
-          if [[ "$CHANGED_FIELD_ID" != "$SCORE_FIELD_ID" ]]; then
-            echo "field-change is not Score (was $CHANGED_FIELD_ID); skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Read item, derive band, propagate
-        if: steps.filter.outputs.skip == 'false'
-        env:
-          ITEM_NODE_ID: ${{ github.event.projects_v2_item.node_id }}
+      - name: Reconcile Score → Priority + label across all open issues
         run: |
           set -euo pipefail
 
-          # Read current Score value + linked issue (if content is an Issue).
-          PAYLOAD=$(gh api graphql \
-            -f query='query($id: ID!, $field: ID!) {
-              node(id: $id) {
-                ... on ProjectV2Item {
-                  content {
-                    __typename
-                    ... on Issue { number repository { nameWithOwner } }
-                  }
-                  fieldValueByName(name: "Score") {
-                    ... on ProjectV2ItemFieldNumberValue { number }
+          # Paginate through every project item; collect open Issues with Score set.
+          : > /tmp/work.tsv
+          AFTER=""
+          while :; do
+            ARGS=(-f query='
+              query($after: String) {
+                user(login: "jeremypruitt") {
+                  projectV2(number: 1) {
+                    items(first: 100, after: $after) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        id
+                        content {
+                          __typename
+                          ... on Issue {
+                            number
+                            state
+                            repository { nameWithOwner }
+                            labels(first: 50) { nodes { name } }
+                          }
+                        }
+                        score: fieldValueByName(name: "Score") {
+                          ... on ProjectV2ItemFieldNumberValue { number }
+                        }
+                        priority: fieldValueByName(name: "Priority") {
+                          ... on ProjectV2ItemFieldSingleSelectValue { optionId }
+                        }
+                      }
+                    }
                   }
                 }
-              }
-            }' \
-            -F id="$ITEM_NODE_ID" \
-            -F field="$SCORE_FIELD_ID")
+              }')
+            if [[ -n "$AFTER" ]]; then ARGS+=(-F after="$AFTER"); fi
+            PAYLOAD=$(gh api graphql "${ARGS[@]}")
 
-          TYPENAME=$(echo "$PAYLOAD" | jq -r '.data.node.content.__typename')
-          if [[ "$TYPENAME" != "Issue" ]]; then
-            echo "content is $TYPENAME (not Issue); skipping label propagation"
-            exit 0
-          fi
+            echo "$PAYLOAD" | jq -r '.data.user.projectV2.items.nodes[]
+              | select(.content.__typename == "Issue"
+                       and .content.state == "OPEN"
+                       and .score.number != null)
+              | [
+                  .id,
+                  (.content.number|tostring),
+                  .content.repository.nameWithOwner,
+                  (.score.number|tostring),
+                  (.priority.optionId // ""),
+                  ([.content.labels.nodes[].name]
+                    | map(select(. == "crit" or . == "top" or . == "high" or . == "med" or . == "low"))
+                    | sort | join(","))
+                ] | @tsv' >> /tmp/work.tsv
 
-          ISSUE_NUMBER=$(echo "$PAYLOAD" | jq -r '.data.node.content.number')
-          REPO=$(echo "$PAYLOAD" | jq -r '.data.node.content.repository.nameWithOwner')
-          SCORE=$(echo "$PAYLOAD" | jq -r '.data.node.fieldValueByName.number // empty')
-
-          # Score cleared → strip band label + clear Priority field.
-          if [[ -z "$SCORE" ]]; then
-            echo "Score cleared on #$ISSUE_NUMBER; removing band labels + Priority field"
-            for LABEL in crit top high med low; do
-              gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label "$LABEL" 2>/dev/null || true
-            done
-            gh api graphql \
-              -f query='mutation($project: ID!, $item: ID!, $field: ID!) {
-                clearProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field}) {
-                  projectV2Item { id }
-                }
-              }' \
-              -F project="$PROJECT_ID" \
-              -F item="$ITEM_NODE_ID" \
-              -F field="$PRIORITY_FIELD_ID" > /dev/null
-            exit 0
-          fi
-
-          # Clamp + derive band.
-          SCORE_INT=$(printf '%.0f' "$SCORE")
-          if (( SCORE_INT > 100 )); then SCORE_INT=100; fi
-          if (( SCORE_INT < 1 )); then SCORE_INT=1; fi
-
-          if   (( SCORE_INT >= 50 )); then BAND="crit"; OPT="$PRIORITY_OPT_CRIT"
-          elif (( SCORE_INT >= 25 )); then BAND="top";  OPT="$PRIORITY_OPT_TOP"
-          elif (( SCORE_INT >= 13 )); then BAND="high"; OPT="$PRIORITY_OPT_HIGH"
-          elif (( SCORE_INT >= 5  )); then BAND="med";  OPT="$PRIORITY_OPT_MED"
-          else                            BAND="low";  OPT="$PRIORITY_OPT_LOW"
-          fi
-
-          echo "Score=$SCORE_INT → band=$BAND on #$ISSUE_NUMBER"
-
-          # Update Priority single-select.
-          gh api graphql \
-            -f query='mutation($project: ID!, $item: ID!, $field: ID!, $value: String!) {
-              updateProjectV2ItemFieldValue(input: {
-                projectId: $project,
-                itemId: $item,
-                fieldId: $field,
-                value: { singleSelectOptionId: $value }
-              }) {
-                projectV2Item { id }
-              }
-            }' \
-            -F project="$PROJECT_ID" \
-            -F item="$ITEM_NODE_ID" \
-            -F field="$PRIORITY_FIELD_ID" \
-            -F value="$OPT" > /dev/null
-
-          # Add the band label, remove the others.
-          REMOVE=""
-          for L in crit top high med low; do
-            if [[ "$L" != "$BAND" ]]; then
-              REMOVE+="${REMOVE:+,}$L"
-            fi
+            HAS_NEXT=$(echo "$PAYLOAD" | jq -r '.data.user.projectV2.items.pageInfo.hasNextPage')
+            [[ "$HAS_NEXT" == "true" ]] || break
+            AFTER=$(echo "$PAYLOAD" | jq -r '.data.user.projectV2.items.pageInfo.endCursor')
           done
-          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label "$BAND" --remove-label "$REMOVE"
+
+          TOTAL=$(wc -l < /tmp/work.tsv)
+          DRIFT=0
+          while IFS=$'\t' read -r ITEM_ID NUM REPO SCORE CUR_OPT CUR_BAND_LABELS; do
+            SCORE_INT=$(printf '%.0f' "$SCORE")
+            if (( SCORE_INT > 100 )); then SCORE_INT=100; fi
+            if (( SCORE_INT < 1 )); then SCORE_INT=1; fi
+
+            if   (( SCORE_INT >= 50 )); then BAND="crit"; OPT="$PRIORITY_OPT_CRIT"
+            elif (( SCORE_INT >= 25 )); then BAND="top";  OPT="$PRIORITY_OPT_TOP"
+            elif (( SCORE_INT >= 13 )); then BAND="high"; OPT="$PRIORITY_OPT_HIGH"
+            elif (( SCORE_INT >= 5  )); then BAND="med";  OPT="$PRIORITY_OPT_MED"
+            else                            BAND="low";  OPT="$PRIORITY_OPT_LOW"
+            fi
+
+            CHANGED=0
+            if [[ "$CUR_OPT" != "$OPT" ]]; then
+              gh api graphql -f query='
+                mutation($p: ID!, $i: ID!, $f: ID!, $v: String!) {
+                  updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, fieldId: $f, value: {singleSelectOptionId: $v}}) {
+                    projectV2Item { id }
+                  }
+                }' -F p="$PROJECT_ID" -F i="$ITEM_ID" -F f="$PRIORITY_FIELD_ID" -F v="$OPT" >/dev/null
+              CHANGED=1
+            fi
+
+            if [[ "$CUR_BAND_LABELS" != "$BAND" ]]; then
+              REMOVE=""
+              for L in crit top high med low; do
+                [[ "$L" != "$BAND" ]] && REMOVE+="${REMOVE:+,}$L"
+              done
+              gh issue edit "$NUM" --repo "$REPO" --add-label "$BAND" --remove-label "$REMOVE" >/dev/null 2>&1 || true
+              CHANGED=1
+            fi
+
+            if (( CHANGED )); then
+              DRIFT=$((DRIFT + 1))
+              echo "reconciled #$NUM score=$SCORE_INT → $BAND"
+            fi
+          done < /tmp/work.tsv
+
+          echo "Reconciled $DRIFT of $TOTAL scored items"

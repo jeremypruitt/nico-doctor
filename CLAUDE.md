@@ -14,9 +14,16 @@ Default label vocabulary (needs-triage, needs-info, ready-for-agent, ready-for-h
 
 ### Priority scoring
 
-Every issue carries a 1-100 priority score in the project board's **Score** number field. Score is set by Claude (autonomous mode of `/priority-score`) at issue creation; project automation derives the band label (`crit`/`top`/`high`/`med`/`low`) and the Priority single-select field automatically when Score changes. Manual edits to label or Priority field stick until next Score change. See `docs/agents/issue-tracker.md` §"Priority scoring".
+Every issue carries a 1-100 priority score in the project board's **Score** number field. Score is the source of truth; the **Priority** single-select field and the band label (`crit`/`top`/`high`/`med`/`low`) are derived. See `docs/agents/issue-tracker.md` §"Priority scoring".
 
-**When filing any GitHub issue:** run `/priority-score` (autonomous mode), include the one-liner rationale in the body's `## Priority` section between Acceptance criteria and Blocked by, and set the Score project field via `gh api graphql`. Do not write the band label or Priority field directly — let the workflow propagate. Override path: if you judge a score band wrong despite the math, set Score per the math AND write Priority + label directly with a chat callout explaining why; the override sticks until next re-scoring.
+**Two write paths keep them in sync:**
+
+1. **Claude writes all three inline** at scoring time (Score + Priority field + label). Instant correctness; no waiting on cron.
+2. **Cron reconciliation** every 15 min (workflow `priority-reconcile` job) scans every open issue, derives the expected band from Score, and fixes Priority/label if drifted. This catches manual board edits to Score that bypass Claude.
+
+GitHub does not deliver `projects_v2_item` events to repo workflows for user-owned ProjectsV2, which is why the cron pattern (rather than event-driven) is the safety net.
+
+**When filing any GitHub issue:** run `/priority-score` (autonomous mode), include the one-liner rationale in the body's `## Priority` section between Acceptance criteria and Blocked by, and write **all three** — Score project field + Priority single-select + band label — in the same scoring step. Override path: if you judge a band wrong despite the math, write Score per the math AND deliberately set Priority + label to the desired band; the next cron pass will revert the override unless the underlying Score is updated. Note overrides explicitly in chat so the user can re-score if the override should stick.
 
 ### Domain docs
 
