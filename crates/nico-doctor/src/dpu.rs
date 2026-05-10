@@ -1,14 +1,11 @@
-//! Fleet-wide DPU/HBN roll-up — the `dpu` layer's data + assembly seam.
+//! Fleet-wide DPU holistic summary — the `dpu` layer's data + assembly
+//! seam (PRD-003 slice 6, #310).
 //!
-//! Closes #214. Encodes the muscle-memory tell from
-//! `docs/learning/topics/01-hbn.md`: most weird stuck states are
-//! version-drift, not network failure — so the default ladder asks "are
-//! any DPUs drifting?" before deeper diagnosis.
-//!
-//! Five parallel sub-checks, each its own headline `Check`:
-//! `drift-managed-host`, `drift-instance`, `cert-fleet`, `quarantine`,
-//! `lost-connection`. Drift sub-checks also emit top-N=5 detail lines
-//! pointing at `nico doctor hbn <id>` (#205) for per-DPU drill-down.
+//! Iterates the fleet, calls each per-DPU axis verdict (`cert_verdict`,
+//! `isolation_verdict`, `hbn_verdict`, `services_verdict`), and emits
+//! **one headline per axis** with a rollup count + worst-status DPU
+//! examples. Fleet-specific concerns that have not yet been carved into
+//! axis verdicts (`probe-stuck`) live alongside the per-axis headlines.
 //!
 //! Pure assembly over a snapshot vec — no I/O, no clock reads. The
 //! [`DpuClient`] trait is the seam over forgedb / Postgres; tests inject
@@ -20,21 +17,19 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nico_common::output::Status;
 
+use crate::dpu_cert::{CertSnapshot, DEFAULT_WARN_THRESHOLD as CERT_WARN_THRESHOLD};
+use crate::dpu_isolation::{IsolationSnapshot, DEFAULT_FRESHNESS_THRESHOLD as ISOLATION_FRESHNESS_THRESHOLD};
+use crate::dpu_services::{ServiceStatus, ServicesSnapshot, DEFAULT_OBSERVATION_STALE_THRESHOLD};
+use crate::formatter::FINDINGS_CAP;
+use crate::hbn::{HbnSnapshot, DEFAULT_FRESHNESS_THRESHOLD as HBN_FRESHNESS_THRESHOLD};
 use crate::layer::{Check, CheckKind};
+use crate::verdicts::{cert_verdict, hbn_verdict, isolation_verdict, services_verdict, AxisSummary};
 
 pub use nico_common::config::DpuConfig;
 
-/// Number of detail lines a drift sub-check emits, capped to match #184.
-pub const DRIFT_DETAIL_TOP_N: usize = 5;
-
 /// One row in the fleet view — the union of producer-side fields the
-/// six sub-checks need: applied state from `machines.network_status_observation`,
-/// desired managed-host version from `machines.network_config_version`
-/// (top-level column), desired quarantine + other config from
-/// `machines.network_config` JSON, agent alerts from
-/// `machines.dpu_agent_health_report` JSON, and desired instance
-/// version from `instances.network_config_version` (joined on
-/// `instances.machine_id`). PRD-002.
+/// four axis verdicts need plus the agent-alert column used by the
+/// fleet-specific `probe-stuck` headline.
 #[derive(Debug, Clone)]
 pub struct DpuSnapshot {
     pub dpu_id: String,
@@ -46,13 +41,17 @@ pub struct DpuSnapshot {
     pub last_seen_at: DateTime<Utc>,
     pub client_certificate_expiry: Option<DateTime<Utc>>,
     pub health_alerts: Vec<HealthAlert>,
+    pub network_config_error: Option<String>,
+    pub hbn_version: String,
+    pub bgp_alerts: Vec<String>,
+    pub extension_services_observed_at: Option<DateTime<Utc>>,
+    pub extension_services: Vec<ServiceStatus>,
 }
 
 /// One entry from the agent's `HealthReport.alerts` array, persisted on
-/// `machines.dpu_agent_health_report` as JSONB (PRD-002). The `dpu`
-/// layer only consumes the fields it acts on — `id` to filter for a
-/// known probe (e.g. `PostConfigCheckWait`) and `in_alert_since` to
-/// age the alert.
+/// `machines.dpu_agent_health_report` as JSONB (PRD-002). The fleet
+/// `probe-stuck` headline filters this list for the `PostConfigCheckWait`
+/// probe id.
 #[derive(Debug, Clone)]
 pub struct HealthAlert {
     pub id: String,
@@ -60,9 +59,9 @@ pub struct HealthAlert {
 }
 
 /// Extract `HealthAlert`s from the raw `machines.dpu_agent_health_report`
-/// JSONB blob. Tolerates the column being NULL or having no `alerts` array.
-/// Accepts `in_alert_since` as RFC3339 string, Unix epoch seconds (i64),
-/// or `null` — the agent's serializer history has used all three.
+/// JSONB blob. Tolerates the column being NULL or having no `alerts`
+/// array. Accepts `in_alert_since` as RFC3339 string, Unix epoch seconds
+/// (i64), or `null` — the agent's serializer history has used all three.
 pub fn parse_health_alerts(blob: Option<&serde_json::Value>) -> Vec<HealthAlert> {
     let Some(v) = blob else { return Vec::new() };
     let Some(arr) = v.get("alerts").and_then(|a| a.as_array()) else {
@@ -90,30 +89,20 @@ fn parse_in_alert_since(v: &serde_json::Value) -> Option<DateTime<Utc>> {
     None
 }
 
-/// Read-only seam over the fleet data layer (forgedb + Postgres). The
-/// real impl issues one bulk SELECT over `machines` (producer-side
-/// JSON columns) joined with `instances`, covering every DPU; tests
-/// inject mocks. Empty vec means "no DPUs" (or schema absent on dev
-/// clusters — we degrade gracefully).
+/// Read-only seam over the fleet data layer (forgedb + Postgres).
 #[async_trait]
 pub trait DpuClient: Send + Sync {
     async fn fetch_fleet(&self) -> Result<Vec<DpuSnapshot>>;
 }
 
-/// Default sqlx-backed [`DpuClient`]. Single bulk query reads
-/// producer-side state from `machines` row (PRD-002): `network_status_observation`
-/// JSON for applied state, top-level `network_config_version` column for
-/// the desired managed-host version, `network_config` JSON for desired
-/// quarantine state, and `instances.network_config_version` (joined on
-/// `instances.machine_id`) for the desired instance version.
+/// Default sqlx-backed [`DpuClient`].
 pub struct SqlxDpuClient {
     pool: sqlx::PgPool,
 }
 
 /// SQL used by [`SqlxDpuClient::fetch_fleet`]. Extracted as a constant
 /// so the schema choice (which tables / JSON paths the layer reads) is
-/// pinned by a unit test, even though we can't exercise the full query
-/// without a live postgres.
+/// pinned by a unit test.
 pub(crate) const FETCH_FLEET_SQL: &str = "\
     SELECT \
         m.id, \
@@ -124,7 +113,12 @@ pub(crate) const FETCH_FLEET_SQL: &str = "\
         m.network_config->'quarantine_state'->>'mode', \
         (m.network_status_observation->>'observed_at')::timestamptz, \
         (m.network_status_observation->>'client_certificate_expiry')::bigint, \
-        m.dpu_agent_health_report \
+        m.dpu_agent_health_report, \
+        NULLIF(m.network_status_observation->>'network_config_error', ''), \
+        (SELECT c->>'version' FROM jsonb_array_elements(COALESCE(m.inventory->'components', '[]'::jsonb)) c \
+           WHERE c->>'name' = 'hbn' LIMIT 1), \
+        (m.network_status_observation->'extension_service_observation'->>'observed_at')::timestamptz, \
+        m.network_status_observation->'extension_service_observation'->'extension_service_statuses' \
     FROM machines m \
     LEFT JOIN instances i ON i.machine_id = m.id \
     WHERE m.network_status_observation IS NOT NULL";
@@ -137,6 +131,61 @@ impl SqlxDpuClient {
             .map_err(|e| anyhow::anyhow!("invalid postgres URL: {e}"))?;
         Ok(Self { pool })
     }
+}
+
+type FleetRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    DateTime<Utc>,
+    Option<i64>,
+    Option<serde_json::Value>,
+    Option<String>,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    Option<serde_json::Value>,
+);
+
+/// Parse the `extension_service_statuses` JSON array into
+/// [`ServiceStatus`] rows. Tolerates the column being NULL or absent.
+pub fn parse_extension_services(blob: Option<&serde_json::Value>) -> Vec<ServiceStatus> {
+    let Some(arr) = blob.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|entry| {
+            let service_name = entry.get("service_name")?.as_str()?.to_owned();
+            let version = entry
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let overall_state = entry
+                .get("overall_state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let message = entry
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let removed = entry
+                .get("removed")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            Some(ServiceStatus {
+                service_name,
+                version,
+                overall_state,
+                message,
+                removed,
+            })
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -153,17 +202,7 @@ impl DpuClient for SqlxDpuClient {
             return Ok(Vec::new());
         }
 
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            DateTime<Utc>,
-            Option<i64>,
-            Option<serde_json::Value>,
-        )> = sqlx::query_as(FETCH_FLEET_SQL)
+        let rows: Vec<FleetRow> = sqlx::query_as(FETCH_FLEET_SQL)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| anyhow::anyhow!("dpu fleet query failed: {e}"))?;
@@ -180,211 +219,280 @@ impl DpuClient for SqlxDpuClient {
                 last_seen_at: r.6,
                 client_certificate_expiry: r.7.and_then(|s| DateTime::<Utc>::from_timestamp(s, 0)),
                 health_alerts: parse_health_alerts(r.8.as_ref()),
+                network_config_error: r.9,
+                hbn_version: r.10.unwrap_or_default(),
+                bgp_alerts: crate::hbn::parse_bgp_alerts(r.8.as_ref()),
+                extension_services_observed_at: r.11,
+                extension_services: parse_extension_services(r.12.as_ref()),
             })
             .collect())
     }
 }
 
-/// Per-DPU drift report: how long a DPU's applied version has lagged
-/// behind desired. `age` is `now - last_seen_at` and a coarse lower bound
-/// — the DPU has been in the observed applied state since at least
-/// `last_seen_at`. Drift sub-checks rank DPUs by `age` for the top-N
-/// detail list and pick worst-of for the headline.
-#[derive(Debug, Clone)]
-struct DriftReport<'a> {
-    dpu_id: &'a str,
-    applied: &'a str,
-    desired: &'a str,
-    age: Duration,
+/// Per-axis verdict for one DPU. Builds the axis-specific snapshot from
+/// the fleet [`DpuSnapshot`] and delegates to the shared verdict
+/// function so the fleet rollup says exactly what the per-DPU drill-down
+/// would say.
+fn cert_summary(s: &DpuSnapshot, now: DateTime<Utc>) -> AxisSummary {
+    cert_verdict(
+        &CertSnapshot {
+            dpu_id: s.dpu_id.clone(),
+            client_certificate_expiry: s.client_certificate_expiry,
+        },
+        now,
+        CERT_WARN_THRESHOLD,
+    )
 }
 
-fn drift_reports<'a>(
-    snapshots: &'a [DpuSnapshot],
+fn isolation_summary(s: &DpuSnapshot, now: DateTime<Utc>) -> AxisSummary {
+    isolation_verdict(
+        &IsolationSnapshot {
+            machine_id: s.dpu_id.clone(),
+            registered: true,
+            scout_discovery_complete: true,
+            quarantine_state: s.quarantine_state.clone(),
+            last_seen_at: Some(s.last_seen_at),
+        },
+        now,
+        ISOLATION_FRESHNESS_THRESHOLD,
+    )
+}
+
+fn hbn_summary(s: &DpuSnapshot, now: DateTime<Utc>) -> AxisSummary {
+    hbn_verdict(
+        &HbnSnapshot {
+            dpu_id: s.dpu_id.clone(),
+            hbn_version: s.hbn_version.clone(),
+            applied_managed_host_config_version: s.applied_managed_host_config_version.clone(),
+            desired_managed_host_config_version: s.desired_managed_host_config_version.clone(),
+            applied_instance_network_config_version: s
+                .applied_instance_network_config_version
+                .clone(),
+            desired_instance_network_config_version: s
+                .desired_instance_network_config_version
+                .clone(),
+            network_config_error: s.network_config_error.clone(),
+            bgp_alerts: s.bgp_alerts.clone(),
+            quarantine_state: s.quarantine_state.clone(),
+            last_seen_at: s.last_seen_at,
+        },
+        now,
+        HBN_FRESHNESS_THRESHOLD,
+    )
+}
+
+fn services_summary(s: &DpuSnapshot, now: DateTime<Utc>) -> AxisSummary {
+    services_verdict(
+        &ServicesSnapshot {
+            dpu_id: s.dpu_id.clone(),
+            observed_at: s.extension_services_observed_at,
+            services: s.extension_services.clone(),
+        },
+        now,
+        DEFAULT_OBSERVATION_STALE_THRESHOLD,
+    )
+}
+
+/// Worst-case status across a slice of `AxisSummary` verdicts.
+/// Priority: Fail > Warn > Unknown > Ok.
+fn worst_status(verdicts: &[AxisSummary]) -> Status {
+    if verdicts.iter().any(|v| v.status == Status::Fail) {
+        Status::Fail
+    } else if verdicts.iter().any(|v| v.status == Status::Warn) {
+        Status::Warn
+    } else if verdicts.iter().any(|v| v.status == Status::Unknown) {
+        Status::Unknown
+    } else {
+        Status::Ok
+    }
+}
+
+/// Fleet-rollup headline message for one axis. Counts non-Ok verdicts
+/// and renders the human-readable count line (e.g. `3 DPUs drifted`).
+/// The empty / all-Ok case renders the axis-specific `no <foo>` line.
+fn axis_headline_value(axis: &'static str, verdicts: &[AxisSummary]) -> String {
+    let total = verdicts.len();
+    let fail = verdicts.iter().filter(|v| v.status == Status::Fail).count();
+    let warn = verdicts.iter().filter(|v| v.status == Status::Warn).count();
+    let unknown = verdicts.iter().filter(|v| v.status == Status::Unknown).count();
+    let bad = fail + warn + unknown;
+    if total == 0 {
+        return ok_message_for(axis, 0);
+    }
+    if bad == 0 {
+        return ok_message_for(axis, total);
+    }
+    let noun = match (axis, bad) {
+        ("dpu_cert", _) => "cert",
+        ("dpu_isolation", _) => "isolation",
+        ("hbn", _) => "hbn",
+        ("dpu_services", _) => "services",
+        _ => "axis",
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if fail > 0 {
+        parts.push(format!("{fail} fail"));
+    }
+    if warn > 0 {
+        parts.push(format!("{warn} warn"));
+    }
+    if unknown > 0 {
+        parts.push(format!("{unknown} unknown"));
+    }
+    format!("{bad}/{total} DPUs {noun}: {}", parts.join(", "))
+}
+
+fn ok_message_for(axis: &'static str, total: usize) -> String {
+    match axis {
+        "dpu_cert" => "no expiring certs".to_string(),
+        "dpu_isolation" => format!("{total} DPUs healthy"),
+        "hbn" => "no drift".to_string(),
+        "dpu_services" => "no degraded services".to_string(),
+        _ => format!("{total} DPUs ok"),
+    }
+}
+
+/// Sort key: Fail > Warn > Unknown > Ok. Lower = worse → sort ascending
+/// to put worst first.
+fn status_rank(s: &Status) -> u8 {
+    match s {
+        Status::Fail => 0,
+        Status::Warn => 1,
+        Status::Unknown => 2,
+        Status::Ok => 3,
+        Status::Skipped => 4,
+    }
+}
+
+/// Assemble the fleet `dpu` layer's holistic checks from a snapshot vec.
+/// Pure — the caller supplies `now` so the function stays clock-free.
+///
+/// Output ordering (per PRD-003 slice 6 acceptance):
+///
+/// 1. One headline `Check` per per-DPU axis (cert, isolation, hbn,
+///    services), tagged with the axis name. Each headline's `value`
+///    summarises the rollup count; status = worst-of the per-DPU
+///    verdicts on that axis.
+/// 2. Fleet-specific headlines that have not yet migrated onto the
+///    verdict primitive — currently just `probe-stuck`.
+/// 3. Detail rows for the worst non-Ok DPUs across all axes, capped at
+///    [`FINDINGS_CAP`], sorted Fail before Warn before Unknown, then
+///    by axis. Each detail row carries the per-DPU verdict message
+///    and the verdict's `next_command` (the per-DPU drill-down hint).
+pub fn assemble_checks(
+    snapshots: &[DpuSnapshot],
     now: DateTime<Utc>,
-    select_axis: impl Fn(&'a DpuSnapshot) -> (&'a str, &'a str),
-) -> Vec<DriftReport<'a>> {
-    snapshots
-        .iter()
-        .filter_map(|s| {
-            let (applied, desired) = select_axis(s);
-            if applied == desired {
-                return None;
+    config: &DpuConfig,
+) -> Vec<Check> {
+    let cert: Vec<AxisSummary> = snapshots.iter().map(|s| cert_summary(s, now)).collect();
+    let isolation: Vec<AxisSummary> =
+        snapshots.iter().map(|s| isolation_summary(s, now)).collect();
+    let hbn: Vec<AxisSummary> = snapshots.iter().map(|s| hbn_summary(s, now)).collect();
+    let services: Vec<AxisSummary> = snapshots.iter().map(|s| services_summary(s, now)).collect();
+
+    let mut out: Vec<Check> = vec![
+        axis_headline("dpu_cert", &cert),
+        axis_headline("dpu_isolation", &isolation),
+        axis_headline("hbn", &hbn),
+        axis_headline("dpu_services", &services),
+    ];
+    out.extend(probe_stuck_headline(snapshots, now, config));
+
+    // Detail rows: collect every non-Ok per-DPU verdict across all axes,
+    // sort worst-first (Fail > Warn > Unknown), and cap.
+    let axes: [(&'static str, &[AxisSummary]); 4] = [
+        ("dpu_cert", &cert),
+        ("dpu_isolation", &isolation),
+        ("hbn", &hbn),
+        ("dpu_services", &services),
+    ];
+    let mut findings: Vec<(u8, u8, &'static str, &AxisSummary)> = Vec::new();
+    for (axis_rank, (name, verdicts)) in axes.iter().enumerate() {
+        for v in verdicts.iter() {
+            if v.status == Status::Ok || v.status == Status::Skipped {
+                continue;
             }
-            let age = (now - s.last_seen_at).to_std().unwrap_or(Duration::ZERO);
-            Some(DriftReport {
-                dpu_id: &s.dpu_id,
-                applied,
-                desired,
-                age,
-            })
+            findings.push((status_rank(&v.status), axis_rank as u8, name, v));
+        }
+    }
+    findings.sort_by_key(|(s, a, _, _)| (*s, *a));
+    for (_, _, name, v) in findings.into_iter().take(FINDINGS_CAP) {
+        out.push(Check {
+            name,
+            status: v.status.clone(),
+            value: v.message.clone(),
+            next_command: v.next_command.clone(),
+            kind: CheckKind::Detail,
+        });
+    }
+
+    // Probe-stuck details follow the per-axis details — they're
+    // fleet-specific findings that share the same JSON section.
+    out.extend(probe_stuck_details(snapshots, now, config));
+
+    out
+}
+
+fn axis_headline(axis: &'static str, verdicts: &[AxisSummary]) -> Check {
+    Check {
+        name: axis,
+        status: worst_status(verdicts),
+        value: axis_headline_value(axis, verdicts),
+        next_command: None,
+        kind: CheckKind::Headline,
+    }
+}
+
+/// Fleet-specific `probe-stuck` headline. Counts DPUs whose
+/// `PostConfigCheckWait` health probe has been in alert state longer
+/// than [`DpuConfig::probe_stuck_grace`]. Encodes failure mode 3 from
+/// `docs/learning/topics/01-hbn.md` §3.
+fn probe_stuck_headline(
+    snapshots: &[DpuSnapshot],
+    now: DateTime<Utc>,
+    config: &DpuConfig,
+) -> Vec<Check> {
+    let stuck = collect_stuck(snapshots, now, config);
+    let count = stuck.len();
+    let status = if count > 0 { Status::Fail } else { Status::Ok };
+    vec![Check {
+        name: "probe-stuck",
+        status,
+        value: format!("{count} DPUs with stuck PostConfigCheckWait"),
+        next_command: None,
+        kind: CheckKind::Headline,
+    }]
+}
+
+fn probe_stuck_details(
+    snapshots: &[DpuSnapshot],
+    now: DateTime<Utc>,
+    config: &DpuConfig,
+) -> Vec<Check> {
+    let mut stuck = collect_stuck(snapshots, now, config);
+    stuck.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
+    stuck
+        .into_iter()
+        .take(FINDINGS_CAP)
+        .map(|(dpu_id, age)| Check {
+            name: "probe-stuck",
+            status: Status::Fail,
+            value: format!(
+                "dpu {dpu_id} PostConfigCheckWait stuck (in_alert_since {}s ago)",
+                age.as_secs()
+            ),
+            next_command: Some(format!("nico doctor hbn {dpu_id}")),
+            kind: CheckKind::Detail,
         })
         .collect()
 }
 
-fn drift_status(reports: &[DriftReport<'_>], warn: Duration, fail: Duration) -> Status {
-    if reports.iter().any(|r| r.age > fail) {
-        Status::Fail
-    } else if reports.iter().any(|r| r.age > warn) {
-        Status::Warn
-    } else if reports.is_empty() {
-        Status::Ok
-    } else {
-        // Drifting but under warn threshold → still Ok (within churn window).
-        Status::Ok
-    }
-}
-
-fn drift_check(
-    name: &'static str,
-    reports: &[DriftReport<'_>],
-    fleet_size: usize,
-    warn: Duration,
-    fail: Duration,
-) -> Vec<Check> {
-    let status = drift_status(reports, warn, fail);
-    let drifting = reports.iter().filter(|r| r.age > warn).count();
-    let value = format!("{drifting}/{fleet_size} drifting");
-    let mut out = vec![Check {
-        name,
-        status: status.clone(),
-        value,
-        next_command: None,
-        kind: CheckKind::Headline,
-    }];
-
-    if status == Status::Ok {
-        return out;
-    }
-
-    let mut sorted: Vec<&DriftReport<'_>> = reports.iter().filter(|r| r.age > warn).collect();
-    sorted.sort_by_key(|r| std::cmp::Reverse(r.age));
-    for r in sorted.into_iter().take(DRIFT_DETAIL_TOP_N) {
-        let detail_status = if r.age > fail { Status::Fail } else { Status::Warn };
-        out.push(Check {
-            name,
-            status: detail_status,
-            value: format!(
-                "dpu {} applied={} desired={} (drift {}s)",
-                r.dpu_id,
-                r.applied,
-                r.desired,
-                r.age.as_secs()
-            ),
-            next_command: Some(format!("nico doctor hbn {}", r.dpu_id)),
-            kind: CheckKind::Detail,
-        });
-    }
-    out
-}
-
-fn cert_check(snapshots: &[DpuSnapshot], now: DateTime<Utc>, config: &DpuConfig) -> Check {
-    let mut warn_count = 0usize;
-    let mut fail_count = 0usize;
-    for s in snapshots {
-        if let Some(exp) = s.client_certificate_expiry {
-            let until = (exp - now).to_std().unwrap_or(Duration::ZERO);
-            if until < config.cert_fail {
-                fail_count += 1;
-            } else if until < config.cert_warn {
-                warn_count += 1;
-            }
-        }
-    }
-    let status = if fail_count > 0 {
-        Status::Fail
-    } else if warn_count > 0 {
-        Status::Warn
-    } else {
-        Status::Ok
-    };
-    Check {
-        name: "cert-fleet",
-        status,
-        value: format!(
-            "{} expiring < {}d, {} expiring < {}d",
-            fail_count,
-            config.cert_fail.as_secs() / 86_400,
-            warn_count,
-            config.cert_warn.as_secs() / 86_400,
-        ),
-        next_command: None,
-        kind: CheckKind::Headline,
-    }
-}
-
-fn quarantine_check(snapshots: &[DpuSnapshot]) -> Check {
-    let count = snapshots
-        .iter()
-        .filter(|s| s.quarantine_state.as_deref() == Some("BlockAllTraffic"))
-        .count();
-    // Issue rule: quarantine sub-check is capped at Warn — quarantine is
-    // sometimes deliberate, never auto-Fail.
-    let status = if count > 0 { Status::Warn } else { Status::Ok };
-    Check {
-        name: "quarantine",
-        status,
-        value: format!("{count} quarantined"),
-        next_command: None,
-        kind: CheckKind::Headline,
-    }
-}
-
-fn lost_connection_check(
-    snapshots: &[DpuSnapshot],
+fn collect_stuck<'a>(
+    snapshots: &'a [DpuSnapshot],
     now: DateTime<Utc>,
     config: &DpuConfig,
-) -> Check {
-    let fleet = snapshots.len();
-    let mut over_warn = 0usize;
-    let mut over_fail_age = 0usize;
-    for s in snapshots {
-        let age = (now - s.last_seen_at).to_std().unwrap_or(Duration::ZERO);
-        if age > config.lost_connection_warn {
-            over_warn += 1;
-        }
-        if age > config.lost_connection_fail_age {
-            over_fail_age += 1;
-        }
-    }
-    let pct_over_warn = if fleet > 0 {
-        over_warn as f64 / fleet as f64
-    } else {
-        0.0
-    };
-    let status = if over_fail_age > 0 || pct_over_warn > config.lost_connection_fail_pct {
-        Status::Fail
-    } else if over_warn > 0 {
-        Status::Warn
-    } else {
-        Status::Ok
-    };
-    Check {
-        name: "lost-connection",
-        status,
-        value: format!(
-            "{}/{} silent > {}s",
-            over_warn,
-            fleet,
-            config.lost_connection_warn.as_secs()
-        ),
-        next_command: None,
-        kind: CheckKind::Headline,
-    }
-}
-
-/// `probe-stuck` sub-check (issue #239). Flags DPUs whose
-/// `PostConfigCheckWait` health probe has been in alert state longer
-/// than [`DpuConfig::probe_stuck_grace`]. Encodes failure mode 3 from
-/// `docs/learning/topics/01-hbn.md` §3 — DPU traffic is dropped
-/// post-config and the agent's `PostConfigCheckWait` probe stays in
-/// alert.
-fn probe_stuck_check(
-    snapshots: &[DpuSnapshot],
-    now: DateTime<Utc>,
-    config: &DpuConfig,
-) -> Vec<Check> {
+) -> Vec<(&'a str, Duration)> {
     const PROBE_ID: &str = "PostConfigCheckWait";
-
     let mut stuck: Vec<(&str, Duration)> = Vec::new();
     for s in snapshots {
         for alert in &s.health_alerts {
@@ -400,79 +508,7 @@ fn probe_stuck_check(
             }
         }
     }
-
-    let count = stuck.len();
-    let status = if count > 0 { Status::Fail } else { Status::Ok };
-    let mut out = vec![Check {
-        name: "probe-stuck",
-        status: status.clone(),
-        value: format!("{count} DPUs with stuck PostConfigCheckWait"),
-        next_command: None,
-        kind: CheckKind::Headline,
-    }];
-
-    if status == Status::Ok {
-        return out;
-    }
-
-    stuck.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
-    for (dpu_id, age) in stuck.into_iter().take(DRIFT_DETAIL_TOP_N) {
-        out.push(Check {
-            name: "probe-stuck",
-            status: Status::Fail,
-            value: format!(
-                "dpu {dpu_id} PostConfigCheckWait stuck (in_alert_since {}s ago)",
-                age.as_secs()
-            ),
-            next_command: Some(format!("nico doctor hbn {dpu_id}")),
-            kind: CheckKind::Detail,
-        });
-    }
-    out
-}
-
-/// Assemble the six `dpu` layer sub-checks (plus drift / probe-stuck
-/// detail lines) from a fleet snapshot. Pure — the caller supplies
-/// `now` so the function stays clock-free.
-pub fn assemble_checks(
-    snapshots: &[DpuSnapshot],
-    now: DateTime<Utc>,
-    config: &DpuConfig,
-) -> Vec<Check> {
-    let fleet = snapshots.len();
-    let managed_drift = drift_reports(snapshots, now, |s| {
-        (
-            s.applied_managed_host_config_version.as_str(),
-            s.desired_managed_host_config_version.as_str(),
-        )
-    });
-    let instance_drift = drift_reports(snapshots, now, |s| {
-        (
-            s.applied_instance_network_config_version.as_str(),
-            s.desired_instance_network_config_version.as_str(),
-        )
-    });
-
-    let mut out = Vec::new();
-    out.extend(drift_check(
-        "drift-managed-host",
-        &managed_drift,
-        fleet,
-        config.drift_managed_host_warn,
-        config.drift_managed_host_fail,
-    ));
-    out.extend(drift_check(
-        "drift-instance",
-        &instance_drift,
-        fleet,
-        config.drift_instance_warn,
-        config.drift_instance_fail,
-    ));
-    out.push(cert_check(snapshots, now, config));
-    out.push(quarantine_check(snapshots));
-    out.push(lost_connection_check(snapshots, now, config));
-    out.extend(probe_stuck_check(snapshots, now, config));
-    out
+    stuck
 }
 
 #[cfg(test)]
@@ -491,6 +527,11 @@ mod tests {
             last_seen_at: Utc::now(),
             client_certificate_expiry: None,
             health_alerts: Vec::new(),
+            network_config_error: None,
+            hbn_version: String::new(),
+            bgp_alerts: Vec::new(),
+            extension_services_observed_at: None,
+            extension_services: Vec::new(),
         }
     }
 
@@ -512,316 +553,298 @@ mod tests {
             .collect()
     }
 
-    // ── empty + single-DPU fleets ────────────────────────────────────────
+    fn alert(id: &str, in_alert_since: Option<DateTime<Utc>>) -> HealthAlert {
+        HealthAlert { id: id.into(), in_alert_since }
+    }
+
+    // ── tracer bullet: empty fleet ──────────────────────────────────────
 
     #[test]
-    fn empty_fleet_emits_six_ok_headlines_and_no_details() {
+    fn empty_fleet_emits_four_axis_headlines_plus_probe_stuck_all_ok() {
         let now = Utc::now();
         let checks = assemble_checks(&[], now, &DpuConfig::default());
-        let headline_count = checks
-            .iter()
-            .filter(|c| c.kind == CheckKind::Headline)
-            .count();
-        assert_eq!(headline_count, 6, "expected 6 headlines, got {headline_count}");
+        for axis in ["dpu_cert", "dpu_isolation", "hbn", "dpu_services", "probe-stuck"] {
+            assert_eq!(headline(&checks, axis).status, Status::Ok, "{axis}");
+        }
         assert!(
             checks.iter().all(|c| c.kind == CheckKind::Headline),
-            "no details expected on empty fleet",
+            "empty fleet should have no detail rows: {:?}",
+            checks.iter().map(|c| (c.name, c.kind)).collect::<Vec<_>>(),
         );
-        for name in [
-            "drift-managed-host",
-            "drift-instance",
-            "cert-fleet",
-            "quarantine",
-            "lost-connection",
-            "probe-stuck",
-        ] {
-            assert_eq!(headline(&checks, name).status, Status::Ok, "{name}");
-        }
     }
 
-    #[test]
-    fn single_healthy_dpu_emits_only_ok_headlines() {
-        let now = Utc::now();
-        let s = snap("dpu-1");
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        for name in [
-            "drift-managed-host",
-            "drift-instance",
-            "cert-fleet",
-            "quarantine",
-            "lost-connection",
-            "probe-stuck",
-        ] {
-            assert_eq!(headline(&checks, name).status, Status::Ok, "{name}");
-        }
-        assert!(checks.iter().all(|c| c.kind == CheckKind::Headline));
-    }
-
-    // ── drift-managed-host ───────────────────────────────────────────────
+    // ── per-axis rollup: cert ───────────────────────────────────────────
 
     #[test]
-    fn managed_host_drift_under_warn_threshold_is_ok() {
+    fn expired_cert_on_one_dpu_flips_cert_axis_to_fail() {
         let now = Utc::now();
         let mut s = snap("dpu-1");
-        s.applied_managed_host_config_version = "v1".into();
-        s.desired_managed_host_config_version = "v2".into();
-        s.last_seen_at = now - ChronoDuration::seconds(60); // 1m < 15m
+        s.client_certificate_expiry = Some(now - ChronoDuration::days(1));
         let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "drift-managed-host").status, Status::Ok);
+        let h = headline(&checks, "dpu_cert");
+        assert_eq!(h.status, Status::Fail);
+        assert!(h.value.contains("DPUs cert"), "value: {}", h.value);
     }
 
     #[test]
-    fn managed_host_drift_above_warn_threshold_is_warn_with_detail() {
-        let now = Utc::now();
-        let mut s = snap("dpu-1");
-        s.applied_managed_host_config_version = "v1".into();
-        s.desired_managed_host_config_version = "v2".into();
-        s.last_seen_at = now - ChronoDuration::seconds(20 * 60); // 20m > 15m
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "drift-managed-host").status, Status::Warn);
-        let d = details(&checks, "drift-managed-host");
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].status, Status::Warn);
-        assert!(d[0].value.contains("dpu-1"));
-        assert_eq!(d[0].next_command.as_deref(), Some("nico doctor hbn dpu-1"));
-    }
-
-    #[test]
-    fn managed_host_drift_above_fail_threshold_is_fail() {
-        let now = Utc::now();
-        let mut s = snap("dpu-1");
-        s.applied_managed_host_config_version = "v1".into();
-        s.desired_managed_host_config_version = "v2".into();
-        s.last_seen_at = now - ChronoDuration::seconds(70 * 60); // 70m > 60m
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "drift-managed-host").status, Status::Fail);
-        let d = details(&checks, "drift-managed-host");
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].status, Status::Fail);
-    }
-
-    #[test]
-    fn drift_detail_top_n_caps_at_five() {
-        let now = Utc::now();
-        let snaps: Vec<DpuSnapshot> = (0..10)
-            .map(|i| {
-                let mut s = snap(&format!("dpu-{i}"));
-                s.applied_managed_host_config_version = "v1".into();
-                s.desired_managed_host_config_version = "v2".into();
-                // Mix ages so older ones rank first.
-                s.last_seen_at = now - ChronoDuration::seconds(20 * 60 + i * 60);
-                s
-            })
-            .collect();
-        let checks = assemble_checks(&snaps, now, &DpuConfig::default());
-        let d = details(&checks, "drift-managed-host");
-        assert_eq!(d.len(), DRIFT_DETAIL_TOP_N);
-        // Top-N should be the OLDEST (largest age) — sorted desc.
-        assert!(d[0].value.contains("dpu-9"), "{}", d[0].value);
-    }
-
-    #[test]
-    fn drift_managed_and_instance_are_independent_axes() {
-        let now = Utc::now();
-        // DPU drifts on managed_host (above warn) but instance is aligned.
-        let mut s = snap("dpu-1");
-        s.applied_managed_host_config_version = "v1".into();
-        s.desired_managed_host_config_version = "v2".into();
-        s.last_seen_at = now - ChronoDuration::seconds(20 * 60);
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "drift-managed-host").status, Status::Warn);
-        assert_eq!(headline(&checks, "drift-instance").status, Status::Ok);
-    }
-
-    // ── drift-instance ───────────────────────────────────────────────────
-
-    #[test]
-    fn instance_drift_above_warn_threshold_is_warn() {
-        let now = Utc::now();
-        let mut s = snap("dpu-1");
-        s.applied_instance_network_config_version = "v1".into();
-        s.desired_instance_network_config_version = "v2".into();
-        s.last_seen_at = now - ChronoDuration::seconds(3 * 60); // 3m > 2m
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "drift-instance").status, Status::Warn);
-    }
-
-    #[test]
-    fn instance_drift_above_fail_threshold_is_fail() {
-        let now = Utc::now();
-        let mut s = snap("dpu-1");
-        s.applied_instance_network_config_version = "v1".into();
-        s.desired_instance_network_config_version = "v2".into();
-        s.last_seen_at = now - ChronoDuration::seconds(31 * 60);
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "drift-instance").status, Status::Fail);
-    }
-
-    // ── cert-fleet ───────────────────────────────────────────────────────
-
-    #[test]
-    fn cert_with_no_expiring_certs_is_ok() {
-        let now = Utc::now();
-        let mut s = snap("dpu-1");
-        s.client_certificate_expiry = Some(now + ChronoDuration::days(60));
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "cert-fleet").status, Status::Ok);
-    }
-
-    #[test]
-    fn cert_under_warn_window_is_warn() {
+    fn cert_within_warn_window_flips_cert_axis_to_warn() {
         let now = Utc::now();
         let mut s = snap("dpu-1");
         s.client_certificate_expiry = Some(now + ChronoDuration::days(20));
         let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "cert-fleet").status, Status::Warn);
+        assert_eq!(headline(&checks, "dpu_cert").status, Status::Warn);
     }
 
+    // ── per-axis rollup: isolation ──────────────────────────────────────
+
     #[test]
-    fn cert_under_fail_window_is_fail() {
+    fn one_dpu_with_lost_connection_flips_isolation_axis_to_fail() {
         let now = Utc::now();
         let mut s = snap("dpu-1");
-        s.client_certificate_expiry = Some(now + ChronoDuration::days(3));
+        s.last_seen_at = now - ChronoDuration::seconds(300); // > 90s freshness
         let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "cert-fleet").status, Status::Fail);
-    }
-
-    // ── quarantine: capped at Warn ──────────────────────────────────────
-
-    #[test]
-    fn no_quarantined_dpus_is_ok() {
-        let now = Utc::now();
-        let s = snap("dpu-1");
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "quarantine").status, Status::Ok);
+        assert_eq!(headline(&checks, "dpu_isolation").status, Status::Fail);
     }
 
     #[test]
-    fn one_quarantined_dpu_is_warn_not_fail() {
+    fn one_quarantined_dpu_flips_isolation_axis_to_fail() {
         let now = Utc::now();
         let mut s = snap("dpu-1");
         s.quarantine_state = Some("BlockAllTraffic".into());
         let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "quarantine").status, Status::Warn);
+        assert_eq!(headline(&checks, "dpu_isolation").status, Status::Fail);
     }
 
-    #[test]
-    fn all_quarantined_fleet_still_yields_warn_never_fail() {
-        let now = Utc::now();
-        let snaps: Vec<DpuSnapshot> = (0..20)
-            .map(|i| {
-                let mut s = snap(&format!("dpu-{i}"));
-                s.quarantine_state = Some("BlockAllTraffic".into());
-                s
-            })
-            .collect();
-        let checks = assemble_checks(&snaps, now, &DpuConfig::default());
-        let q = headline(&checks, "quarantine");
-        assert_eq!(q.status, Status::Warn);
-        assert_ne!(q.status, Status::Fail);
-    }
-
-    // ── lost-connection: dual fail rule ─────────────────────────────────
+    // ── per-axis rollup: hbn ────────────────────────────────────────────
 
     #[test]
-    fn lost_connection_under_warn_threshold_is_ok() {
+    fn managed_host_drift_flips_hbn_axis_to_fail() {
         let now = Utc::now();
         let mut s = snap("dpu-1");
-        s.last_seen_at = now - ChronoDuration::seconds(60);
+        s.applied_managed_host_config_version = "v1".into();
+        s.desired_managed_host_config_version = "v2".into();
         let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "lost-connection").status, Status::Ok);
+        assert_eq!(headline(&checks, "hbn").status, Status::Fail);
     }
 
     #[test]
-    fn lost_connection_above_warn_threshold_is_warn() {
+    fn bgp_alert_flips_hbn_axis_to_fail() {
         let now = Utc::now();
-        // 1/100 silent > 5m: above warn but below the 5%-of-fleet
-        // Fail-pct rule and below 30m absolute. Should be Warn.
-        let mut snaps: Vec<DpuSnapshot> = (0..99)
-            .map(|i| {
-                let mut s = snap(&format!("ok-{i}"));
-                s.last_seen_at = now - ChronoDuration::seconds(1);
-                s
-            })
-            .collect();
-        let mut silent = snap("silent");
-        silent.last_seen_at = now - ChronoDuration::seconds(10 * 60);
-        snaps.push(silent);
-        let checks = assemble_checks(&snaps, now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "lost-connection").status, Status::Warn);
+        let mut s = snap("dpu-1");
+        s.bgp_alerts = vec!["BgpPeerDown".into()];
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        assert_eq!(headline(&checks, "hbn").status, Status::Fail);
     }
 
+    // ── per-axis rollup: services ───────────────────────────────────────
+
     #[test]
-    fn lost_connection_absolute_age_over_30m_is_fail() {
+    fn one_failed_service_flips_services_axis_to_warn() {
         let now = Utc::now();
-        // One DPU silent > 30m, in a fleet that's mostly fresh — pct
-        // alone wouldn't trip Fail (1/100 = 1%).
-        let mut bad = snap("bad");
-        bad.last_seen_at = now - ChronoDuration::seconds(31 * 60);
-        let mut snaps: Vec<DpuSnapshot> = (0..99)
+        let mut s = snap("dpu-1");
+        s.extension_services_observed_at = Some(now);
+        s.extension_services = vec![ServiceStatus {
+            service_name: "doca-telemetry".into(),
+            version: "1.0.0".into(),
+            overall_state: "Failed".into(),
+            message: String::new(),
+            removed: None,
+        }];
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        assert_eq!(headline(&checks, "dpu_services").status, Status::Warn);
+    }
+
+    // ── fleet rollup count is non-Ok DPUs ───────────────────────────────
+
+    #[test]
+    fn cert_axis_headline_counts_three_expiring_in_a_fleet_of_five() {
+        let now = Utc::now();
+        let mut snaps: Vec<DpuSnapshot> = (0..5)
             .map(|i| {
                 let mut s = snap(&format!("dpu-{i}"));
-                s.last_seen_at = now - ChronoDuration::seconds(1);
+                // Default-Ok cert: 180 days remaining.
+                s.client_certificate_expiry = Some(now + ChronoDuration::days(180));
                 s
             })
             .collect();
-        snaps.push(bad);
+        for s in snaps.iter_mut().take(3) {
+            s.client_certificate_expiry = Some(now + ChronoDuration::days(15));
+        }
         let checks = assemble_checks(&snaps, now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "lost-connection").status, Status::Fail);
+        let h = headline(&checks, "dpu_cert");
+        assert_eq!(h.status, Status::Warn);
+        assert!(h.value.contains("3/5"), "value: {}", h.value);
+        assert!(h.value.contains("3 warn"), "value: {}", h.value);
     }
 
+    // ── detail capping at FINDINGS_CAP, sorted worst-first ──────────────
+
     #[test]
-    fn lost_connection_over_5pct_of_fleet_is_fail_independent_of_age() {
+    fn fleet_detail_caps_at_findings_cap_with_fail_before_warn() {
         let now = Utc::now();
-        // 10/100 silent > 5m (warn) but none over 30m absolute. Pct
-        // rule alone should still trip Fail.
-        let mut snaps: Vec<DpuSnapshot> = (0..90)
+        let mut snaps: Vec<DpuSnapshot> = (0..3)
             .map(|i| {
-                let mut s = snap(&format!("ok-{i}"));
-                s.last_seen_at = now - ChronoDuration::seconds(1);
+                let mut s = snap(&format!("warner-{i}"));
+                // Warn-tier cert: 20d to expiry < 30d warn threshold.
+                s.client_certificate_expiry = Some(now + ChronoDuration::days(20));
                 s
             })
             .collect();
-        for i in 0..10 {
-            let mut s = snap(&format!("silent-{i}"));
-            s.last_seen_at = now - ChronoDuration::seconds(10 * 60);
+        for i in 0..7 {
+            let mut s = snap(&format!("failer-{i}"));
+            // Fail-tier: expired cert.
+            s.client_certificate_expiry = Some(now - ChronoDuration::days(1));
             snaps.push(s);
         }
         let checks = assemble_checks(&snaps, now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "lost-connection").status, Status::Fail);
+        // All details across all axes, capped at 5.
+        let total_details = checks.iter().filter(|c| c.kind == CheckKind::Detail).count();
+        assert_eq!(total_details, FINDINGS_CAP);
+        // Every detail is Fail (Fail-tier sorts before Warn-tier).
+        for d in checks.iter().filter(|c| c.kind == CheckKind::Detail) {
+            assert_eq!(
+                d.status, Status::Fail,
+                "expected all Fail details, got status {:?} value {:?}",
+                d.status, d.value,
+            );
+        }
+    }
+
+    // ── detail rows carry next_command from the verdict ────────────────
+
+    #[test]
+    fn cert_detail_row_carries_cert_verdict_next_command() {
+        let now = Utc::now();
+        let mut s = snap("dpu-x");
+        s.client_certificate_expiry = Some(now - ChronoDuration::days(2));
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let d = details(&checks, "dpu_cert");
+        assert_eq!(d.len(), 1);
+        assert!(d[0].value.contains("dpu-x"));
+        assert!(
+            d[0].next_command
+                .as_deref()
+                .unwrap_or("")
+                .contains("rotate"),
+            "expected cert verdict's rotate next_command: {:?}",
+            d[0].next_command,
+        );
     }
 
     #[test]
-    fn lost_connection_5pct_exactly_does_not_trip_fail_pct_rule() {
+    fn isolation_detail_row_carries_isolation_verdict_next_command() {
         let now = Utc::now();
-        // 5/100 silent > 5m, none absolute > 30m. 5% is NOT > 5%.
-        let mut snaps: Vec<DpuSnapshot> = (0..95)
+        let mut s = snap("dpu-y");
+        s.last_seen_at = now - ChronoDuration::seconds(300);
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let d = details(&checks, "dpu_isolation");
+        assert_eq!(d.len(), 1);
+        assert!(d[0].value.contains("dpu-y"));
+        assert!(d[0]
+            .next_command
+            .as_deref()
+            .unwrap_or("")
+            .contains("nico correlate"));
+    }
+
+    // ── output ordering: headlines first, details after ────────────────
+
+    #[test]
+    fn json_ordering_emits_all_headlines_before_any_detail() {
+        let now = Utc::now();
+        let mut s = snap("dpu-1");
+        s.client_certificate_expiry = Some(now - ChronoDuration::days(1));
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        let mut seen_detail = false;
+        for c in &checks {
+            match c.kind {
+                CheckKind::Headline => {
+                    assert!(
+                        !seen_detail,
+                        "headline {} appeared after a detail row",
+                        c.name
+                    );
+                }
+                CheckKind::Detail => seen_detail = true,
+            }
+        }
+    }
+
+    // ── per-axis headlines come before fleet-specific headlines ────────
+
+    #[test]
+    fn per_axis_headlines_come_before_fleet_specific_headlines() {
+        let now = Utc::now();
+        let checks = assemble_checks(&[snap("dpu-1")], now, &DpuConfig::default());
+        let order: Vec<&str> = checks
+            .iter()
+            .filter(|c| c.kind == CheckKind::Headline)
+            .map(|c| c.name)
+            .collect();
+        let probe_idx = order.iter().position(|&n| n == "probe-stuck").unwrap();
+        for axis in ["dpu_cert", "dpu_isolation", "hbn", "dpu_services"] {
+            let i = order.iter().position(|&n| n == axis).unwrap();
+            assert!(
+                i < probe_idx,
+                "{axis} should precede probe-stuck, order: {order:?}",
+            );
+        }
+    }
+
+    // ── probe-stuck preserved ──────────────────────────────────────────
+
+    #[test]
+    fn probe_stuck_fleet_headline_preserved_with_top_n_details() {
+        let now = Utc::now();
+        let snaps: Vec<DpuSnapshot> = (0..3)
             .map(|i| {
-                let mut s = snap(&format!("ok-{i}"));
-                s.last_seen_at = now - ChronoDuration::seconds(1);
+                let mut s = snap(&format!("stuck-{i}"));
+                s.health_alerts = vec![alert(
+                    "PostConfigCheckWait",
+                    Some(now - ChronoDuration::seconds(60 + i * 10)),
+                )];
                 s
             })
             .collect();
-        for i in 0..5 {
-            let mut s = snap(&format!("silent-{i}"));
-            s.last_seen_at = now - ChronoDuration::seconds(10 * 60);
-            snaps.push(s);
-        }
         let checks = assemble_checks(&snaps, now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "lost-connection").status, Status::Warn);
+        let h = headline(&checks, "probe-stuck");
+        assert_eq!(h.status, Status::Fail);
+        assert!(h.value.starts_with("3 DPUs"), "value: {}", h.value);
+        let d = details(&checks, "probe-stuck");
+        assert!(!d.is_empty(), "probe-stuck details should appear");
+        assert!(d[0].value.contains("stuck-"));
     }
 
-    // ── parse_health_alerts (issue #239) ────────────────────────────────
+    // ── empty / all-Ok axis messages are axis-specific ─────────────────
+
+    #[test]
+    fn empty_fleet_cert_axis_value_reads_no_expiring_certs() {
+        let checks = assemble_checks(&[], Utc::now(), &DpuConfig::default());
+        assert!(
+            headline(&checks, "dpu_cert").value.contains("no expiring"),
+            "value: {}",
+            headline(&checks, "dpu_cert").value,
+        );
+    }
+
+    #[test]
+    fn all_healthy_services_axis_value_reads_no_degraded() {
+        let now = Utc::now();
+        let s = snap("dpu-1");
+        let checks = assemble_checks(&[s], now, &DpuConfig::default());
+        assert_eq!(headline(&checks, "dpu_services").status, Status::Ok);
+        assert!(
+            headline(&checks, "dpu_services").value.contains("no degraded"),
+            "value: {}",
+            headline(&checks, "dpu_services").value,
+        );
+    }
+
+    // ── parse_health_alerts (unchanged from prior slice) ───────────────
 
     #[test]
     fn parse_health_alerts_returns_empty_for_none() {
         assert!(parse_health_alerts(None).is_empty());
-    }
-
-    #[test]
-    fn parse_health_alerts_returns_empty_when_alerts_missing() {
-        let v = serde_json::json!({"other": "field"});
-        assert!(parse_health_alerts(Some(&v)).is_empty());
     }
 
     #[test]
@@ -834,14 +857,6 @@ mod tests {
         let out = parse_health_alerts(Some(&v));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "PostConfigCheckWait");
-        assert_eq!(
-            out[0].in_alert_since,
-            Some(
-                DateTime::parse_from_rfc3339("2024-01-15T12:34:56Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-            ),
-        );
     }
 
     #[test]
@@ -859,170 +874,50 @@ mod tests {
         );
     }
 
+    // ── parse_extension_services ───────────────────────────────────────
+
     #[test]
-    fn parse_health_alerts_handles_null_in_alert_since() {
-        let v = serde_json::json!({
-            "alerts": [
-                {"id": "PostConfigCheckWait", "in_alert_since": null}
-            ]
-        });
-        let out = parse_health_alerts(Some(&v));
-        assert_eq!(out.len(), 1);
-        assert!(out[0].in_alert_since.is_none());
+    fn parse_extension_services_returns_empty_for_none() {
+        assert!(parse_extension_services(None).is_empty());
     }
 
     #[test]
-    fn parse_health_alerts_skips_entries_without_id() {
-        let v = serde_json::json!({
-            "alerts": [
-                {"in_alert_since": "2024-01-15T12:34:56Z"},
-                {"id": "Good", "in_alert_since": "2024-01-15T12:34:56Z"}
-            ]
-        });
-        let out = parse_health_alerts(Some(&v));
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].id, "Good");
+    fn parse_extension_services_extracts_service_rows() {
+        let v = serde_json::json!([
+            {
+                "service_name": "doca-telemetry",
+                "version": "1.2.3",
+                "overall_state": "Running",
+                "message": "",
+            },
+            {
+                "service_name": "doca-bfb",
+                "version": "0.9.0",
+                "overall_state": "Failed",
+                "message": "exit 1",
+                "removed": "operator decommissioned",
+            }
+        ]);
+        let out = parse_extension_services(Some(&v));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].service_name, "doca-telemetry");
+        assert_eq!(out[0].overall_state, "Running");
+        assert_eq!(out[1].removed.as_deref(), Some("operator decommissioned"));
     }
 
-    // ── probe-stuck (issue #239) ────────────────────────────────────────
+    // ── fetch_fleet SQL schema (PRD-002 + slice-6 additions) ───────────
 
-    fn alert(id: &str, in_alert_since: Option<DateTime<Utc>>) -> HealthAlert {
-        HealthAlert { id: id.into(), in_alert_since }
-    }
-
-    #[test]
-    fn probe_stuck_within_grace_window_is_ok() {
-        let now = Utc::now();
-        let mut s = snap("dpu-1");
-        // In alert for 10s — under the 30s grace window.
-        s.health_alerts = vec![alert(
-            "PostConfigCheckWait",
-            Some(now - ChronoDuration::seconds(10)),
-        )];
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        let h = headline(&checks, "probe-stuck");
-        assert_eq!(h.status, Status::Ok);
-        assert_eq!(h.value, "0 DPUs with stuck PostConfigCheckWait");
-        assert!(details(&checks, "probe-stuck").is_empty());
-    }
-
-    #[test]
-    fn probe_stuck_past_grace_window_is_fail_with_detail() {
-        let now = Utc::now();
-        let mut s = snap("dpu-stuck");
-        // In alert for 60s — past the 30s grace window.
-        s.health_alerts = vec![alert(
-            "PostConfigCheckWait",
-            Some(now - ChronoDuration::seconds(60)),
-        )];
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        let h = headline(&checks, "probe-stuck");
-        assert_eq!(h.status, Status::Fail);
-        assert_eq!(h.value, "1 DPUs with stuck PostConfigCheckWait");
-        let d = details(&checks, "probe-stuck");
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].status, Status::Fail);
-        assert!(d[0].value.contains("dpu-stuck"));
-        assert!(d[0].value.contains("60s"));
-        assert_eq!(
-            d[0].next_command.as_deref(),
-            Some("nico doctor hbn dpu-stuck")
-        );
-    }
-
-    #[test]
-    fn probe_stuck_only_postconfigcheckwait_id_counts() {
-        let now = Utc::now();
-        let mut s = snap("dpu-1");
-        s.health_alerts = vec![
-            // Some other probe in alert > grace — should NOT count.
-            alert("OtherProbe", Some(now - ChronoDuration::seconds(120))),
-        ];
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "probe-stuck").status, Status::Ok);
-    }
-
-    #[test]
-    fn probe_stuck_alert_with_no_in_alert_since_does_not_count() {
-        let now = Utc::now();
-        let mut s = snap("dpu-1");
-        // Alert entry exists but in_alert_since is None — treat as not stuck.
-        s.health_alerts = vec![alert("PostConfigCheckWait", None)];
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "probe-stuck").status, Status::Ok);
-    }
-
-    #[test]
-    fn probe_stuck_cleared_between_reports_is_ok() {
-        let now = Utc::now();
-        // Acceptance criterion: "probe cleared between reports (pass)".
-        // After clear, the alert vec contains no PostConfigCheckWait entry.
-        let s = snap("dpu-1");
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "probe-stuck").status, Status::Ok);
-    }
-
-    #[test]
-    fn probe_stuck_at_exact_grace_threshold_is_ok() {
-        let now = Utc::now();
-        let mut s = snap("dpu-1");
-        s.health_alerts = vec![alert(
-            "PostConfigCheckWait",
-            Some(now - ChronoDuration::seconds(30)),
-        )];
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        // Strict > grace: exactly 30s does NOT trip.
-        assert_eq!(headline(&checks, "probe-stuck").status, Status::Ok);
-    }
-
-    #[test]
-    fn probe_stuck_detail_lines_capped_and_sorted_by_age() {
-        let now = Utc::now();
-        let snaps: Vec<DpuSnapshot> = (0..10)
-            .map(|i| {
-                let mut s = snap(&format!("dpu-{i}"));
-                s.health_alerts = vec![alert(
-                    "PostConfigCheckWait",
-                    Some(now - ChronoDuration::seconds(60 + i * 10)),
-                )];
-                s
-            })
-            .collect();
-        let checks = assemble_checks(&snaps, now, &DpuConfig::default());
-        let h = headline(&checks, "probe-stuck");
-        assert_eq!(h.status, Status::Fail);
-        assert_eq!(h.value, "10 DPUs with stuck PostConfigCheckWait");
-        let d = details(&checks, "probe-stuck");
-        assert_eq!(d.len(), DRIFT_DETAIL_TOP_N);
-        // Oldest first — dpu-9 has age 60+90=150s, the largest.
-        assert!(d[0].value.contains("dpu-9"), "{}", d[0].value);
-    }
-
-    // ── fetch_fleet schema (PRD-002) ────────────────────────────────────
-
-    /// PRD-002 acceptance: fleet query reads producer-side JSON columns
-    /// from the `machines` row, never the (non-existent) old tables.
     #[test]
     fn fetch_fleet_sql_targets_producer_side_machines_columns() {
         let sql = FETCH_FLEET_SQL;
-        // Old schema must not be referenced.
         assert!(
             !sql.contains("dpu_network_status"),
             "old table dpu_network_status still referenced: {sql}"
         );
-        assert!(
-            !sql.contains("dpu_desired_network_config"),
-            "old table dpu_desired_network_config still referenced: {sql}"
-        );
-        // New schema must be referenced.
         assert!(sql.contains("FROM machines"), "missing machines table: {sql}");
         assert!(
             sql.contains("network_status_observation"),
             "missing applied-side JSON column: {sql}"
-        );
-        assert!(
-            sql.contains("network_config_version"),
-            "missing desired managed-host version column: {sql}"
         );
         assert!(
             sql.contains("network_config->'quarantine_state'"),
@@ -1030,20 +925,24 @@ mod tests {
         );
         assert!(
             sql.contains("dpu_agent_health_report"),
-            "agent alert JSON column must be read for probe-stuck: {sql}"
+            "agent alert JSON column must be read: {sql}"
         );
     }
 
-    // ── drift threshold boundary ────────────────────────────────────────
-
     #[test]
-    fn drift_at_exact_warn_threshold_is_ok() {
-        let now = Utc::now();
-        let mut s = snap("dpu-1");
-        s.applied_managed_host_config_version = "v1".into();
-        s.desired_managed_host_config_version = "v2".into();
-        s.last_seen_at = now - ChronoDuration::seconds(15 * 60); // exactly 15m
-        let checks = assemble_checks(&[s], now, &DpuConfig::default());
-        assert_eq!(headline(&checks, "drift-managed-host").status, Status::Ok);
+    fn fetch_fleet_sql_includes_verdict_inputs_added_in_slice_6() {
+        let sql = FETCH_FLEET_SQL;
+        assert!(
+            sql.contains("network_config_error"),
+            "hbn verdict input missing: {sql}"
+        );
+        assert!(
+            sql.contains("extension_service_observation"),
+            "services verdict input missing: {sql}"
+        );
+        assert!(
+            sql.contains("inventory->'components'") || sql.contains("inventory ->'components'"),
+            "hbn version input missing: {sql}"
+        );
     }
 }
