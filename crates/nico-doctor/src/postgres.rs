@@ -1,11 +1,13 @@
 use async_trait::async_trait;
 use anyhow::Result;
 
+#[derive(serde::Serialize)]
 pub struct PoolStats {
     pub active: i64,
     pub max_conn: i64,
 }
 
+#[derive(serde::Serialize)]
 pub struct LockWait {
     pub waiting_pid: i32,
     pub blocking_pid: Option<i32>,

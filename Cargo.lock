@@ -2126,6 +2126,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "owo-colors",
+ "prost",
  "prost-wkt-types",
  "ratatui",
  "serde",

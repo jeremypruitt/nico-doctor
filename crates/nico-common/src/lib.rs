@@ -4,6 +4,7 @@ pub mod config;
 pub mod deployment_detect;
 pub mod k8s;
 pub mod output;
+pub mod perf;
 pub mod reach;
 pub mod temporal;
 pub mod theme;
