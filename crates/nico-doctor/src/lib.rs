@@ -23,6 +23,7 @@ pub mod layers;
 pub mod log_collector;
 pub mod log_source;
 pub mod loki;
+pub mod perf_fixtures;
 pub mod postgres;
 pub mod preflight;
 pub mod runner;

@@ -18,5 +18,13 @@ chrono = "0.4"
 humantime = "2"
 arboard = { version = "3", default-features = false }
 
+[features]
+# Opt-in dhat heap-profiling allocator. Off by default; enable for
+# perf benches only:
+#   cargo bench -p nico-ops --features dhat-heap
+dhat-heap = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+criterion = { version = "0.5", default-features = false }
+dhat = "0.3"
