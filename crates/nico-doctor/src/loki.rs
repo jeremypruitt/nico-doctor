@@ -8,11 +8,13 @@ use serde::Deserialize;
 
 use crate::log_source::{LogCollection, LogSource, PodLogsCache};
 
+#[derive(serde::Serialize)]
 pub struct LokiLine {
     pub pod: String,
     pub text: String,
 }
 
+#[derive(serde::Serialize)]
 pub enum LokiQueryResult {
     Lines(Vec<LokiLine>),
     Unreachable,

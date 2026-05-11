@@ -28,7 +28,7 @@ pub enum PodScope<'a> {
 }
 
 /// Minimal pod shape needed by both crates.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RawPod {
     pub name: String,
     pub namespace: String,
@@ -41,7 +41,7 @@ pub struct RawPod {
 
 /// Minimal Kubernetes event shape needed by both crates. Callers
 /// typically filter by `event_type == "Warning"` and a since-cutoff.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RawEvent {
     pub ts: Option<DateTime<Utc>>,
     pub event_type: Option<String>,
