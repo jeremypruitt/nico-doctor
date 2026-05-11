@@ -2194,6 +2194,7 @@ dependencies = [
 name = "nico-ops"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arboard",
  "async-trait",
  "chrono",
@@ -2207,6 +2208,7 @@ dependencies = [
  "nico-correlate",
  "nico-doctor",
  "ratatui",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tui-big-text",
