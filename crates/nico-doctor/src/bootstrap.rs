@@ -678,9 +678,15 @@ async fn run_boot_probe(
             config.cluster.deployment_type_source.label(),
         )
         .await;
-    tracker
-        .set_warnings(config.override_conflict_warnings())
-        .await;
+    let mut warnings = config.override_conflict_warnings();
+    if config.cluster.grpc_address.is_some() {
+        warnings.push(
+            "⚠  port-forward: grpc is not yet implemented — \
+             resolved address is informational only"
+                .to_string(),
+        );
+    }
+    tracker.set_warnings(warnings).await;
 
     let ns = config.cluster.namespace.clone();
 
@@ -998,24 +1004,14 @@ async fn run_serving_section(
         }
     };
 
-    // gRPC port-forward — currently a no-op placeholder. If
-    // grpc_address is configured, mark Passed; otherwise mark Skipped
-    // (no actual port-forward to attempt today).
+    // gRPC port-forward is not yet implemented. Always Skipped so the
+    // green-check / 0.0s rendering can't claim a forward that didn't
+    // happen. When `grpc_address` resolves, a one-time warning above
+    // the sections surfaces the resolved target.
     let grpc_fut = async {
-        tracker.started(StepId::PortForwardGrpc).await;
-        let t = Instant::now();
-        if config.cluster.grpc_address.is_some() {
-            tracker
-                .finished(
-                    StepId::PortForwardGrpc,
-                    StepState::Passed { elapsed: t.elapsed() },
-                )
-                .await;
-        } else {
-            tracker
-                .finished(StepId::PortForwardGrpc, StepState::Skipped)
-                .await;
-        }
+        tracker
+            .finished(StepId::PortForwardGrpc, StepState::Skipped)
+            .await;
     };
 
     // Postgres port-forward → reach postgres (sequential within
