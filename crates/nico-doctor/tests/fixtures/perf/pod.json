@@ -1,0 +1,38 @@
+{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "dpu-agent-seed-0000",
+    "namespace": "infra-controller",
+    "uid": "00000000-0000-0000-0000-000000000000",
+    "labels": {
+      "app": "dpu-agent",
+      "dpu-id": "dpu-seed-0000"
+    }
+  },
+  "spec": {
+    "nodeName": "worker-seed-0000",
+    "containers": [
+      {
+        "name": "dpu-agent",
+        "image": "ghcr.io/example/dpu-agent:1.7.3"
+      }
+    ]
+  },
+  "status": {
+    "phase": "Running",
+    "podIP": "10.0.0.10",
+    "containerStatuses": [
+      {
+        "name": "dpu-agent",
+        "ready": true,
+        "restartCount": 0,
+        "state": {
+          "running": {
+            "startedAt": "2026-05-10T11:00:00Z"
+          }
+        }
+      }
+    ]
+  }
+}

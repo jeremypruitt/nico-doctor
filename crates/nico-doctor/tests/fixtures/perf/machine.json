@@ -1,0 +1,25 @@
+{
+  "id": "dpu-seed-0000",
+  "network_config_version": "v42",
+  "network_config": {
+    "quarantine_state": {
+      "mode": "none"
+    }
+  },
+  "network_status_observation": {
+    "network_config_version": "v42",
+    "instance_network_observation": {
+      "config_version": "v42"
+    },
+    "observed_at": "2026-05-10T12:00:00Z",
+    "client_certificate_expiry": 1799884800
+  },
+  "dpu_agent_health_report": {
+    "agent_version": "1.7.3",
+    "uptime_seconds": 86400,
+    "services": {
+      "doca-telemetry": "running",
+      "snap-mlnx-management": "running"
+    }
+  }
+}

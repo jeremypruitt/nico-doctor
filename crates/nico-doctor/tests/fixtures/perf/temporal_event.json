@@ -1,0 +1,17 @@
+{
+  "event_id": "1",
+  "event_time": "2026-05-10T12:00:00Z",
+  "event_type": "WorkflowExecutionStarted",
+  "task_id": "1",
+  "workflow_execution": {
+    "workflow_id": "dpu-provision-seed-0000",
+    "run_id": "00000000-0000-0000-0000-000000000000"
+  },
+  "attributes": {
+    "workflow_type": "DpuProvisionWorkflow",
+    "task_queue": "dpu-provision-tq",
+    "input": {
+      "dpu_id": "dpu-seed-0000"
+    }
+  }
+}
