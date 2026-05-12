@@ -1,8 +1,6 @@
 use std::time::Instant;
 
-use crate::model::{
-    EntityRef, LayerSnapshot, LogLine, PopoverDiagnosis, PopoverEvent, SourceError,
-};
+use crate::model::{CorrelateUpdate, EntityRef, LayerSnapshot, LogLine};
 
 /// Direction for focus navigation across the scorecard grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,16 +82,17 @@ pub enum Action {
     /// entity. The general path the per-surface triggers (Spotlight rows,
     /// log lines, Findings detail, event timeline) all funnel into.
     OpenCorrelatePopup(EntityRef),
-    /// Results from a `nico_correlate::collect_all` round, posted by the
-    /// host loop. Carries the `entity` so the reducer can drop stale
-    /// results when the operator has already closed or re-opened the
-    /// popup for a different entity. PRD-007 adds `diagnosis` for the
-    /// banner at the top of the popup.
-    CorrelateResults {
+    /// PRD-007 Slice 2 (#374): one streaming update from the correlate
+    /// runner adapter ([`crate::correlate_runner`]). Carries the
+    /// `entity` so the reducer can drop stale updates when the operator
+    /// has already closed or re-opened the popup for a different
+    /// entity, and a [`CorrelateUpdate`] describing what advanced
+    /// (`Loading`, `SourceLanded`, `SourceFailed`, `Diagnosis`, or
+    /// `Done`). Replaced the one-shot `CorrelateResults` action from
+    /// Slice 0.
+    CorrelateUpdate {
         entity: EntityRef,
-        events: Vec<PopoverEvent>,
-        source_errors: Vec<SourceError>,
-        diagnosis: Option<PopoverDiagnosis>,
+        update: CorrelateUpdate,
     },
     /// Show a transient toast in the bottom bar (e.g. "clipboard
     /// unavailable"). Auto-clears after `TOAST_TTL`.

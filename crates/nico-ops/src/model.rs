@@ -48,15 +48,20 @@ pub struct PopoverEvent {
     pub severity: PopoverSeverity,
 }
 
-/// Either the correlate run is still in flight (`Loading`) or it has
-/// landed and the renderer has events + per-source error lines to show.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CorrelateStatus {
+/// PRD-007 Slice 2 (#374): per-source availability state, painted as a
+/// row of dots at the bottom of the [correlate mini-dashboard
+/// popup](CorrelateState). `⟳` while in flight, `●` once events have
+/// landed, `✗` if the source reported
+/// [`crate::correlate_runner::CorrelateUpdate::SourceFailed`]. `○` is
+/// the unrequested default the renderer falls back to if a source name
+/// from the initial `Loading` list never appears in a subsequent
+/// update — in practice means the run was cancelled before it landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceStatus {
     Loading,
-    Loaded {
-        events: Vec<PopoverEvent>,
-        source_errors: Vec<SourceError>,
-    },
+    Landed,
+    Failed,
+    Unrequested,
 }
 
 /// One Source that errored during the correlate run. Rendered inline as
@@ -79,13 +84,71 @@ pub struct PopoverDiagnosis {
     pub next_commands: Vec<String>,
 }
 
-/// The full state the correlate popup needs: which entity it's for, the
-/// in-flight / loaded payload, and the optional Diagnosis banner.
+/// PRD-007 Slice 2 (#374) — model-layer mirror of the runner's
+/// [`crate::correlate_runner::CorrelateUpdate`]. Carries [`PopoverEvent`]
+/// / [`PopoverDiagnosis`] instead of correlate's internal `Event` /
+/// `Diagnosis` types so [`crate::action::Action`] (and therefore the
+/// reducer + tests) stay free of the correlate crate's vocabulary —
+/// same pattern as [`PopoverSeverity`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum CorrelateUpdate {
+    /// First update — names every source the run is waiting on.
+    Loading { sources: Vec<String> },
+    /// A source landed with events. The reducer appends `events` to
+    /// the popup's accumulated timeline and flips that source's dot
+    /// from `⟳` to `●`.
+    SourceLanded {
+        source: String,
+        events: Vec<PopoverEvent>,
+    },
+    /// A source reported `Unavailable`. The reducer records a
+    /// [`SourceError`] and flips the dot to `✗`.
+    SourceFailed { source: String, reason: String },
+    /// Diagnosis computed over the accumulated events + state.
+    Diagnosis { diagnosis: Option<PopoverDiagnosis> },
+    /// Terminal item — the popup stops painting the throbber.
+    Done,
+}
+
+/// The full state the correlate popup needs. PRD-007 Slice 2 (#374)
+/// replaced the binary `CorrelateStatus::Loading | Loaded` with this
+/// incremental shape so per-source dots can transition `⟳ → ● / ✗ / ○`
+/// independently, and the timeline can render rows the moment a source
+/// lands instead of waiting for the whole batch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorrelateState {
     pub entity: EntityRef,
-    pub status: CorrelateStatus,
+    /// Ordered list of named sources in the run, with current status
+    /// each. The order is taken from the runner's `Loading` update so
+    /// the dots row paints in the same order across re-renders.
+    pub sources: Vec<(String, SourceStatus)>,
+    /// Accumulated timeline. Sorted by timestamp on each insert so the
+    /// renderer can iterate without further sorting.
+    pub events: Vec<PopoverEvent>,
+    /// One entry per `SourceFailed` update — rendered inline as
+    /// `source_error` rows below the timeline.
+    pub source_errors: Vec<SourceError>,
     pub diagnosis: Option<PopoverDiagnosis>,
+    /// Set true when the runner emits `Done`. Drives the throbber +
+    /// "collecting…" suffix in the popup title.
+    pub done: bool,
+}
+
+impl CorrelateState {
+    /// Empty initial state for `entity` — no sources listed, no events
+    /// yet, not done. The host loop fills `sources` from the runner's
+    /// `Loading` update; until that arrives, the popup paints the
+    /// throbber with an empty dots row.
+    pub fn new(entity: EntityRef) -> Self {
+        Self {
+            entity,
+            sources: Vec::new(),
+            events: Vec::new(),
+            source_errors: Vec::new(),
+            diagnosis: None,
+            done: false,
+        }
+    }
 }
 
 /// PRD-007: pull the first entity (DPU / workflow / host / request) out

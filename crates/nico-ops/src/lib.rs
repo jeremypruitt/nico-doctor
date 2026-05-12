@@ -18,6 +18,7 @@ pub mod action;
 pub mod app;
 pub mod cli;
 pub mod clock;
+pub mod correlate_runner;
 pub mod data;
 pub mod events;
 pub mod hbn_panel;
@@ -34,7 +35,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::events::{Mode, translate};
 use crate::model::{
     EntityRef, LayerSnapshot, LogLine, PopoverDiagnosis, PopoverEvent, PopoverSeverity,
-    SourceError, log_level_from_text,
+    log_level_from_text,
 };
 
 pub use cli::{HbnPanelArgs, OpsArgs, OpsCommand};
@@ -323,90 +324,151 @@ fn dispatch(
     }
 }
 
-/// Run `nico_correlate::collect_all` for `entity` on a background
-/// task and post the resulting timeline back through the action channel.
-/// All errors (config load, source preparation, collection) end up as
-/// `Action::CorrelateResults` with a populated `source_errors` so the
-/// popup can render them inline as `source_error` rows. PRD-007 also
-/// computes a `Diagnosis` over the collected events + state and ships
-/// it through for the popup banner.
+/// PRD-007 Slice 2 (#374): spawn a streaming correlate run for
+/// `entity` and forward each [`crate::correlate_runner::CorrelateUpdate`]
+/// as an [`Action::CorrelateUpdate`]. Setup failures (config
+/// resolution) and source preparation feed into the same stream as a
+/// synthetic `SourceFailed("config", …)` so the popup renders them
+/// inline as a `source_error` row, then closes with `Done` so the
+/// throbber stops. The previous one-shot `CorrelateResults` action and
+/// its bulk-fetch sibling `run_correlate_collect` were removed when
+/// the streaming adapter landed.
 fn spawn_correlate(entity: EntityRef, tx: mpsc::Sender<Action>) {
     tokio::spawn(async move {
-        let (events, source_errors, diagnosis) = run_correlate_collect(&entity).await;
-        let _ = tx
-            .send(Action::CorrelateResults {
-                entity,
-                events,
-                source_errors,
-                diagnosis,
-            })
-            .await;
+        let args = correlate_args(&entity);
+        let cfg = match nico_correlate::resolve_config(&args) {
+            Ok(c) => c,
+            Err(nico_correlate::BootstrapErr::Fatal { message, .. }) => {
+                // Emit a Loading list with one synthetic source so the
+                // dots row shows the failure, then SourceFailed →
+                // Diagnosis(None) → Done.
+                forward_synthetic_failure(
+                    &entity,
+                    "config",
+                    &message,
+                    &tx,
+                )
+                .await;
+                return;
+            }
+        };
+        let prepared = nico_correlate::prepare_sources(&args, &cfg).await;
+        let id_str = args.id.clone().unwrap_or_default();
+        let diag_config = nico_correlate::diagnosis::DiagnosisConfig {
+            stuck_threshold: cfg.config.temporal.stuck_threshold,
+        };
+
+        let stream =
+            correlate_runner::run_correlate(prepared.named_sources, id_str, cfg.id_type, diag_config);
+        forward_stream(entity, stream, prepared._pf_guards, tx).await;
     });
 }
 
-async fn run_correlate_collect(
+async fn forward_synthetic_failure(
     entity: &EntityRef,
-) -> (Vec<PopoverEvent>, Vec<SourceError>, Option<PopoverDiagnosis>) {
-    let args = correlate_args(entity);
-    let cfg = match nico_correlate::resolve_config(&args) {
-        Ok(c) => c,
-        Err(nico_correlate::BootstrapErr::Fatal { message, .. }) => {
-            return (
-                vec![],
-                vec![SourceError {
-                    name: "config".into(),
-                    reason: message,
-                }],
-                None,
-            );
-        }
-    };
-    let prepared = nico_correlate::prepare_sources(&args, &cfg).await;
-    let id_str = args.id.clone().unwrap_or_default();
-    let results = nico_correlate::collect_all(&prepared.named_sources, &id_str, &cfg.id_type).await;
-    drop(prepared._pf_guards);
+    source: &'static str,
+    reason: &str,
+    tx: &mpsc::Sender<Action>,
+) {
+    let _ = tx
+        .send(Action::CorrelateUpdate {
+            entity: entity.clone(),
+            update: model::CorrelateUpdate::Loading {
+                sources: vec![source.to_string()],
+            },
+        })
+        .await;
+    let _ = tx
+        .send(Action::CorrelateUpdate {
+            entity: entity.clone(),
+            update: model::CorrelateUpdate::SourceFailed {
+                source: source.to_string(),
+                reason: reason.to_string(),
+            },
+        })
+        .await;
+    let _ = tx
+        .send(Action::CorrelateUpdate {
+            entity: entity.clone(),
+            update: model::CorrelateUpdate::Diagnosis { diagnosis: None },
+        })
+        .await;
+    let _ = tx
+        .send(Action::CorrelateUpdate {
+            entity: entity.clone(),
+            update: model::CorrelateUpdate::Done,
+        })
+        .await;
+}
 
-    let mut popover_events: Vec<PopoverEvent> = Vec::new();
-    let mut source_errors: Vec<SourceError> = Vec::new();
-    let mut raw_events: Vec<nico_correlate::Event> = Vec::new();
-    let mut state: Vec<nico_correlate::source::StateEntry> = Vec::new();
-    for r in results {
-        match r {
-            nico_correlate::source::SourceResult::Output(o) => {
-                for e in o.events {
-                    popover_events.push(PopoverEvent {
-                        ts: e.ts,
-                        source: e.source.clone(),
-                        kind: e.kind.clone(),
-                        message: e.message.clone(),
-                        severity: severity_to_popover(&e.severity),
-                    });
-                    raw_events.push(e);
-                }
-                state.extend(o.state);
-            }
-            nico_correlate::source::SourceResult::Unavailable(u) => {
-                source_errors.push(SourceError {
-                    name: u.name.to_string(),
-                    reason: u.reason.clone(),
-                });
-            }
+async fn forward_stream(
+    entity: EntityRef,
+    stream: correlate_runner::CorrelateStream,
+    _pf_guards: Vec<nico_common::reach::ForwardedEndpoint>,
+    tx: mpsc::Sender<Action>,
+) {
+    use futures::StreamExt;
+    let mut stream = stream;
+    while let Some(update) = stream.next().await {
+        let mapped = map_update_to_model(update);
+        if tx
+            .send(Action::CorrelateUpdate {
+                entity: entity.clone(),
+                update: mapped,
+            })
+            .await
+            .is_err()
+        {
+            break;
         }
     }
-    popover_events.sort_by_key(|e| e.ts);
+    // Drop the port-forward guards only after the stream finishes so
+    // tunnels stay up for the duration of the run.
+    drop(_pf_guards);
+}
 
-    let diag_config = nico_correlate::diagnosis::DiagnosisConfig {
-        stuck_threshold: cfg.config.temporal.stuck_threshold,
-    };
-    let diagnosis = nico_correlate::diagnosis::diagnose(&raw_events, &state, &diag_config).map(
-        |d| PopoverDiagnosis {
-            pattern: d.pattern,
-            error_signature: d.error_signature,
-            next_commands: d.next_commands,
+fn map_update_to_model(update: correlate_runner::CorrelateUpdate) -> model::CorrelateUpdate {
+    match update {
+        correlate_runner::CorrelateUpdate::Loading { sources } => model::CorrelateUpdate::Loading {
+            sources: sources.into_iter().map(|s| s.to_string()).collect(),
         },
-    );
-
-    (popover_events, source_errors, diagnosis)
+        correlate_runner::CorrelateUpdate::SourceLanded {
+            source,
+            events,
+            state: _,
+        } => {
+            let popover_events: Vec<PopoverEvent> = events
+                .into_iter()
+                .map(|e| PopoverEvent {
+                    ts: e.ts,
+                    source: e.source,
+                    kind: e.kind,
+                    message: e.message,
+                    severity: severity_to_popover(&e.severity),
+                })
+                .collect();
+            model::CorrelateUpdate::SourceLanded {
+                source: source.to_string(),
+                events: popover_events,
+            }
+        }
+        correlate_runner::CorrelateUpdate::SourceFailed { source, reason } => {
+            model::CorrelateUpdate::SourceFailed {
+                source: source.to_string(),
+                reason,
+            }
+        }
+        correlate_runner::CorrelateUpdate::Diagnosis { diagnosis } => {
+            model::CorrelateUpdate::Diagnosis {
+                diagnosis: diagnosis.map(|d| PopoverDiagnosis {
+                    pattern: d.pattern,
+                    error_signature: d.error_signature,
+                    next_commands: d.next_commands,
+                }),
+            }
+        }
+        correlate_runner::CorrelateUpdate::Done => model::CorrelateUpdate::Done,
+    }
 }
 
 fn severity_to_popover(s: &nico_correlate::event::Severity) -> PopoverSeverity {

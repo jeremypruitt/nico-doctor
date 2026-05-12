@@ -13,6 +13,7 @@ tui-big-text = "0.7"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 tokio-stream = "0.1"
+tokio-util = "0.7"
 futures = "0.3"
 chrono = "0.4"
 humantime = "2"

@@ -16,8 +16,8 @@ use nico_doctor::baseline::Delta;
 use crate::app::{App, Layout as AppLayout};
 use crate::events::Overlay;
 use crate::model::{
-    CorrelateState, CorrelateStatus, Finding, LayerSnapshot, LogLine, PopoverEvent,
-    PopoverSeverity, SourceError, overall_verdict,
+    CorrelateState, Finding, LayerSnapshot, LogLine, PopoverEvent, PopoverSeverity, SourceError,
+    SourceStatus, overall_verdict,
 };
 use crate::popup::{Popup, PopupSize};
 use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
@@ -640,10 +640,12 @@ fn render_correlate_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: R
 
 fn correlate_title(app: &App, state: &CorrelateState) -> String {
     let throb = app.throbber_glyph();
-    let (loading_marker, suffix) = match state.status {
-        CorrelateStatus::Loading if !throb.is_empty() => (format!(" {throb}"), " collecting…"),
-        CorrelateStatus::Loading => (String::new(), " collecting…"),
-        CorrelateStatus::Loaded { .. } => (String::new(), ""),
+    let (loading_marker, suffix) = if state.done {
+        (String::new(), "")
+    } else if !throb.is_empty() {
+        (format!(" {throb}"), " collecting…")
+    } else {
+        (String::new(), " collecting…")
     };
     format!(" correlate — {}{}{} ", state.entity.id, loading_marker, suffix)
 }
@@ -653,33 +655,79 @@ fn correlate_body_lines(state: &CorrelateState, theme: &Theme) -> Vec<Line<'stat
     if let Some(diag) = &state.diagnosis {
         out.extend(diagnosis_banner_lines(diag, theme));
     }
-    match &state.status {
-        CorrelateStatus::Loading => {
+    if state.events.is_empty() && state.source_errors.is_empty() {
+        if state.done {
+            out.push(Line::from(Span::styled(
+                format!("(no events found for {})", state.entity.id),
+                Style::default().fg(theme.muted),
+            )));
+        } else {
             out.push(Line::from(Span::styled(
                 "loading timeline…".to_string(),
                 Style::default().fg(theme.muted),
             )));
         }
-        CorrelateStatus::Loaded {
-            events,
-            source_errors,
-        } => {
-            if events.is_empty() && source_errors.is_empty() {
-                out.push(Line::from(Span::styled(
-                    format!("(no events found for {})", state.entity.id),
-                    Style::default().fg(theme.muted),
-                )));
-            } else {
-                for e in events {
-                    out.push(format_popover_event(e, theme));
-                }
-                for se in source_errors {
-                    out.push(format_source_error(se, theme));
-                }
-            }
+    } else {
+        for e in &state.events {
+            out.push(format_popover_event(e, theme));
+        }
+        for se in &state.source_errors {
+            out.push(format_source_error(se, theme));
         }
     }
+
+    // PRD-007 Slice 2 (#374): two trailing rows pinned to the bottom
+    // of the popup body. Blank separator → source-availability dots
+    // row → action row. Kept inline (not pinned to the popup frame
+    // bottom) because Popup body has no separate footer slot yet.
+    out.push(Line::from(""));
+    out.push(source_dots_line(state, theme));
+    out.push(action_row_line(theme));
     out
+}
+
+/// PRD-007 Slice 2 (#374) — the source-availability dots row.
+/// `⟳ temporal  ● postgres  ✗ loki  ○ redfish`, painted with the same
+/// glyph vocabulary the issue spec calls out. Empty when the runner
+/// hasn't yet emitted `Loading` (initial popup state); pinned at the
+/// bottom of the body otherwise.
+pub(crate) fn source_dots_line(state: &CorrelateState, theme: &Theme) -> Line<'static> {
+    if state.sources.is_empty() {
+        return Line::from(Span::styled(
+            "(no sources reported yet)".to_string(),
+            Style::default().fg(theme.muted),
+        ));
+    }
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(state.sources.len() * 3);
+    for (i, (name, status)) in state.sources.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  ".to_string()));
+        }
+        let (glyph, color) = match status {
+            SourceStatus::Loading => ("⟳", theme.warn),
+            SourceStatus::Landed => ("●", theme.ok),
+            SourceStatus::Failed => ("✗", theme.error),
+            SourceStatus::Unrequested => ("○", theme.muted),
+        };
+        spans.push(Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(color),
+        ));
+        spans.push(Span::raw(name.clone()));
+    }
+    Line::from(spans)
+}
+
+/// PRD-007 Slice 2 (#374) — the action row pinned at the bottom of
+/// the popup. Enter is a stub until Slice 4 (#377) wires the
+/// expand-to-fullscreen handler; Esc dismisses the popup today.
+pub(crate) fn action_row_line(theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("[Enter] ".to_string(), Style::default().fg(theme.overlay_key)),
+        Span::raw("full   "),
+        Span::styled("[esc] ".to_string(), Style::default().fg(theme.overlay_key)),
+        Span::raw("close"),
+    ])
 }
 
 /// PRD-007: two-line Diagnosis banner + blank separator at the top of

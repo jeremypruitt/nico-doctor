@@ -1,5 +1,6 @@
 use super::*;
-use crate::model::{EntityRef, PopoverEvent, SourceError};
+use crate::model::{CorrelateUpdate, EntityRef, PopoverEvent, SourceStatus};
+use chrono::TimeZone;
 use nico_common::output::Status;
 use nico_correlate::id::IdType;
 
@@ -951,7 +952,10 @@ fn correlate_on_workflows_layer_opens_loading_overlay_and_emits_effect() {
     assert_eq!(app.overlay(), Overlay::Correlate);
     let cs = app.correlate_state().expect("correlate state set");
     assert_eq!(cs.entity, entity_wf("wf-001"));
-    assert!(matches!(cs.status, CorrelateStatus::Loading));
+    assert!(!cs.done);
+    assert!(cs.events.is_empty());
+    assert!(cs.source_errors.is_empty());
+    assert!(cs.sources.is_empty());
     assert!(cs.diagnosis.is_none());
 }
 
@@ -1028,7 +1032,7 @@ fn correlate_on_dpu_finding_in_spotlight_opens_popup_with_dpu_entity() {
     assert_eq!(app.overlay(), Overlay::Correlate);
     let cs = app.correlate_state().expect("correlate state set");
     assert_eq!(cs.entity, entity_dpu("dpu-r12u5"));
-    assert!(matches!(cs.status, CorrelateStatus::Loading));
+    assert!(!cs.done);
 }
 
 #[test]
@@ -1045,62 +1049,181 @@ fn open_correlate_popup_directly_opens_for_any_entity() {
 }
 
 #[test]
-fn correlate_results_for_matching_entity_populates_loaded_state() {
+fn correlate_streaming_updates_for_matching_entity_populate_state() {
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
         "wf-001",
     )]));
     app.handle(Action::Correlate);
-    let evs = vec![PopoverEvent {
+    // Runner emits Loading first → dots row sees every name in
+    // `Loading` flavor.
+    app.handle(Action::CorrelateUpdate {
+        entity: entity_wf("wf-001"),
+        update: CorrelateUpdate::Loading {
+            sources: vec!["temporal".into(), "loki".into()],
+        },
+    });
+    let cs = app.correlate_state().expect("still open");
+    assert_eq!(
+        cs.sources,
+        vec![
+            ("temporal".into(), SourceStatus::Loading),
+            ("loki".into(), SourceStatus::Loading),
+        ]
+    );
+
+    // SourceLanded flips one dot to Landed and appends events.
+    let ev = PopoverEvent {
         ts: chrono::Utc::now(),
         source: "temporal".into(),
         kind: "WorkflowExecutionStarted".into(),
         message: "started".into(),
         severity: crate::model::PopoverSeverity::Info,
-    }];
+    };
+    app.handle(Action::CorrelateUpdate {
+        entity: entity_wf("wf-001"),
+        update: CorrelateUpdate::SourceLanded {
+            source: "temporal".into(),
+            events: vec![ev.clone()],
+        },
+    });
+    let cs = app.correlate_state().expect("still open");
+    assert_eq!(cs.sources[0].1, SourceStatus::Landed);
+    assert_eq!(cs.events.len(), 1);
+    assert_eq!(cs.events[0].kind, "WorkflowExecutionStarted");
+
+    // SourceFailed pushes a source_error row + flips dot to Failed.
+    app.handle(Action::CorrelateUpdate {
+        entity: entity_wf("wf-001"),
+        update: CorrelateUpdate::SourceFailed {
+            source: "loki".into(),
+            reason: "LOKI_URL not set".into(),
+        },
+    });
+    let cs = app.correlate_state().expect("still open");
+    assert_eq!(cs.sources[1].1, SourceStatus::Failed);
+    assert_eq!(cs.source_errors.len(), 1);
+
+    // Diagnosis lands.
     let diag = crate::model::PopoverDiagnosis {
         pattern: "stuck_workflow".into(),
         error_signature: "no events in the last 30m; workflow still Running".into(),
         next_commands: vec!["nico doctor".into()],
     };
-    app.handle(Action::CorrelateResults {
+    app.handle(Action::CorrelateUpdate {
         entity: entity_wf("wf-001"),
-        events: evs.clone(),
-        source_errors: vec![],
-        diagnosis: Some(diag.clone()),
+        update: CorrelateUpdate::Diagnosis {
+            diagnosis: Some(diag.clone()),
+        },
     });
     let cs = app.correlate_state().expect("still open");
-    match &cs.status {
-        CorrelateStatus::Loaded {
-            events,
-            source_errors,
-        } => {
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0].kind, "WorkflowExecutionStarted");
-            assert!(source_errors.is_empty());
-        }
-        _ => panic!("expected Loaded, got {:?}", cs.status),
-    }
     assert_eq!(cs.diagnosis.as_ref(), Some(&diag));
+    assert!(!cs.done);
+
+    // Done flips the terminal flag.
+    app.handle(Action::CorrelateUpdate {
+        entity: entity_wf("wf-001"),
+        update: CorrelateUpdate::Done,
+    });
+    let cs = app.correlate_state().expect("still open");
+    assert!(cs.done);
 }
 
 #[test]
-fn correlate_results_for_stale_entity_are_dropped() {
+fn correlate_stream_landings_accumulate_events_sorted_by_ts() {
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
         "wf-001",
     )]));
     app.handle(Action::Correlate);
-    app.handle(Action::CorrelateResults {
+    let later = chrono::Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 9).unwrap();
+    let earlier = chrono::Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 5).unwrap();
+    let mk = |ts, kind: &str| PopoverEvent {
+        ts,
+        source: "temporal".into(),
+        kind: kind.into(),
+        message: String::new(),
+        severity: crate::model::PopoverSeverity::Info,
+    };
+    // Late SourceLanded first, then early one. Reducer must sort so
+    // earlier event is rendered above later one regardless of arrival
+    // order.
+    app.handle(Action::CorrelateUpdate {
+        entity: entity_wf("wf-001"),
+        update: CorrelateUpdate::SourceLanded {
+            source: "later".into(),
+            events: vec![mk(later, "Late")],
+        },
+    });
+    app.handle(Action::CorrelateUpdate {
+        entity: entity_wf("wf-001"),
+        update: CorrelateUpdate::SourceLanded {
+            source: "earlier".into(),
+            events: vec![mk(earlier, "Early")],
+        },
+    });
+    let cs = app.correlate_state().unwrap();
+    assert_eq!(cs.events.len(), 2);
+    assert_eq!(cs.events[0].kind, "Early");
+    assert_eq!(cs.events[1].kind, "Late");
+}
+
+#[test]
+fn correlate_diagnosis_before_events_keeps_view_consistent() {
+    // PRD-007 acceptance: even if Diagnosis arrives before all events,
+    // the reducer must accept later SourceLanded updates without
+    // overwriting Diagnosis or duplicating events.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
+        "wf-001",
+    )]));
+    app.handle(Action::Correlate);
+    let diag = crate::model::PopoverDiagnosis {
+        pattern: "stuck_workflow".into(),
+        error_signature: "n/a".into(),
+        next_commands: vec![],
+    };
+    app.handle(Action::CorrelateUpdate {
+        entity: entity_wf("wf-001"),
+        update: CorrelateUpdate::Diagnosis {
+            diagnosis: Some(diag.clone()),
+        },
+    });
+    app.handle(Action::CorrelateUpdate {
+        entity: entity_wf("wf-001"),
+        update: CorrelateUpdate::SourceLanded {
+            source: "temporal".into(),
+            events: vec![PopoverEvent {
+                ts: chrono::Utc::now(),
+                source: "temporal".into(),
+                kind: "Started".into(),
+                message: String::new(),
+                severity: crate::model::PopoverSeverity::Info,
+            }],
+        },
+    });
+    let cs = app.correlate_state().unwrap();
+    assert_eq!(cs.diagnosis.as_ref(), Some(&diag));
+    assert_eq!(cs.events.len(), 1);
+}
+
+#[test]
+fn correlate_streaming_updates_for_stale_entity_are_dropped() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
+        "wf-001",
+    )]));
+    app.handle(Action::Correlate);
+    app.handle(Action::CorrelateUpdate {
         entity: entity_wf("wf-OTHER"),
-        events: vec![],
-        source_errors: vec![],
-        diagnosis: None,
+        update: CorrelateUpdate::Loading {
+            sources: vec!["temporal".into()],
+        },
     });
     let cs = app.correlate_state().unwrap();
     assert!(
-        matches!(cs.status, CorrelateStatus::Loading),
-        "stale results must not flip the popup into Loaded"
+        cs.sources.is_empty(),
+        "stale Loading must not flip the dots row"
     );
 }
 
@@ -1129,18 +1252,16 @@ fn correlate_with_overlay_already_open_is_inert() {
 }
 
 #[test]
-fn correlate_results_when_no_overlay_open_are_dropped() {
+fn correlate_streaming_updates_when_no_overlay_open_are_dropped() {
     let mut app = App::new();
-    // Never opened the popup; out-of-band results must not crash or
+    // Never opened the popup; out-of-band updates must not crash or
     // flip state.
-    app.handle(Action::CorrelateResults {
+    app.handle(Action::CorrelateUpdate {
         entity: entity_wf("wf-001"),
-        events: vec![],
-        source_errors: vec![SourceError {
-            name: "loki".into(),
+        update: CorrelateUpdate::SourceFailed {
+            source: "loki".into(),
             reason: "x".into(),
-        }],
-        diagnosis: None,
+        },
     });
     assert!(app.correlate_state().is_none());
 }

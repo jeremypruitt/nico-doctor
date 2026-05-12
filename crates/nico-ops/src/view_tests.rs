@@ -1,6 +1,73 @@
 use super::*;
 use crate::action::{Action, Dir};
-use crate::model::{LayerSnapshot, PopoverEvent, PopoverSeverity, SourceError};
+use crate::model::{
+    CorrelateUpdate, EntityRef, LayerSnapshot, PopoverDiagnosis, PopoverEvent, PopoverSeverity,
+    SourceError,
+};
+
+/// Test helper that fans a bulk fixture (events + source_errors +
+/// diagnosis) out across the new streaming actions in the same order
+/// the runner would emit them: Loading → SourceLanded(s) →
+/// SourceFailed(s) → Diagnosis → Done. Old PRD-007 Slice 0 tests were
+/// written against a one-shot `CorrelateResults` action; this helper
+/// keeps the test intent compact while exercising the streaming path.
+fn dispatch_correlate_fixture(
+    app: &mut App,
+    entity: EntityRef,
+    events: Vec<PopoverEvent>,
+    source_errors: Vec<SourceError>,
+    diagnosis: Option<PopoverDiagnosis>,
+) {
+    let mut source_names: Vec<String> = Vec::new();
+    for e in &events {
+        if !source_names.contains(&e.source) {
+            source_names.push(e.source.clone());
+        }
+    }
+    for se in &source_errors {
+        if !source_names.contains(&se.name) {
+            source_names.push(se.name.clone());
+        }
+    }
+    app.handle(Action::CorrelateUpdate {
+        entity: entity.clone(),
+        update: CorrelateUpdate::Loading {
+            sources: source_names.clone(),
+        },
+    });
+    for name in &source_names {
+        let evs: Vec<PopoverEvent> = events
+            .iter()
+            .filter(|e| &e.source == name)
+            .cloned()
+            .collect();
+        if let Some(se) = source_errors.iter().find(|s| &s.name == name) {
+            app.handle(Action::CorrelateUpdate {
+                entity: entity.clone(),
+                update: CorrelateUpdate::SourceFailed {
+                    source: se.name.clone(),
+                    reason: se.reason.clone(),
+                },
+            });
+        } else if !evs.is_empty() {
+            app.handle(Action::CorrelateUpdate {
+                entity: entity.clone(),
+                update: CorrelateUpdate::SourceLanded {
+                    source: name.clone(),
+                    events: evs,
+                },
+            });
+        }
+    }
+    app.handle(Action::CorrelateUpdate {
+        entity: entity.clone(),
+        update: CorrelateUpdate::Diagnosis { diagnosis },
+    });
+    app.handle(Action::CorrelateUpdate {
+        entity,
+        update: CorrelateUpdate::Done,
+    });
+}
 use chrono::TimeZone;
 use nico_common::theme::DEFAULT;
 use ratatui::Terminal;
@@ -1159,12 +1226,13 @@ fn correlate_overlay_body_renders_loaded_timeline_events() {
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
     open_correlate(&mut app);
-    app.handle(Action::CorrelateResults {
-        entity: crate::model::EntityRef {
+    dispatch_correlate_fixture(
+        &mut app,
+        crate::model::EntityRef {
             id: "wf-001".into(),
             id_type: nico_correlate::id::IdType::Workflow,
         },
-        events: vec![
+        vec![
             PopoverEvent {
                 ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 5).unwrap(),
                 source: "temporal".into(),
@@ -1180,9 +1248,9 @@ fn correlate_overlay_body_renders_loaded_timeline_events() {
                 severity: PopoverSeverity::Error,
             },
         ],
-        source_errors: vec![],
-        diagnosis: None,
-    });
+        vec![],
+        None,
+    );
     let s = render_to_string(&mut app, 120, 30);
     assert!(
         s.contains("WorkflowExecutionStarted"),
@@ -1207,18 +1275,19 @@ fn correlate_overlay_renders_source_errors_inline_as_source_error_rows() {
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
     open_correlate(&mut app);
-    app.handle(Action::CorrelateResults {
-        entity: crate::model::EntityRef {
+    dispatch_correlate_fixture(
+        &mut app,
+        crate::model::EntityRef {
             id: "wf-001".into(),
             id_type: nico_correlate::id::IdType::Workflow,
         },
-        events: vec![],
-        source_errors: vec![SourceError {
+        vec![],
+        vec![SourceError {
             name: "loki".into(),
             reason: "LOKI_URL not set".into(),
         }],
-        diagnosis: None,
-    });
+        None,
+    );
     let s = render_to_string(&mut app, 120, 30);
     assert!(
         s.contains("source_error"),
@@ -1236,15 +1305,16 @@ fn correlate_overlay_renders_empty_state_when_no_events_and_no_source_errors() {
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
     open_correlate(&mut app);
-    app.handle(Action::CorrelateResults {
-        entity: crate::model::EntityRef {
+    dispatch_correlate_fixture(
+        &mut app,
+        crate::model::EntityRef {
             id: "wf-001".into(),
             id_type: nico_correlate::id::IdType::Workflow,
         },
-        events: vec![],
-        source_errors: vec![],
-        diagnosis: None,
-    });
+        vec![],
+        vec![],
+        None,
+    );
     let s = render_to_string(&mut app, 120, 30);
     assert!(
         s.contains("no events found"),
@@ -1313,9 +1383,10 @@ fn correlate_popup_for_dpu_renders_diagnosis_banner_and_timeline_at_120_cols() {
         id: "dpu-r12u5".into(),
         id_type: nico_correlate::id::IdType::Dpu,
     };
-    app.handle(Action::CorrelateResults {
-        entity: dpu_entity,
-        events: vec![
+    dispatch_correlate_fixture(
+        &mut app,
+        dpu_entity,
+        vec![
             PopoverEvent {
                 ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 14, 30, 0).unwrap(),
                 source: "postgres".into(),
@@ -1331,13 +1402,13 @@ fn correlate_popup_for_dpu_renders_diagnosis_banner_and_timeline_at_120_cols() {
                 severity: PopoverSeverity::Error,
             },
         ],
-        source_errors: vec![],
-        diagnosis: Some(crate::model::PopoverDiagnosis {
+        vec![],
+        Some(crate::model::PopoverDiagnosis {
             pattern: "k8s_crash_loop".into(),
             error_signature: "pod worker-xyz in CrashLoopBackOff (6 restarts)".into(),
             next_commands: vec!["kubectl describe pod worker-xyz".into()],
         }),
-    });
+    );
     let s = render_to_string(&mut app, 120, 30);
     // Title pins the entity by id, not "workflow-id"-flavored suffix.
     assert!(
@@ -1394,18 +1465,19 @@ fn correlate_popup_omits_diagnosis_section_when_no_diagnosis_present() {
         id: "dpu-r12u5".into(),
         id_type: nico_correlate::id::IdType::Dpu,
     };
-    app.handle(Action::CorrelateResults {
-        entity: dpu_entity,
-        events: vec![PopoverEvent {
+    dispatch_correlate_fixture(
+        &mut app,
+        dpu_entity,
+        vec![PopoverEvent {
             ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 14, 30, 0).unwrap(),
             source: "postgres".into(),
             kind: "provision_fail".into(),
             message: "BMC unreachable".into(),
             severity: PopoverSeverity::Warning,
         }],
-        source_errors: vec![],
-        diagnosis: None,
-    });
+        vec![],
+        None,
+    );
     let s = render_to_string(&mut app, 120, 30);
     assert!(
         !s.contains("diagnosis:"),
@@ -1415,4 +1487,196 @@ fn correlate_popup_omits_diagnosis_section_when_no_diagnosis_present() {
         s.contains("provision_fail"),
         "Timeline still renders without diagnosis:\n{s}"
     );
+}
+
+// ── PRD-007 Slice 2 (#374) — streaming + source-dots + action-row ───
+
+fn open_correlate_dpu(app: &mut App) {
+    app.handle(Action::Snapshots(vec![dpu_warn_snap(
+        "dpu-r12u5 disconnected at 14:32 (link down 5m)",
+    )]));
+    app.handle(Action::ShowSpotlight);
+    open_correlate(app);
+}
+
+fn dpu_entity() -> EntityRef {
+    EntityRef {
+        id: "dpu-r12u5".into(),
+        id_type: nico_correlate::id::IdType::Dpu,
+    }
+}
+
+#[test]
+fn correlate_popup_renders_action_row_at_each_supported_width() {
+    // Slice 2 acceptance: action row `[Enter] full   [esc] close`
+    // renders regardless of terminal width.
+    for w in [100u16, 120, 200] {
+        let mut app = App::new();
+        open_correlate_dpu(&mut app);
+        // Just opened — no updates yet, source dots row empty.
+        let s = render_to_string(&mut app, w, 30);
+        assert!(
+            s.contains("[Enter]"),
+            "action row missing at width {w}:\n{s}"
+        );
+        assert!(s.contains("[esc]"), "esc hint missing at width {w}:\n{s}");
+    }
+}
+
+#[test]
+fn correlate_popup_renders_source_dots_row_in_loading_state_at_three_widths() {
+    for w in [100u16, 120, 200] {
+        let mut app = App::new();
+        open_correlate_dpu(&mut app);
+        app.handle(Action::CorrelateUpdate {
+            entity: dpu_entity(),
+            update: CorrelateUpdate::Loading {
+                sources: vec!["temporal".into(), "postgres".into(), "loki".into()],
+            },
+        });
+        let s = render_to_string(&mut app, w, 30);
+        // Source names painted in the dots row.
+        assert!(
+            s.contains("temporal"),
+            "temporal name missing at width {w}:\n{s}"
+        );
+        assert!(
+            s.contains("postgres"),
+            "postgres name missing at width {w}:\n{s}"
+        );
+        assert!(s.contains("loki"), "loki name missing at width {w}:\n{s}");
+        // Still in flight → throbber suffix present.
+        assert!(
+            s.contains("collecting"),
+            "collecting suffix missing at width {w}:\n{s}"
+        );
+    }
+}
+
+#[test]
+fn correlate_popup_renders_partial_state_dot_glyphs_after_one_source_lands() {
+    let mut app = App::new();
+    open_correlate_dpu(&mut app);
+    app.handle(Action::CorrelateUpdate {
+        entity: dpu_entity(),
+        update: CorrelateUpdate::Loading {
+            sources: vec!["postgres".into(), "loki".into()],
+        },
+    });
+    app.handle(Action::CorrelateUpdate {
+        entity: dpu_entity(),
+        update: CorrelateUpdate::SourceLanded {
+            source: "postgres".into(),
+            events: vec![PopoverEvent {
+                ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 14, 30, 0).unwrap(),
+                source: "postgres".into(),
+                kind: "provision_fail".into(),
+                message: "BMC unreachable".into(),
+                severity: PopoverSeverity::Warning,
+            }],
+        },
+    });
+    let s = render_to_string(&mut app, 120, 30);
+    // Partial state: landed event present, throbber still on.
+    assert!(s.contains("provision_fail"), "landed event missing:\n{s}");
+    assert!(s.contains("collecting"), "should still show throbber:\n{s}");
+    // ● (landed) glyph and ⟳ (loading) glyph both painted somewhere.
+    assert!(s.contains("●"), "landed dot glyph missing:\n{s}");
+    assert!(s.contains("⟳"), "loading dot glyph missing:\n{s}");
+}
+
+#[test]
+fn correlate_popup_renders_fully_loaded_state_with_no_loading_dots() {
+    let mut app = App::new();
+    open_correlate_dpu(&mut app);
+    dispatch_correlate_fixture(
+        &mut app,
+        dpu_entity(),
+        vec![PopoverEvent {
+            ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 14, 30, 0).unwrap(),
+            source: "postgres".into(),
+            kind: "provision_fail".into(),
+            message: "BMC unreachable".into(),
+            severity: PopoverSeverity::Warning,
+        }],
+        vec![SourceError {
+            name: "loki".into(),
+            reason: "LOKI_URL not set".into(),
+        }],
+        None,
+    );
+    let s = render_to_string(&mut app, 120, 30);
+    assert!(!s.contains("collecting"), "throbber should be off:\n{s}");
+    assert!(!s.contains("⟳"), "no loading dots when fully landed:\n{s}");
+    // Landed + Failed dots present.
+    assert!(s.contains("●"), "landed dot missing:\n{s}");
+    assert!(s.contains("✗"), "failed dot missing:\n{s}");
+    // source_error row renders below the timeline.
+    assert!(s.contains("source_error"), "source_error row missing:\n{s}");
+}
+
+#[test]
+fn correlate_popup_renders_empty_result_state_after_done() {
+    // "No events in the last 1h for dpu-r12u5" empty state — slice 2
+    // acceptance: empty-result state renders cleanly.
+    let mut app = App::new();
+    open_correlate_dpu(&mut app);
+    app.handle(Action::CorrelateUpdate {
+        entity: dpu_entity(),
+        update: CorrelateUpdate::Loading {
+            sources: vec!["postgres".into()],
+        },
+    });
+    app.handle(Action::CorrelateUpdate {
+        entity: dpu_entity(),
+        update: CorrelateUpdate::SourceLanded {
+            source: "postgres".into(),
+            events: vec![],
+        },
+    });
+    app.handle(Action::CorrelateUpdate {
+        entity: dpu_entity(),
+        update: CorrelateUpdate::Diagnosis { diagnosis: None },
+    });
+    app.handle(Action::CorrelateUpdate {
+        entity: dpu_entity(),
+        update: CorrelateUpdate::Done,
+    });
+    let s = render_to_string(&mut app, 120, 30);
+    assert!(
+        s.contains("no events found"),
+        "empty-result hint missing:\n{s}"
+    );
+    assert!(s.contains("[Enter]"), "action row missing:\n{s}");
+}
+
+#[test]
+fn correlate_popup_renders_error_state_after_all_sources_fail() {
+    // Error state: every source unavailable → only source_error rows
+    // appear; empty-result hint suppressed (we *did* get something).
+    let mut app = App::new();
+    open_correlate_dpu(&mut app);
+    dispatch_correlate_fixture(
+        &mut app,
+        dpu_entity(),
+        vec![],
+        vec![
+            SourceError {
+                name: "loki".into(),
+                reason: "LOKI_URL not set".into(),
+            },
+            SourceError {
+                name: "postgres".into(),
+                reason: "connect refused".into(),
+            },
+        ],
+        None,
+    );
+    let s = render_to_string(&mut app, 120, 30);
+    assert!(s.contains("source_error"), "source_error rows missing:\n{s}");
+    assert!(
+        !s.contains("no events found"),
+        "error state should not surface empty-result hint:\n{s}"
+    );
+    assert!(s.contains("✗"), "failed dots missing:\n{s}");
 }

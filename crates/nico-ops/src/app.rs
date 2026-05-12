@@ -9,8 +9,8 @@ use ratatui::layout::Rect;
 use crate::action::{Action, Dir, ScrollDir};
 use crate::events::Overlay;
 use crate::model::{
-    CorrelateState, CorrelateStatus, EntityRef, LayerSnapshot, LogLine,
-    extract_entity_from_finding,
+    CorrelateState, CorrelateUpdate, EntityRef, LayerSnapshot, LogLine, PopoverEvent,
+    SourceError, SourceStatus, extract_entity_from_finding,
 };
 use crate::pulse::PulseTimer;
 use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
@@ -537,29 +537,16 @@ impl App {
                     return None;
                 }
                 self.overlay = Overlay::Correlate;
-                self.correlate = Some(CorrelateState {
-                    entity: entity.clone(),
-                    status: CorrelateStatus::Loading,
-                    diagnosis: None,
-                });
+                self.correlate = Some(CorrelateState::new(entity.clone()));
                 self.dirty = true;
                 Some(Effect::RunCorrelate(entity))
             }
-            Action::CorrelateResults {
-                entity,
-                events,
-                source_errors,
-                diagnosis,
-            } => {
+            Action::CorrelateUpdate { entity, update } => {
                 let state = self.correlate.as_mut()?;
                 if state.entity != entity {
                     return None;
                 }
-                state.status = CorrelateStatus::Loaded {
-                    events,
-                    source_errors,
-                };
-                state.diagnosis = diagnosis;
+                apply_correlate_update(state, update);
                 self.dirty = true;
                 None
             }
@@ -779,6 +766,52 @@ fn contains(r: &Rect, col: u16, row: u16) -> bool {
         && col < r.x.saturating_add(r.width)
         && row >= r.y
         && row < r.y.saturating_add(r.height)
+}
+
+/// Apply one streaming runner update to the popup's
+/// [`CorrelateState`]. Pulled out of the reducer so the merge rules
+/// (source-status flips, timeline append-and-sort, idempotent name
+/// lists) have one home and one set of unit tests.
+fn apply_correlate_update(state: &mut CorrelateState, update: CorrelateUpdate) {
+    match update {
+        CorrelateUpdate::Loading { sources } => {
+            state.sources = sources
+                .into_iter()
+                .map(|name| (name, SourceStatus::Loading))
+                .collect();
+        }
+        CorrelateUpdate::SourceLanded {
+            source,
+            mut events,
+        } => {
+            set_source_status(state, &source, SourceStatus::Landed);
+            state.events.append(&mut events);
+            state.events.sort_by_key(|e: &PopoverEvent| e.ts);
+        }
+        CorrelateUpdate::SourceFailed { source, reason } => {
+            set_source_status(state, &source, SourceStatus::Failed);
+            state.source_errors.push(SourceError {
+                name: source,
+                reason,
+            });
+        }
+        CorrelateUpdate::Diagnosis { diagnosis } => {
+            state.diagnosis = diagnosis;
+        }
+        CorrelateUpdate::Done => {
+            state.done = true;
+        }
+    }
+}
+
+fn set_source_status(state: &mut CorrelateState, name: &str, status: SourceStatus) {
+    if let Some(entry) = state.sources.iter_mut().find(|(n, _)| n == name) {
+        entry.1 = status;
+    } else {
+        // A late landing for a source we never saw in `Loading` — push
+        // it in so the dots row still reflects what actually happened.
+        state.sources.push((name.to_string(), status));
+    }
 }
 
 #[cfg(test)]
