@@ -307,6 +307,58 @@ mod tests {
         }
     }
 
+    /// PRD-006 Slice 3 (issue #369): popup-primitive modal-stack contract.
+    /// While any popup is active, navigation / refresh / focus-toggle keys
+    /// MUST NOT translate to an action that targets the underlying view.
+    /// Only overlay-local actions (dismiss, scroll, quit) may be emitted.
+    #[test]
+    fn popup_open_captures_underlying_view_keys() {
+        let underlying_nav_keys = [
+            KeyCode::Char('h'),
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('R'),
+            KeyCode::Char('r'),
+            KeyCode::Char(' '),
+            KeyCode::Char('s'),
+            KeyCode::Char('a'),
+            KeyCode::Char('m'),
+            KeyCode::Char('M'),
+            KeyCode::Char('y'),
+            KeyCode::Char('o'),
+        ];
+        for ov in [Overlay::Detail, Overlay::Help, Overlay::Correlate] {
+            for code in underlying_nav_keys {
+                let action = tr(&k(code), ov);
+                let leaks = matches!(
+                    action,
+                    Some(
+                        Action::Focus(_)
+                            | Action::Refresh
+                            | Action::TogglePause
+                            | Action::ShowSpotlight
+                            | Action::ShowAll
+                            | Action::ShowToast(_)
+                            | Action::ToggleMouseCapture
+                            | Action::CopyNextCommand
+                            | Action::OpenLink
+                            | Action::OpenDetail
+                            | Action::OpenHelp
+                            | Action::Correlate
+                    )
+                );
+                assert!(
+                    !leaks,
+                    "underlying-view action {action:?} leaked while overlay={ov:?} key={code:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn enter_inside_detail_closes_overlay() {
         assert_eq!(

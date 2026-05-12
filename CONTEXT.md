@@ -109,6 +109,8 @@ every output line points at where to dig deeper.
 - **ADR label** — `adr-NNNN` (4-digit, matching the ADR filename). Applied to issues that touch or amend that ADR. Bidirectional backlink: ADR docs reference issues; issues reference ADRs via this label.
 - **SDLC state** — the column an issue or PR sits in on the project board (project 1, `https://github.com/users/jeremypruitt/projects/1`). Five values: `Backlog` (filed, not yet specced), `Ready` (specced + triaged + carries `ready-for-agent` or `ready-for-human`), `In progress` (a draft PR exists), `Validating` (a non-draft PR is open and CI/review is running), `Done` (issue closed or PR merged). Set automatically by `.github/workflows/project-automation.yml` on lifecycle events; manual edits via `gh project item-edit` are allowed but expected to be rare and re-asserted on the next event. The state is the project's primary SDLC oversight surface — every actionable issue and PR must appear on the board.
 - **PR↔issue linkage** — every PR with `Closes #N` (or `Fixes`/`Resolves`) drives the linked issue's SDLC state via the project-automation workflow. Required by the repo CI ruleset (`ci.yml` blocks PRs without one). Linked-issue resolution uses GraphQL `closingIssuesReferences`; only those three keywords count, plain `#N` mentions don't. A PR closed *without* merging moves the PR card to `Done` but leaves linked issues' states untouched.
+- **Popup primitive** (nico-ops specific) — the shared render contract every overlay in `nico ops` routes through, landed in PRD-006 Slice 3 (issue #369). Lives in `crates/nico-ops/src/popup.rs`. Inputs: `PopupSpec { title, body: Vec<Line>, footer: Vec<Line>, size: PopupSize, scroll: u16 }` plus theme + frame + area. The primitive owns the chrome (centered rect, `Clear` wipe, bordered `Block` with title, body `Paragraph` with vertical scroll, footer band for keymap hints). Three size bands cover every overlay today: `Small` (60% × 50%, help/keybinds), `Medium` (80% × 70%, correlate popover), `Large` (80% × 80%, detail). Modal-stack semantics (one popup at a time, underlying view stops receiving keys while a popup is open) live in `events::translate` + the `App` reducer's `Overlay::None` guards on every `Open*` action — the primitive itself is a pure render helper. Every existing overlay (`Overlay::Detail`, `Overlay::Help`, `Overlay::Correlate`) was ported to it in the same slice; no empty/mystery popups reachable from any keybinding. PRD-007's correlate drill-down popup is the next consumer.
+  _Avoid_: modal, dialog (popup is the project term)
 
 ## Umbrella binary layout
 
@@ -122,10 +124,12 @@ every output line points at where to dig deeper.
   `resolve_config`, `prepare_sources`, `collect_all`, `run_correlate`.
   No `[[bin]]` section, no `ratatui`/`crossterm` deps. (ADR-011)
 - `crates/nico-ops` — interactive ratatui dashboard (~7,900 LOC). Exposes
-  `run_ops()` (Layout A scorecard / Layout B Mission Control / Spotlight),
-  the `App` reducer + `Action` enum, and the per-refresh `data::collect`
-  fan-out. Hosts the `dpu` HBN panel via `nico ops hbn`. ADR-012's async
-  Component event loop landed here in earlier slices.
+  `run_ops()` (Scorecard / Spotlight — two top-level views since
+  PRD-006 Slice 1, issue #367), the `App` reducer + `Action` enum, the
+  per-refresh `data::collect` fan-out, and the shared `popup` render
+  primitive every overlay routes through (PRD-006 Slice 3, issue #369).
+  Hosts the `dpu` HBN panel via `nico ops hbn`. ADR-012's async Component
+  event loop landed here in earlier slices.
 - `crates/nico-common` — shared config, theme, output, k8s, temporal,
   reach-manager primitives. Unchanged by the umbrella restructure.
 
