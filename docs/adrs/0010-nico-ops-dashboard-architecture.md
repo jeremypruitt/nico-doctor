@@ -1,6 +1,6 @@
 # ADR-010: `nico-ops` dashboard architecture
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-05-11)
 - **Date:** 2026-05-06
 
 ## Context
@@ -174,3 +174,56 @@ contained to this one subcommand.
 - ADR-009 — umbrella binary `nico` and library-first subcommand crates.
 - ADR-011 — TUI removed from text subcommands; live dashboard moves here.
 - ADR-012 — async Component-style TUI event loop (the engine ADR-010 sits on).
+
+## Amendment — 2026-05-11 (PRD-006 slice 1, issue #367)
+
+### Mission Control shrink
+
+The Mission Control view (originally added under "Layout B — Tabs by
+Layer" in the Alternatives Considered table, then shipped as a 2×3
+quadrant grid in a follow-up slice) is removed. The `Layout` enum now
+carries exactly two variants:
+
+- `Layout::Scorecard` (formerly `Layout::A`) — the ADR-010 launch
+  layout described above.
+- `Layout::Spotlight` — the "3am page" view (incident cards over a green
+  footer).
+
+The `m` keybinding is preserved as a one-shot toast pointing operators at
+the two remaining views and the logs drill panel:
+
+> Mission Control removed; press \`s\` for Spotlight or \`l\` for logs
+
+### Why
+
+- The MC view duplicated coverage already provided by the Scorecard
+  grid + Spotlight pair, and the per-quadrant zoom path doubled the
+  surface area to maintain.
+- The `Quadrant` type + `Action::NamespaceEvents` + `Action::ZoomQuadrant`
+  + `Action::ToggleLayout` were the only consumers of a non-trivial
+  amount of state (`b_focus`, `b_zoomed`, `namespace_events`) and the
+  per-quadrant rendering paths in `view.rs`. Removing the view in one
+  pass collapses the dashboard back to the two operator surfaces
+  ADR-010 originally argued for.
+- The `nico_correlate::recent_namespace_events` helper (the Activity
+  feed's data source) is preserved for PRD-007's correlate drill-down
+  but is no longer wired into the dashboard refresh fan-out.
+
+### What changed concretely
+
+- `crates/nico-ops/src/app.rs` — `Layout::B` deleted, `Layout::A`
+  renamed to `Layout::Scorecard`, all MC-only reducer branches
+  removed.
+- `crates/nico-ops/src/events.rs` — `translate_layout_b` deleted, `m`
+  rebinding emits `Action::ShowToast` carrying
+  `MISSION_CONTROL_REMOVED_TOAST`.
+- `crates/nico-ops/src/view.rs` — `render_layout_b` and its quadrant
+  helpers deleted.
+- `crates/nico-ops/src/model.rs` — `Quadrant` type deleted.
+- `crates/nico-ops/src/action.rs` — `Action::ToggleLayout`,
+  `Action::ZoomQuadrant`, `Action::NamespaceEvents` deleted.
+- `crates/nico-ops/src/lib.rs` — `spawn_activity_refresh` and the
+  `ActivityCtx` struct deleted from the host loop.
+- Test suite — all MC-specific tests removed (not skipped); a
+  scorecard-layout-default test and two `m`-toast translator tests
+  encode the new contract.

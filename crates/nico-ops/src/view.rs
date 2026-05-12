@@ -16,7 +16,7 @@ use crate::app::{App, Layout as AppLayout};
 use crate::events::Overlay;
 use crate::model::{
     CorrelateState, CorrelateStatus, Finding, LayerSnapshot, LogLine, PopoverEvent,
-    PopoverSeverity, Quadrant, SourceError, overall_verdict,
+    PopoverSeverity, SourceError, overall_verdict,
 };
 use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
 
@@ -57,13 +57,12 @@ pub const HELP_LINES: &[&str] = &[
 /// only known here and have to round-trip to the reducer somehow.
 pub fn render(app: &mut App, theme: &Theme, frame: &mut Frame) {
     match app.layout() {
-        AppLayout::A => render_layout_a(app, theme, frame),
-        AppLayout::B => render_layout_b(app, theme, frame),
+        AppLayout::Scorecard => render_scorecard_layout(app, theme, frame),
         AppLayout::Spotlight => render_spotlight(app, theme, frame),
     }
 }
 
-fn render_layout_a(app: &mut App, theme: &Theme, frame: &mut Frame) {
+fn render_scorecard_layout(app: &mut App, theme: &Theme, frame: &mut Frame) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -471,20 +470,16 @@ fn render_drill(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 }
 
 /// Render the snapshot logs panel — error log lines from the most recent
-/// refresh round. Used by Layout A's drill panel (when the `logs` layer is
-/// focused) and Layout B's `Logs` quadrant. The renderer is the sole cap
-/// on visible row count: it shows up to `inner.height` rows from
+/// refresh round. Used by the scorecard drill panel when the `logs`
+/// layer is focused. (Mission Control's `Logs` quadrant used to be the
+/// other consumer; it was removed in PRD-006 slice 1, issue #367.) The
+/// renderer is the sole cap on visible row count: it shows up to
+/// `inner.height` rows from
 /// `lines[clamped..]` and the title carries the `start–end of total`
 /// range. `scroll` is clamped on use so a post-refresh dataset shrink
 /// can't render past the end. Empty `lines` yields a "no errors" empty
 /// state. Issue #158, ADR-0014.
-fn render_logs_panel(
-    lines: &[LogLine],
-    scroll: u16,
-    theme: &Theme,
-    frame: &mut Frame,
-    area: Rect,
-) {
+fn render_logs_panel(lines: &[LogLine], scroll: u16, theme: &Theme, frame: &mut Frame, area: Rect) {
     let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(area);
     let total = lines.len();
@@ -504,10 +499,7 @@ fn render_logs_panel(
     }
 
     if lines.is_empty() {
-        let empty = Line::from(Span::styled(
-            "no errors",
-            Style::default().fg(theme.muted),
-        ));
+        let empty = Line::from(Span::styled("no errors", Style::default().fg(theme.muted)));
         frame.render_widget(Paragraph::new(empty), inner);
         return;
     }
@@ -859,278 +851,15 @@ fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
     }
 }
 
-// ── Layout B (Mission Control, issue #155) ────────────────────────────
-
-/// Inner cell rows needed to fit a Quadrant-pixel-size big-text glyph
-/// (4 inner rows). Add 2 for the surrounding block borders to get the
-/// outer header height. Below this we degrade to an ASCII verdict line.
-const BIG_TEXT_INNER_ROWS: u16 = 4;
-const BIG_TEXT_HEADER_HEIGHT: u16 = BIG_TEXT_INNER_ROWS + 2;
-const ASCII_HEADER_HEIGHT: u16 = 3;
-
-fn render_layout_b(app: &App, theme: &Theme, frame: &mut Frame) {
-    let area = frame.area();
-    let header_height = if area.height >= BIG_TEXT_HEADER_HEIGHT + 8 {
-        BIG_TEXT_HEADER_HEIGHT
-    } else {
-        ASCII_HEADER_HEIGHT
-    };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(header_height),
-            Constraint::Min(6),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    render_layout_b_header(app, theme, frame, chunks[0]);
-    if app.b_zoomed() {
-        render_layout_b_zoomed(app, theme, frame, chunks[1]);
-    } else {
-        render_layout_b_grid(app, theme, frame, chunks[1]);
-    }
-    render_layout_b_hint_bar(app, theme, frame, chunks[2]);
-
-    if app.overlay() == Overlay::Help {
-        // Layout B does not use the Detail overlay; Enter zooms instead.
-        render_help_overlay(theme, frame, area);
-    }
-}
-
-fn render_layout_b_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let snapshots = app.snapshots();
-    let verdict = overall_verdict(snapshots);
-    let word = verdict_word(&verdict);
-    let color = theme_color(theme, &verdict);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" mission control ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height >= BIG_TEXT_INNER_ROWS {
-        let big = BigText::builder()
-            .pixel_size(PixelSize::Quadrant)
-            .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
-            .lines(vec![Line::from(word)])
-            .build();
-        frame.render_widget(big, inner);
-    } else {
-        // ASCII fallback when the terminal is too short for tui-big-text.
-        let line = Line::from(Span::styled(
-            word.to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
-        frame.render_widget(Paragraph::new(line), inner);
-    }
-}
-
-fn render_layout_b_grid(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
-        .split(area);
-
-    for row in 0..2 {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Ratio(1, 3),
-                Constraint::Ratio(1, 3),
-                Constraint::Ratio(1, 3),
-            ])
-            .split(rows[row]);
-        for col in 0..3 {
-            let idx = row * 3 + col;
-            let q = Quadrant::ALL[idx];
-            let focused = idx == app.b_focus();
-            render_quadrant(app, q, focused, theme, frame, cols[col]);
-        }
-    }
-}
-
-fn render_layout_b_zoomed(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
-    render_quadrant(app, app.focused_quadrant(), true, theme, frame, area);
-}
-
-fn render_quadrant(
-    app: &App,
-    quadrant: Quadrant,
-    focused: bool,
-    theme: &Theme,
-    frame: &mut Frame,
-    area: Rect,
-) {
-    let title_text = if focused {
-        format!(" ▶ {} ", quadrant.title())
-    } else {
-        format!(" {} ", quadrant.title())
-    };
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .title(title_text);
-    if focused {
-        block = block.border_style(
-            Style::default()
-                .fg(theme.overlay_key)
-                .add_modifier(Modifier::BOLD),
-        );
-    }
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 {
-        return;
-    }
-
-    match quadrant {
-        Quadrant::Activity => render_activity_body(app, theme, frame, inner),
-        Quadrant::Logs => render_logs_quadrant_body(app, theme, frame, inner),
-        _ => render_layer_body(app, quadrant, theme, frame, inner),
-    }
-}
-
-/// Layout B's `Logs` quadrant body. Reuses the snapshot logs panel so
-/// Layout A's drill and this quadrant stay visually consistent. Honors
-/// `logs_scroll` when the quadrant is the dominant view (zoomed); the
-/// offset is clamped on use so a stale value can't render past the end.
-/// Issue #158, ADR-0014.
-fn render_logs_quadrant_body(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let lines = app.log_lines();
-    if lines.is_empty() {
-        let line = Line::from(Span::styled(
-            "no errors",
-            Style::default().fg(theme.muted),
-        ));
-        frame.render_widget(Paragraph::new(line), area);
-        return;
-    }
-    let height = area.height as usize;
-    let max_offset = lines.len().saturating_sub(height);
-    let clamped = (app.logs_scroll() as usize).min(max_offset);
-    let visible = lines.len().saturating_sub(clamped).min(height);
-    let body: Vec<Line> = lines
-        .iter()
-        .skip(clamped)
-        .take(visible)
-        .map(|l| log_line_spans(l, theme, area.width))
-        .collect();
-    frame.render_widget(Paragraph::new(body), area);
-}
-
-fn render_layer_body(
-    app: &App,
-    quadrant: Quadrant,
-    theme: &Theme,
-    frame: &mut Frame,
-    area: Rect,
-) {
-    let lines: Vec<Line> = match find_snapshot(app.snapshots(), quadrant) {
-        Some(s) => layer_body_lines(s, theme),
-        None => vec![Line::from(Span::styled(
-            "no data",
-            Style::default().fg(theme.muted),
-        ))],
-    };
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
-}
-
-fn find_snapshot(snapshots: &[LayerSnapshot], quadrant: Quadrant) -> Option<&LayerSnapshot> {
-    let name = quadrant.layer_name()?;
-    snapshots.iter().find(|s| s.name == name)
-}
-
-fn layer_body_lines(snap: &LayerSnapshot, theme: &Theme) -> Vec<Line<'static>> {
-    let pip_style = Style::default().fg(theme_color(theme, &snap.status));
-    let mut out = vec![Line::from(vec![
-        Span::styled(format!("{} ", pip_glyph(&snap.status)), pip_style),
-        Span::raw(snap.evidence.clone()),
-    ])];
-    let mut findings_added = 0;
-    for f in &snap.findings {
-        if findings_added >= 4 {
-            break;
-        }
-        out.push(Line::from(vec![
-            Span::styled(
-                format!("{} ", pip_glyph(&f.status)),
-                Style::default().fg(theme_color(theme, &f.status)),
-            ),
-            Span::raw(f.message.clone()),
-        ]));
-        findings_added += 1;
-    }
-    if snap.findings.len() > findings_added {
-        out.push(Line::from(Span::styled(
-            format!("    +{} more", snap.findings.len() - findings_added),
-            Style::default().fg(theme.muted),
-        )));
-    }
-    out
-}
-
-fn render_activity_body(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let events = app.namespace_events();
-    if events.is_empty() {
-        let line = Line::from(Span::styled(
-            "no recent namespace events",
-            Style::default().fg(theme.muted),
-        ));
-        frame.render_widget(Paragraph::new(line), area);
-        return;
-    }
-    let max_rows = area.height as usize;
-    let lines: Vec<Line> = events
-        .iter()
-        .take(max_rows)
-        .map(|e| {
-            let status = severity_status(e);
-            let color = theme_color(theme, &status);
-            Line::from(vec![
-                Span::styled(
-                    format!("{} ", pip_glyph(&status)),
-                    Style::default().fg(color),
-                ),
-                Span::raw(format!("{}  ", e.ts.format("%H:%M:%S"))),
-                Span::styled(
-                    format!("{:<8}", e.source),
-                    Style::default().fg(theme.muted),
-                ),
-                Span::raw(format!(" {}", e.kind)),
-            ])
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
-}
-
-fn severity_status(event: &nico_correlate::Event) -> Status {
-    match event.severity {
-        nico_correlate::Severity::Info => Status::Ok,
-        nico_correlate::Severity::Warning => Status::Warn,
-        nico_correlate::Severity::Error => Status::Fail,
-    }
-}
-
-fn render_layout_b_hint_bar(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let mut hint = String::from(" ");
-    if app.b_zoomed() {
-        hint.push_str("Esc:restore  ");
-    } else {
-        hint.push_str("Enter:zoom  ");
-    }
-    hint.push_str("hjkl/arrows:focus  m/Esc:back to A  R:refresh  ?:help  q:quit ");
-    let mut spans: Vec<Span> = vec![Span::styled(hint, Style::default().fg(theme.muted))];
-    if app.paused() {
-        spans.push(Span::styled(
-            " PAUSED ",
-            Style::default()
-                .fg(theme.warn)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        ));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
+// ── Mission Control (Layout B) removed in PRD-006 slice 1 (issue #367).
+//
+// The 2×3 quadrant grid, its tui-big-text verdict header, the Activity
+// feed, the per-quadrant zoom path, and the bespoke Layout-B hint bar
+// used to live below this point. The scorecard layout now carries the
+// full set of operator affordances; the `m` keybinding raises a one-shot
+// toast pointing operators at the two remaining views (Scorecard ↔
+// Spotlight) and the logs drill. See ADR-0010 "Mission Control shrink"
+// amendment.
 
 #[cfg(test)]
 #[path = "view_tests.rs"]

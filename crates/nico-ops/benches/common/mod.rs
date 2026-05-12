@@ -10,17 +10,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use nico_common::output::Status;
 use nico_doctor::layer::{Check, CheckKind, Layer, LayerOutcome, RunOpts};
 use nico_ops::action::Action;
 use nico_ops::app::App;
 use nico_ops::model::{Finding, LayerSnapshot, LogLine};
-use nico_correlate::event::{Event, Severity};
-use chrono::Utc;
-use std::collections::HashMap;
 
-/// Layer order mirroring the `nico ops` Layout A / B grid. Five backed
-/// layers + one synthetic activity quadrant.
+/// Layer order mirroring the `nico ops` scorecard grid. Mission Control
+/// (Layout B) and its synthetic Activity quadrant were removed in PRD-006
+/// slice 1 (issue #367); the layer order is preserved here so benches
+/// stay comparable across the shrink.
 pub const LAYER_NAMES: &[&str] = &[
     "cluster",
     "workflows",
@@ -82,21 +82,6 @@ pub fn fleet_log_lines(n: usize) -> Vec<LogLine> {
         .collect()
 }
 
-/// Build a fleet of N synthetic namespace events for Layout B's Activity
-/// quadrant.
-pub fn fleet_namespace_events(n: usize) -> Vec<Event> {
-    (0..n)
-        .map(|i| Event {
-            ts: Utc::now(),
-            source: "k8s".into(),
-            kind: "BackOff".into(),
-            message: format!("synthetic event {i}: BackOff"),
-            severity: Severity::Warning,
-            tags: HashMap::new(),
-        })
-        .collect()
-}
-
 /// A synthetic Layer that returns a predetermined set of checks with
 /// zero I/O. Drives the fan-out bench without any real cluster.
 pub struct BenchLayer {
@@ -107,13 +92,19 @@ pub struct BenchLayer {
 
 impl BenchLayer {
     pub fn new(name: &'static str, status: Status, finding_count: usize) -> Self {
-        Self { name, status, finding_count }
+        Self {
+            name,
+            status,
+            finding_count,
+        }
     }
 }
 
 #[async_trait]
 impl Layer for BenchLayer {
-    fn name(&self) -> &'static str { self.name }
+    fn name(&self) -> &'static str {
+        self.name
+    }
     async fn collect(&self, _opts: &RunOpts) -> LayerOutcome {
         let status = self.status.clone();
         let checks: Vec<Check> = (0..self.finding_count)
@@ -170,7 +161,6 @@ pub fn warmed_app(n: usize) -> App {
     app.handle(Action::Tick(now));
     app.handle(Action::Snapshots(fleet_snapshots(n)));
     app.handle(Action::LogLines(fleet_log_lines(n.min(50))));
-    app.handle(Action::NamespaceEvents(fleet_namespace_events(n.min(20))));
     app.handle(Action::Tick(now + std::time::Duration::from_millis(100)));
     app
 }

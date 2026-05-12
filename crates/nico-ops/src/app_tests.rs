@@ -443,137 +443,17 @@ fn throbber_glyph_animates_while_refreshing() {
     assert_ne!(f0, THROBBER_DONE);
 }
 
-// ── Layout B (Mission Control, issue #155) ──────────────────────────
+// ── Mission Control (Layout B) removed in PRD-006 slice 1 (issue #367).
+// The block of tests that exercised the 2×3 quadrant grid, the Activity
+// feed, and the per-quadrant zoom path was deleted here. The
+// `Layout::Scorecard ↔ Layout::Spotlight` toggle behaviour is covered by
+// the existing Spotlight tests further down, and the `m`-toast behaviour
+// lives in `events::tests::lower_m_surfaces_mission_control_removed_toast`.
 
 #[test]
-fn fresh_app_starts_in_layout_a() {
+fn fresh_app_starts_in_scorecard_layout() {
     let app = App::new();
-    assert_eq!(app.layout(), Layout::A);
-    assert_eq!(app.b_focus(), 0);
-    assert!(!app.b_zoomed());
-}
-
-#[test]
-fn toggle_layout_flips_between_a_and_b() {
-    let mut app = App::new();
-    app.handle(Action::ToggleLayout);
-    assert_eq!(app.layout(), Layout::B);
-    app.handle(Action::ToggleLayout);
-    assert_eq!(app.layout(), Layout::A);
-}
-
-#[test]
-fn esc_in_layout_b_returns_to_layout_a() {
-    let mut app = App::new();
-    app.handle(Action::ToggleLayout);
-    assert_eq!(app.layout(), Layout::B);
-    app.handle(Action::CloseOverlay);
-    assert_eq!(app.layout(), Layout::A);
-}
-
-#[test]
-fn enter_zooms_focused_quadrant_in_layout_b() {
-    let mut app = App::new();
-    app.handle(Action::ToggleLayout);
-    app.handle(Action::ZoomQuadrant);
-    assert!(app.b_zoomed());
-}
-
-#[test]
-fn esc_in_zoomed_layout_b_unzooms_first_then_returns() {
-    let mut app = App::new();
-    app.handle(Action::ToggleLayout);
-    app.handle(Action::ZoomQuadrant);
-    // First Esc: unzoom but stay in Layout B.
-    app.handle(Action::CloseOverlay);
-    assert!(!app.b_zoomed());
-    assert_eq!(app.layout(), Layout::B);
-    // Second Esc: returns to Layout A.
-    app.handle(Action::CloseOverlay);
-    assert_eq!(app.layout(), Layout::A);
-}
-
-#[test]
-fn focus_in_layout_b_moves_in_two_by_three_grid() {
-    let mut app = App::new();
-    app.handle(Action::ToggleLayout);
-    // 0 1 2
-    // 3 4 5
-    app.handle(Action::Focus(Dir::Right));
-    assert_eq!(app.b_focus(), 1);
-    app.handle(Action::Focus(Dir::Down));
-    assert_eq!(app.b_focus(), 4);
-    app.handle(Action::Focus(Dir::Left));
-    assert_eq!(app.b_focus(), 3);
-    app.handle(Action::Focus(Dir::Up));
-    assert_eq!(app.b_focus(), 0);
-}
-
-#[test]
-fn focused_quadrant_matches_b_focus() {
-    let mut app = App::new();
-    app.handle(Action::ToggleLayout);
-    assert_eq!(app.focused_quadrant(), Quadrant::Cluster);
-    for _ in 0..5 {
-        app.handle(Action::Focus(Dir::Right));
-        // Right walks until it hits column boundaries; we want all six.
-    }
-    // Walk the full grid to make sure we can land on Activity.
-    let mut app = App::new();
-    app.handle(Action::ToggleLayout);
-    app.handle(Action::Focus(Dir::Right)); // Workflows
-    app.handle(Action::Focus(Dir::Right)); // Services
-    app.handle(Action::Focus(Dir::Down)); // Logs (idx 4)
-    app.handle(Action::Focus(Dir::Right)); // Activity (idx 5)
-    assert_eq!(app.focused_quadrant(), Quadrant::Activity);
-}
-
-#[test]
-fn focus_does_not_escape_b_grid() {
-    let mut app = App::new();
-    app.handle(Action::ToggleLayout);
-    // From 0, Up/Left are no-ops.
-    app.handle(Action::Focus(Dir::Up));
-    assert_eq!(app.b_focus(), 0);
-    app.handle(Action::Focus(Dir::Left));
-    assert_eq!(app.b_focus(), 0);
-    // Walk to end (idx 5) and try Down/Right.
-    for _ in 0..2 {
-        app.handle(Action::Focus(Dir::Right));
-    }
-    app.handle(Action::Focus(Dir::Down));
-    app.handle(Action::Focus(Dir::Right));
-    assert_eq!(app.b_focus(), 5);
-    app.handle(Action::Focus(Dir::Down));
-    app.handle(Action::Focus(Dir::Right));
-    assert_eq!(app.b_focus(), 5);
-}
-
-#[test]
-fn focus_inert_when_zoomed_in_layout_b() {
-    let mut app = App::new();
-    app.handle(Action::ToggleLayout);
-    app.handle(Action::Focus(Dir::Right));
-    let before = app.b_focus();
-    app.handle(Action::ZoomQuadrant);
-    app.handle(Action::Focus(Dir::Right));
-    assert_eq!(app.b_focus(), before, "focus should not move while zoomed");
-}
-
-#[test]
-fn namespace_events_action_replaces_feed() {
-    let mut app = App::new();
-    let now = chrono::Utc::now();
-    let ev = nico_correlate::Event {
-        ts: now,
-        source: "k8s".into(),
-        kind: "Crash".into(),
-        message: "boom".into(),
-        severity: nico_correlate::Severity::Warning,
-        tags: Default::default(),
-    };
-    app.handle(Action::NamespaceEvents(vec![ev]));
-    assert_eq!(app.namespace_events().len(), 1);
+    assert_eq!(app.layout(), Layout::Scorecard);
 }
 
 fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect {
@@ -686,48 +566,11 @@ fn logs_panel_not_dominant_when_layout_a_focused_layer_is_not_logs() {
 }
 
 #[test]
-fn logs_panel_dominant_in_layout_a_when_logs_focused() {
+fn logs_panel_dominant_in_scorecard_layout_when_logs_focused() {
     let mut app = App::new();
     app.handle(Action::Snapshots(six_layers()));
     app.handle(Action::Focus(Dir::Right)); // logs at idx 1
     assert!(app.logs_panel_dominant());
-}
-
-fn focus_layout_b_logs_quadrant(app: &mut App) {
-    // Layout B grid: 0 Cluster / 1 Workflows / 2 Services /
-    //                3 Postgres / 4 Logs / 5 Activity
-    app.handle(Action::ToggleLayout);
-    app.handle(Action::Focus(Dir::Right)); // Workflows
-    app.handle(Action::Focus(Dir::Down)); // Logs (idx 4)
-}
-
-#[test]
-fn logs_panel_not_dominant_in_layout_b_when_logs_focused_but_not_zoomed() {
-    let mut app = App::new();
-    app.handle(Action::Snapshots(six_layers()));
-    focus_layout_b_logs_quadrant(&mut app);
-    assert_eq!(app.focused_quadrant(), Quadrant::Logs);
-    assert!(!app.b_zoomed());
-    assert!(!app.logs_panel_dominant());
-}
-
-#[test]
-fn logs_panel_dominant_in_layout_b_when_logs_focused_and_zoomed() {
-    let mut app = App::new();
-    app.handle(Action::Snapshots(six_layers()));
-    focus_layout_b_logs_quadrant(&mut app);
-    app.handle(Action::ZoomQuadrant);
-    assert!(app.logs_panel_dominant());
-}
-
-#[test]
-fn logs_panel_not_dominant_in_layout_b_when_zoomed_but_other_quadrant() {
-    let mut app = App::new();
-    app.handle(Action::Snapshots(six_layers()));
-    app.handle(Action::ToggleLayout);
-    // focus stays on Cluster (idx 0).
-    app.handle(Action::ZoomQuadrant);
-    assert!(!app.logs_panel_dominant());
 }
 
 #[test]
@@ -741,18 +584,6 @@ fn scroll_layout_a_logs_dominant_targets_logs_scroll() {
     assert_eq!(app.logs_scroll(), 2);
     assert_eq!(app.drill_scroll(), 0);
     assert!(app.dirty());
-}
-
-#[test]
-fn scroll_layout_b_logs_zoomed_targets_logs_scroll() {
-    let mut app = App::new();
-    app.handle(Action::Snapshots(six_layers()));
-    focus_layout_b_logs_quadrant(&mut app);
-    app.handle(Action::ZoomQuadrant);
-    app.clear_dirty();
-    app.handle(Action::Scroll(ScrollDir::Down));
-    assert_eq!(app.logs_scroll(), 1);
-    assert_eq!(app.drill_scroll(), 0);
 }
 
 #[test]
@@ -823,18 +654,6 @@ fn focus_horizontal_when_logs_dominant_does_not_scroll() {
 }
 
 #[test]
-fn focus_down_layout_b_logs_zoomed_routes_to_logs_scroll() {
-    let mut app = App::new();
-    app.handle(Action::Snapshots(six_layers()));
-    focus_layout_b_logs_quadrant(&mut app);
-    app.handle(Action::ZoomQuadrant);
-    let b_before = app.b_focus();
-    app.handle(Action::Focus(Dir::Down));
-    assert_eq!(app.logs_scroll(), 1);
-    assert_eq!(app.b_focus(), b_before);
-}
-
-#[test]
 fn focus_when_logs_panel_not_dominant_still_moves_focus() {
     // Regression: cluster focused (idx 0). j/k must still navigate.
     let mut app = App::new();
@@ -893,35 +712,6 @@ fn click_to_non_logs_card_resets_logs_scroll() {
     ]);
     app.handle(Action::Click { col: 65, row: 1 }); // focus card 2 (workflows)
     assert_eq!(app.focus(), 2);
-    assert_eq!(app.logs_scroll(), 0);
-}
-
-#[test]
-fn toggle_layout_resets_logs_scroll() {
-    let mut app = App::new();
-    app.handle(Action::Snapshots(six_layers()));
-    app.handle(Action::Focus(Dir::Right)); // logs (Layout A)
-    app.handle(Action::Scroll(ScrollDir::Down));
-    assert_eq!(app.logs_scroll(), 1);
-    app.handle(Action::ToggleLayout); // A → B
-    assert_eq!(app.logs_scroll(), 0);
-}
-
-#[test]
-fn zoom_quadrant_clears_logs_scroll_on_entry() {
-    // ZoomQuadrant only fires zoom-in (unzoom is via CloseOverlay).
-    // The reset on entry is a belt-and-suspenders guarantee that no
-    // stale offset survives a transition into the dominant view. We
-    // can't preload logs_scroll>0 just before ZoomQuadrant in Layout B
-    // (panel only becomes dominant once zoomed), so this checks the
-    // field stays at 0 across the action — combined with the explicit
-    // reset assignment in the reducer, this is the spec-compliant
-    // round-trip.
-    let mut app = App::new();
-    app.handle(Action::Snapshots(six_layers()));
-    focus_layout_b_logs_quadrant(&mut app);
-    assert_eq!(app.logs_scroll(), 0);
-    app.handle(Action::ZoomQuadrant);
     assert_eq!(app.logs_scroll(), 0);
 }
 
@@ -989,9 +779,9 @@ fn mixed_layers() -> Vec<LayerSnapshot> {
 }
 
 #[test]
-fn fresh_app_is_in_layout_a() {
+fn fresh_app_is_in_scorecard_layout() {
     let app = App::new();
-    assert_eq!(app.layout(), Layout::A);
+    assert_eq!(app.layout(), Layout::Scorecard);
 }
 
 #[test]
@@ -1004,12 +794,12 @@ fn show_spotlight_switches_layout_to_c_and_marks_dirty() {
 }
 
 #[test]
-fn show_all_returns_to_layout_a_and_marks_dirty() {
+fn show_all_returns_to_scorecard_layout_and_marks_dirty() {
     let mut app = App::new();
     app.handle(Action::ShowSpotlight);
     app.clear_dirty();
     app.handle(Action::ShowAll);
-    assert_eq!(app.layout(), Layout::A);
+    assert_eq!(app.layout(), Layout::Scorecard);
     assert!(app.dirty());
 }
 
@@ -1023,7 +813,7 @@ fn show_spotlight_when_already_in_spotlight_is_inert() {
 }
 
 #[test]
-fn show_all_when_already_in_layout_a_is_inert() {
+fn show_all_when_already_in_scorecard_layout_is_inert() {
     let mut app = App::new();
     app.clear_dirty();
     app.handle(Action::ShowAll);
@@ -1052,7 +842,7 @@ fn green_footer_lists_ok_and_skipped_layers() {
 }
 
 #[test]
-fn copy_next_command_in_layout_a_is_inert() {
+fn copy_next_command_in_scorecard_layout_is_inert() {
     let mut app = App::new();
     app.handle(Action::Snapshots(mixed_layers()));
     let eff = app.handle(Action::CopyNextCommand);

@@ -1,6 +1,10 @@
 //! Namespace-scoped event fan-out: collect recent events from the
-//! temporal + k8s Sources for a namespace, with no entity-scoping. Used
-//! by the `nico ops` Mission Control (Layout B) Activity quadrant.
+//! temporal + k8s Sources for a namespace, with no entity-scoping.
+//!
+//! Originally driven by the `nico ops` Mission Control (Layout B)
+//! Activity quadrant, which was removed in PRD-006 slice 1 (issue #367).
+//! The helper is preserved so future consumers (e.g. PRD-007's
+//! correlate drill-down) can still fan out at the namespace level.
 //!
 //! Unlike the `Source::collect(id, id_type)` path used elsewhere, this
 //! function fans out at the namespace level and returns the most recent
@@ -71,7 +75,11 @@ fn workflow_execution_to_event(
 ) -> Option<Event> {
     let exec = info.execution.as_ref()?;
     let workflow_id = exec.workflow_id.clone();
-    let workflow_type = info.r#type.as_ref().map(|t| t.name.clone()).unwrap_or_default();
+    let workflow_type = info
+        .r#type
+        .as_ref()
+        .map(|t| t.name.clone())
+        .unwrap_or_default();
     let ts = info
         .start_time
         .as_ref()
@@ -97,11 +105,7 @@ fn workflow_execution_to_event(
     })
 }
 
-async fn collect_k8s(
-    client: &dyn K8sClient,
-    namespace: &str,
-    cutoff: DateTime<Utc>,
-) -> Vec<Event> {
+async fn collect_k8s(client: &dyn K8sClient, namespace: &str, cutoff: DateTime<Utc>) -> Vec<Event> {
     let raw = match client.list_events(namespace, Some("type=Warning")).await {
         Ok(v) => v,
         Err(_) => return vec![],
@@ -169,18 +173,25 @@ mod tests {
     async fn fans_out_temporal_and_k8s_into_one_merged_list() {
         let now = Utc::now();
         let temporal = Arc::new(
-            MockTemporalClient::new()
-                .with_executions(vec![workflow_info("hp-1", "HostProvisioning", now)]),
+            MockTemporalClient::new().with_executions(vec![workflow_info(
+                "hp-1",
+                "HostProvisioning",
+                now,
+            )]),
         );
-        let k8s = Arc::new(
-            MockK8sClient::new().with_events(vec![warning_event("OOMKilled", "boom", now)]),
-        );
+        let k8s = Arc::new(MockK8sClient::new().with_events(vec![warning_event(
+            "OOMKilled",
+            "boom",
+            now,
+        )]));
 
-        let events =
-            recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
+        let events = recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
 
         let sources: Vec<&str> = events.iter().map(|e| e.source.as_str()).collect();
-        assert!(sources.contains(&"temporal"), "missing temporal: {sources:?}");
+        assert!(
+            sources.contains(&"temporal"),
+            "missing temporal: {sources:?}"
+        );
         assert!(sources.contains(&"k8s"), "missing k8s: {sources:?}");
         assert_eq!(events.len(), 2);
     }
@@ -188,17 +199,20 @@ mod tests {
     #[tokio::test]
     async fn merged_events_are_sorted_newest_first() {
         let now = Utc::now();
-        let temporal = Arc::new(MockTemporalClient::new().with_executions(vec![
-            workflow_info("hp-old", "HostProvisioning", now - Duration::minutes(5)),
-        ]));
+        let temporal = Arc::new(
+            MockTemporalClient::new().with_executions(vec![workflow_info(
+                "hp-old",
+                "HostProvisioning",
+                now - Duration::minutes(5),
+            )]),
+        );
         let k8s = Arc::new(MockK8sClient::new().with_events(vec![warning_event(
             "Crash",
             "x",
             now - Duration::minutes(1),
         )]));
 
-        let events =
-            recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
+        let events = recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
 
         assert_eq!(events[0].source, "k8s");
         assert_eq!(events[1].source, "temporal");
@@ -214,20 +228,20 @@ mod tests {
         let temporal = Arc::new(MockTemporalClient::new());
         let k8s = Arc::new(MockK8sClient::new().with_events(raw_events));
 
-        let events =
-            recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
+        let events = recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
         assert_eq!(events.len(), RECENT_EVENT_CAP);
     }
 
     #[tokio::test]
     async fn temporal_failure_yields_only_k8s_events() {
         let temporal = Arc::new(MockTemporalClient::new().with_executions_err("boom"));
-        let k8s = Arc::new(
-            MockK8sClient::new().with_events(vec![warning_event("Crash", "x", Utc::now())]),
-        );
+        let k8s = Arc::new(MockK8sClient::new().with_events(vec![warning_event(
+            "Crash",
+            "x",
+            Utc::now(),
+        )]));
 
-        let events =
-            recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
+        let events = recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source, "k8s");
     }
@@ -235,13 +249,15 @@ mod tests {
     #[tokio::test]
     async fn k8s_failure_yields_only_temporal_events() {
         let temporal = Arc::new(
-            MockTemporalClient::new()
-                .with_executions(vec![workflow_info("hp-1", "HostProvisioning", Utc::now())]),
+            MockTemporalClient::new().with_executions(vec![workflow_info(
+                "hp-1",
+                "HostProvisioning",
+                Utc::now(),
+            )]),
         );
         let k8s = Arc::new(MockK8sClient::new().with_events_err("nope"));
 
-        let events =
-            recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
+        let events = recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source, "temporal");
     }
@@ -256,16 +272,18 @@ mod tests {
         );
         let k8s = Arc::new(MockK8sClient::new());
 
-        let events =
-            recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
+        let events = recent_namespace_events(temporal, k8s, "nico", Duration::minutes(10)).await;
         assert!(events.is_empty(), "stale execution should be dropped");
     }
 
     #[tokio::test]
     async fn workflow_event_carries_workflow_id_and_type_tags() {
         let temporal = Arc::new(
-            MockTemporalClient::new()
-                .with_executions(vec![workflow_info("hp-7", "HostProvisioning", Utc::now())]),
+            MockTemporalClient::new().with_executions(vec![workflow_info(
+                "hp-7",
+                "HostProvisioning",
+                Utc::now(),
+            )]),
         );
         let k8s = Arc::new(MockK8sClient::new());
 

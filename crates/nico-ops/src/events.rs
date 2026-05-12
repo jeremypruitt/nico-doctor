@@ -27,6 +27,13 @@ pub enum Mode {
     Normal,
 }
 
+/// Toast surfaced when the operator presses `m`. Mission Control was
+/// removed in PRD-006 slice 1 (issue #367); the keybinding now points the
+/// operator at the two remaining views (Scorecard ↔ Spotlight) and the
+/// logs drill.
+pub const MISSION_CONTROL_REMOVED_TOAST: &str =
+    "Mission Control removed; press `s` for Spotlight or `l` for logs";
+
 /// Pure mapping from a crossterm event to an `Action`. No I/O, no state.
 /// Returns `None` when the event is uninteresting in the current
 /// `(mode, layout, overlay)` context — the caller should ignore it.
@@ -65,8 +72,7 @@ fn translate_key(key: &KeyEvent, _mode: Mode, layout: Layout, overlay: Overlay) 
     match (layout, overlay) {
         (_, Overlay::Detail | Overlay::Help) => translate_overlay(key, overlay),
         (_, Overlay::Correlate) => translate_correlate_overlay(key),
-        (Layout::A, Overlay::None) => translate_normal(key),
-        (Layout::B, Overlay::None) => translate_layout_b(key),
+        (Layout::Scorecard, Overlay::None) => translate_normal(key),
         (Layout::Spotlight, Overlay::None) => translate_spotlight(key),
     }
 }
@@ -76,37 +82,19 @@ fn translate_normal(key: &KeyEvent) -> Option<Action> {
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
         KeyCode::Char('r') | KeyCode::Char('R') => Some(Action::Refresh),
         KeyCode::Char(' ') => Some(Action::TogglePause),
-        // `m` toggles to Layout B (Mission Control). `M` (Shift+m) is
-        // reserved for terminal mouse-capture toggling so the operator
-        // can fall back to native scrollback if needed.
-        KeyCode::Char('m') => Some(Action::ToggleLayout),
+        // `m` used to toggle Mission Control (Layout B). The view was
+        // removed in PRD-006 slice 1 (issue #367); the key now surfaces a
+        // one-shot toast pointing operators at the two remaining views.
+        // `M` (Shift+m) is reserved for terminal mouse-capture toggling.
+        KeyCode::Char('m') => Some(Action::ShowToast(MISSION_CONTROL_REMOVED_TOAST.to_string())),
         KeyCode::Char('M') => Some(Action::ToggleMouseCapture),
         KeyCode::Char('s') | KeyCode::Char('S') => Some(Action::ShowSpotlight),
         KeyCode::Char('?') => Some(Action::OpenHelp),
-        // `c` from Layout A targets the focused workflow Finding (issue
-        // #157). Reducer turns it into a no-op when the focused Layer is
-        // not `workflows`.
+        // `c` from the scorecard layout targets the focused workflow
+        // Finding (issue #157). Reducer turns it into a no-op when the
+        // focused Layer is not `workflows`.
         KeyCode::Char('c') | KeyCode::Char('C') => Some(Action::Correlate),
         KeyCode::Enter => Some(Action::OpenDetail),
-        KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
-        KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::Focus(Dir::Up)),
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
-        _ => None,
-    }
-}
-
-fn translate_layout_b(key: &KeyEvent) -> Option<Action> {
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::Quit),
-        KeyCode::Char('r') | KeyCode::Char('R') => Some(Action::Refresh),
-        KeyCode::Char(' ') => Some(Action::TogglePause),
-        // `m` toggles back to Layout A; `M` is mouse-capture (mirrors A).
-        KeyCode::Char('m') => Some(Action::ToggleLayout),
-        KeyCode::Char('M') => Some(Action::ToggleMouseCapture),
-        KeyCode::Esc => Some(Action::CloseOverlay),
-        KeyCode::Char('?') => Some(Action::OpenHelp),
-        KeyCode::Enter => Some(Action::ZoomQuadrant),
         KeyCode::Left | KeyCode::Char('h') => Some(Action::Focus(Dir::Left)),
         KeyCode::Right | KeyCode::Char('l') => Some(Action::Focus(Dir::Right)),
         KeyCode::Up | KeyCode::Char('k') => Some(Action::Focus(Dir::Up)),
@@ -121,8 +109,11 @@ fn translate_spotlight(key: &KeyEvent) -> Option<Action> {
         KeyCode::Char('r') | KeyCode::Char('R') => Some(Action::Refresh),
         KeyCode::Char(' ') => Some(Action::TogglePause),
         KeyCode::Char('M') => Some(Action::ToggleMouseCapture),
+        // Mirror the scorecard binding: `m` raises the
+        // Mission-Control-removed toast (issue #367).
+        KeyCode::Char('m') => Some(Action::ShowToast(MISSION_CONTROL_REMOVED_TOAST.to_string())),
         KeyCode::Char('?') => Some(Action::OpenHelp),
-        // s, a, Esc all return to the show-all Layout A.
+        // s, a, Esc all return to the show-all scorecard layout.
         KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('a') | KeyCode::Char('A') => {
             Some(Action::ShowAll)
         }
@@ -131,7 +122,7 @@ fn translate_spotlight(key: &KeyEvent) -> Option<Action> {
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(Action::CopyNextCommand),
         KeyCode::Char('o') | KeyCode::Char('O') => Some(Action::OpenLink),
         KeyCode::Char('c') | KeyCode::Char('C') => Some(Action::Correlate),
-        // Up/down still navigate cards (Layout C is a vertical stack).
+        // Up/down still navigate cards (Spotlight is a vertical stack).
         KeyCode::Up | KeyCode::Char('k') => Some(Action::Focus(Dir::Up)),
         KeyCode::Down | KeyCode::Char('j') => Some(Action::Focus(Dir::Down)),
         _ => None,
@@ -167,7 +158,7 @@ mod tests {
     };
 
     fn tr(event: &Event, overlay: Overlay) -> Option<Action> {
-        translate(event, Mode::Normal, Layout::A, overlay)
+        translate(event, Mode::Normal, Layout::Scorecard, overlay)
     }
 
     fn tr_spotlight(event: &Event) -> Option<Action> {
@@ -399,12 +390,21 @@ mod tests {
     }
 
     #[test]
-    fn lower_m_toggles_layout_in_normal() {
-        // Issue #155 reserves lowercase `m` for Layout A↔B toggle.
-        // Mouse capture toggle moved to Shift+M (`M`).
+    fn lower_m_surfaces_mission_control_removed_toast() {
+        // Issue #367: Mission Control was removed; the `m` key now
+        // raises a one-shot toast pointing the operator at Spotlight /
+        // logs instead of toggling a (now nonexistent) Layout B.
         assert_eq!(
             tr(&k(KeyCode::Char('m')), Overlay::None),
-            Some(Action::ToggleLayout)
+            Some(Action::ShowToast(MISSION_CONTROL_REMOVED_TOAST.to_string()))
+        );
+    }
+
+    #[test]
+    fn lower_m_in_spotlight_also_surfaces_mc_removed_toast() {
+        assert_eq!(
+            tr_spotlight(&k(KeyCode::Char('m'))),
+            Some(Action::ShowToast(MISSION_CONTROL_REMOVED_TOAST.to_string()))
         );
     }
 
@@ -416,10 +416,10 @@ mod tests {
         }
     }
 
-    // ── Layout C / Spotlight bindings ───────────────────────────────────
+    // ── Spotlight bindings ──────────────────────────────────────────────
 
     #[test]
-    fn s_in_layout_a_switches_to_spotlight() {
+    fn s_in_scorecard_layout_switches_to_spotlight() {
         assert_eq!(
             tr(&k(KeyCode::Char('s')), Overlay::None),
             Some(Action::ShowSpotlight)
@@ -427,17 +427,17 @@ mod tests {
     }
 
     #[test]
-    fn s_in_spotlight_returns_to_layout_a() {
+    fn s_in_spotlight_returns_to_scorecard_layout() {
         assert_eq!(tr_spotlight(&k(KeyCode::Char('s'))), Some(Action::ShowAll));
     }
 
     #[test]
-    fn a_in_spotlight_returns_to_layout_a() {
+    fn a_in_spotlight_returns_to_scorecard_layout() {
         assert_eq!(tr_spotlight(&k(KeyCode::Char('a'))), Some(Action::ShowAll));
     }
 
     #[test]
-    fn esc_in_spotlight_returns_to_layout_a() {
+    fn esc_in_spotlight_returns_to_scorecard_layout() {
         assert_eq!(tr_spotlight(&k(KeyCode::Esc)), Some(Action::ShowAll));
     }
 
@@ -463,16 +463,16 @@ mod tests {
     }
 
     #[test]
-    fn y_and_o_in_layout_a_do_not_emit_spotlight_actions() {
-        // y and o are Spotlight-only; they have no Layout A binding.
+    fn y_and_o_in_scorecard_layout_do_not_emit_spotlight_actions() {
+        // y and o are Spotlight-only; they have no scorecard binding.
         assert_eq!(tr(&k(KeyCode::Char('y')), Overlay::None), None);
         assert_eq!(tr(&k(KeyCode::Char('o')), Overlay::None), None);
     }
 
     #[test]
-    fn c_in_layout_a_emits_correlate_too() {
-        // Issue #157: `c` is bound in Layout A as well so the operator
-        // can pop the quick-correlate overlay from the scorecard grid
+    fn c_in_scorecard_layout_emits_correlate_too() {
+        // Issue #157: `c` is bound in the scorecard layout as well so the
+        // operator can pop the quick-correlate overlay from the grid
         // without first switching to Spotlight.
         assert_eq!(
             tr(&k(KeyCode::Char('c')), Overlay::None),
@@ -486,7 +486,7 @@ mod tests {
             translate(
                 &k(KeyCode::Esc),
                 Mode::Normal,
-                Layout::A,
+                Layout::Scorecard,
                 Overlay::Correlate,
             ),
             Some(Action::CloseOverlay)
@@ -499,7 +499,7 @@ mod tests {
             translate(
                 &k(KeyCode::Char('q')),
                 Mode::Normal,
-                Layout::A,
+                Layout::Scorecard,
                 Overlay::Correlate,
             ),
             Some(Action::CloseOverlay)
@@ -512,7 +512,7 @@ mod tests {
             translate(
                 &ctrl(KeyCode::Char('c')),
                 Mode::Normal,
-                Layout::A,
+                Layout::Scorecard,
                 Overlay::Correlate,
             ),
             Some(Action::Quit)
@@ -550,39 +550,15 @@ mod tests {
     }
 
     #[test]
-    fn m_toggles_layout_in_normal() {
+    fn enter_opens_detail_only_in_scorecard_layout() {
         assert_eq!(
-            translate(&k(KeyCode::Char('m')), Mode::Normal, Layout::A, Overlay::None),
-            Some(Action::ToggleLayout)
-        );
-        assert_eq!(
-            translate(&k(KeyCode::Char('m')), Mode::Normal, Layout::B, Overlay::None),
-            Some(Action::ToggleLayout)
-        );
-    }
-
-    #[test]
-    fn enter_zooms_quadrant_in_layout_b() {
-        assert_eq!(
-            translate(&k(KeyCode::Enter), Mode::Normal, Layout::B, Overlay::None),
-            Some(Action::ZoomQuadrant)
-        );
-    }
-
-    #[test]
-    fn enter_opens_detail_only_in_layout_a() {
-        assert_eq!(
-            translate(&k(KeyCode::Enter), Mode::Normal, Layout::A, Overlay::None),
+            translate(
+                &k(KeyCode::Enter),
+                Mode::Normal,
+                Layout::Scorecard,
+                Overlay::None
+            ),
             Some(Action::OpenDetail)
-        );
-    }
-
-    #[test]
-    fn esc_in_layout_b_normal_dispatches_close_overlay() {
-        // The reducer interprets CloseOverlay-with-no-overlay as "back to A".
-        assert_eq!(
-            translate(&k(KeyCode::Esc), Mode::Normal, Layout::B, Overlay::None),
-            Some(Action::CloseOverlay)
         );
     }
 }

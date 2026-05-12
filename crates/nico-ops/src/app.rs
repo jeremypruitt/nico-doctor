@@ -8,7 +8,9 @@ use ratatui::layout::Rect;
 
 use crate::action::{Action, Dir, ScrollDir};
 use crate::events::Overlay;
-use crate::model::{CorrelateState, CorrelateStatus, LayerSnapshot, LogLine, Quadrant, workflow_id_from_finding};
+use crate::model::{
+    CorrelateState, CorrelateStatus, LayerSnapshot, LogLine, workflow_id_from_finding,
+};
 use crate::pulse::PulseTimer;
 use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
 
@@ -18,20 +20,21 @@ use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
 pub const TOAST_TTL: Duration = Duration::from_millis(2500);
 
 /// Which top-level layout the dashboard is rendering. The reducer flips
-/// between these in response to `Action::ToggleLayout` (A↔B),
-/// `Action::ShowSpotlight` (A→C), and `Action::ShowAll` (any→A); the
+/// between these in response to `Action::ShowSpotlight` (Scorecard →
+/// Spotlight) and `Action::ShowAll` (Spotlight → Scorecard); the
 /// renderer branches on the value.
+///
+/// PRD-006 slice 1 (issue #367) shrunk this from three variants to two
+/// by removing Mission Control (Layout B). The `m` keybinding is
+/// preserved as a one-shot toast — see [`crate::events::translate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layout {
-    /// Layout A — the scorecard grid with drill panel (ADR-010).
+    /// The scorecard grid with drill panel (ADR-010).
     #[default]
-    A,
-    /// Layout B — Mission Control 2×3 quadrant grid with `tui-big-text`
-    /// verdict header (issue #155).
-    B,
-    /// Layout C — the "3am page" Spotlight view: tui-big-text headline
-    /// over incident cards for non-green Layers, green Layers compressed
-    /// to a single footer line.
+    Scorecard,
+    /// The "3am page" Spotlight view: tui-big-text headline over
+    /// incident cards for non-green Layers, green Layers compressed to a
+    /// single footer line.
     Spotlight,
 }
 
@@ -102,9 +105,6 @@ pub struct App {
     spotlight_focus: usize,
     toast: Option<Toast>,
     correlate: Option<CorrelateState>,
-    b_focus: usize,
-    b_zoomed: bool,
-    namespace_events: Vec<nico_correlate::Event>,
     log_lines: Vec<LogLine>,
 }
 
@@ -148,9 +148,6 @@ impl App {
             spotlight_focus: 0,
             toast: None,
             correlate: None,
-            b_focus: 0,
-            b_zoomed: false,
-            namespace_events: Vec::new(),
             log_lines: Vec::new(),
         }
     }
@@ -185,21 +182,22 @@ impl App {
     }
 
     /// Scroll offset for the snapshot logs panel when it is the dominant
-    /// view (Layout A drill with `logs` focused, or Layout B `Logs` quadrant
-    /// while zoomed). See [`logs_panel_dominant`](Self::logs_panel_dominant).
+    /// view (scorecard drill panel with `logs` focused). See
+    /// [`logs_panel_dominant`](Self::logs_panel_dominant). Mission
+    /// Control's `Logs` quadrant used to be the second dominant-view
+    /// source; it was removed in PRD-006 slice 1 (issue #367).
     pub fn logs_scroll(&self) -> u16 {
         self.logs_scroll
     }
 
     /// Whether the snapshot logs panel is currently the dominant view —
     /// i.e. the surface the operator is reading. Returns true when the
-    /// Layout A drill panel is showing the logs panel (focused layer is
-    /// `logs`) or when Layout B's `Logs` quadrant is zoomed. Drives input
-    /// routing so j/k/wheel target `logs_scroll` here. ADR-0014.
+    /// scorecard drill panel is showing the logs panel (focused layer is
+    /// `logs`). Drives input routing so j/k/wheel target `logs_scroll`
+    /// here. ADR-0014.
     pub fn logs_panel_dominant(&self) -> bool {
         match self.layout {
-            Layout::A => self.focused().is_some_and(|s| s.name == "logs"),
-            Layout::B => self.b_zoomed && self.focused_quadrant() == Quadrant::Logs,
+            Layout::Scorecard => self.focused().is_some_and(|s| s.name == "logs"),
             Layout::Spotlight => false,
         }
     }
@@ -285,22 +283,6 @@ impl App {
         &self.history
     }
 
-    pub fn b_focus(&self) -> usize {
-        self.b_focus
-    }
-
-    pub fn focused_quadrant(&self) -> Quadrant {
-        Quadrant::ALL[self.b_focus.min(Quadrant::ALL.len() - 1)]
-    }
-
-    pub fn b_zoomed(&self) -> bool {
-        self.b_zoomed
-    }
-
-    pub fn namespace_events(&self) -> &[nico_correlate::Event] {
-        &self.namespace_events
-    }
-
     /// Snapshot logs panel content, populated by the refresh side-effect.
     /// Empty vec means "no errors" (or no log source at all).
     pub fn log_lines(&self) -> &[LogLine] {
@@ -357,17 +339,7 @@ impl App {
                     return None;
                 }
                 let was_logs_dominant = self.logs_panel_dominant();
-                let moved = match self.layout {
-                    Layout::A => self.move_focus(dir),
-                    Layout::B => {
-                        if self.b_zoomed {
-                            false
-                        } else {
-                            move_b_focus(&mut self.b_focus, dir)
-                        }
-                    }
-                    Layout::Spotlight => self.move_focus(dir),
-                };
+                let moved = self.move_focus(dir);
                 if moved {
                     self.dirty = true;
                     if was_logs_dominant && !self.logs_panel_dominant() {
@@ -377,40 +349,8 @@ impl App {
                 None
             }
             Action::OpenDetail => {
-                if matches!(self.layout, Layout::B) {
-                    return None;
-                }
                 if !self.snapshots.is_empty() && self.overlay == Overlay::None {
                     self.overlay = Overlay::Detail;
-                    self.dirty = true;
-                }
-                None
-            }
-            Action::ToggleLayout => {
-                if self.overlay != Overlay::None {
-                    return None;
-                }
-                self.layout = match self.layout {
-                    Layout::A => Layout::B,
-                    Layout::B => Layout::A,
-                    Layout::Spotlight => Layout::A,
-                };
-                self.b_zoomed = false;
-                self.logs_scroll = 0;
-                self.dirty = true;
-                None
-            }
-            Action::ZoomQuadrant => {
-                if matches!(self.layout, Layout::B) && !self.b_zoomed {
-                    self.b_zoomed = true;
-                    self.logs_scroll = 0;
-                    self.dirty = true;
-                }
-                None
-            }
-            Action::NamespaceEvents(events) => {
-                self.namespace_events = events;
-                if matches!(self.layout, Layout::B) {
                     self.dirty = true;
                 }
                 None
@@ -432,13 +372,6 @@ impl App {
                 if self.overlay != Overlay::None {
                     self.overlay = Overlay::None;
                     self.correlate = None;
-                    self.dirty = true;
-                } else if matches!(self.layout, Layout::B) {
-                    if self.b_zoomed {
-                        self.b_zoomed = false;
-                    } else {
-                        self.layout = Layout::A;
-                    }
                     self.dirty = true;
                 }
                 None
@@ -548,8 +481,8 @@ impl App {
                 None
             }
             Action::ShowAll => {
-                if self.layout != Layout::A {
-                    self.layout = Layout::A;
+                if self.layout != Layout::Scorecard {
+                    self.layout = Layout::Scorecard;
                     self.dirty = true;
                 }
                 None
@@ -641,18 +574,15 @@ impl App {
     }
 
     /// In Spotlight, `[c]` should target the focused incident card; in
-    /// Layout A, the focused scorecard. This returns whichever the
-    /// current layout considers focused.
+    /// the scorecard layout, the focused scorecard. This returns
+    /// whichever the current layout considers focused.
     fn focused_for_correlate(&self) -> Option<&LayerSnapshot> {
         match self.layout {
             Layout::Spotlight => self
                 .non_green_snapshots()
                 .get(self.spotlight_focus)
                 .copied(),
-            Layout::A => self.snapshots.get(self.focus),
-            // Layout B doesn't expose the workflows-Finding focus model,
-            // so `[c]` is a no-op there.
-            Layout::B => None,
+            Layout::Scorecard => self.snapshots.get(self.focus),
         }
     }
 
@@ -796,46 +726,7 @@ impl Default for App {
     }
 }
 
-/// Layout-B is a fixed 2×3 grid: 3 columns × 2 rows. Returns whether
-/// `focus` actually moved.
-fn move_b_focus(focus: &mut usize, dir: Dir) -> bool {
-    const COLS: usize = 3;
-    const N: usize = 6;
-    let cur = (*focus).min(N - 1);
-    let next = match dir {
-        Dir::Left => {
-            if cur.is_multiple_of(COLS) {
-                return false;
-            }
-            cur - 1
-        }
-        Dir::Right => {
-            if cur + 1 >= N || (cur + 1).is_multiple_of(COLS) {
-                return false;
-            }
-            cur + 1
-        }
-        Dir::Up => {
-            if cur < COLS {
-                return false;
-            }
-            cur - COLS
-        }
-        Dir::Down => {
-            if cur + COLS >= N {
-                return false;
-            }
-            cur + COLS
-        }
-    };
-    if next == cur {
-        return false;
-    }
-    *focus = next;
-    true
-}
-
-/// Layout-A grid column count. The grid is 3-up always at the model
+/// Scorecard grid column count. The grid is 3-up always at the model
 /// level; the renderer decides whether to reflow to 2-up or 1-up based on
 /// terminal width — that's a pure presentation concern. Focus navigation
 /// uses 3 columns so that the indices line up with what the operator sees
