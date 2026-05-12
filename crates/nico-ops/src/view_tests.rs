@@ -319,7 +319,10 @@ fn render_drill_shows_findings_for_focused_layer() {
     app.handle(Action::Focus(Dir::Right));
     app.handle(Action::Focus(Dir::Right));
     let s = render_to_string(&mut app, 120, 24);
-    assert!(s.contains("findings — workflows"), "drill title missing:\n{s}");
+    assert!(
+        s.contains("findings — workflows"),
+        "drill title missing:\n{s}"
+    );
     assert!(s.contains("stuck workflow"), "finding text missing:\n{s}");
     assert!(s.contains("next:"), "next-cmd hint missing:\n{s}");
 }
@@ -382,8 +385,14 @@ fn render_drill_logs_panel_visible_row_count_tracks_inner_height() {
         s.contains("logs — 1–40 of 40"),
         "title must reflect renderer-side sizing, got:\n{s}"
     );
-    assert!(s.contains("pod-039"), "row 40 (pod-039) must be visible:\n{s}");
-    assert!(s.contains("pod-020"), "row 21 (pod-020) must be visible:\n{s}");
+    assert!(
+        s.contains("pod-039"),
+        "row 40 (pod-039) must be visible:\n{s}"
+    );
+    assert!(
+        s.contains("pod-020"),
+        "row 21 (pod-020) must be visible:\n{s}"
+    );
 }
 
 #[test]
@@ -457,63 +466,12 @@ fn render_drill_logs_panel_shows_empty_state_when_no_lines() {
     app.handle(Action::Focus(Dir::Right));
     // No LogLines action — log_lines is empty.
     let s = render_to_string(&mut app, 120, 24);
-    assert!(
-        s.contains("no errors"),
-        "empty-state copy missing:\n{s}"
-    );
-}
-
-#[test]
-fn layout_b_zoomed_logs_quadrant_honors_logs_scroll() {
-    let mut app = App::new();
-    app.handle(Action::Snapshots(six_layers()));
-    app.handle(Action::ToggleLayout); // → B
-    app.handle(Action::Focus(Dir::Right)); // Workflows
-    app.handle(Action::Focus(Dir::Down)); // Logs (idx 4)
-    app.handle(Action::ZoomQuadrant);
-    app.handle(Action::LogLines(log_lines_sample_n(50)));
-    // Now dominant — wheel-down 5 should advance logs_scroll.
-    for _ in 0..5 {
-        app.handle(Action::Scroll(ScrollDir::Down));
-    }
-    let s = render_to_string(&mut app, 140, 30);
-    assert!(
-        s.contains("pod-005"),
-        "row at offset 5 must be visible:\n{s}"
-    );
-    assert!(
-        !s.contains("pod-000"),
-        "row 0 must be scrolled out:\n{s}"
-    );
-}
-
-#[test]
-fn layout_b_logs_quadrant_renders_log_panel_when_lines_present() {
-    let mut app = App::new();
-    app.handle(Action::Snapshots(six_layers()));
-    app.handle(Action::ToggleLayout); // A → B
-    app.handle(Action::LogLines(log_lines_sample()));
-    // Layout B grids 3-up; zoom the logs quadrant so the row has full
-    // width and the truncated message text is reliably visible.
-    // (`Logs` is index 4, so right-down-down from the default focus
-    // lands on it.)
-    app.handle(Action::Focus(Dir::Right));
-    app.handle(Action::Focus(Dir::Down));
-    app.handle(Action::ZoomQuadrant);
-    let s = render_to_string(&mut app, 140, 30);
-    assert!(s.contains("Logs"), "Logs quadrant title missing:\n{s}");
-    assert!(s.contains("carbide-controller"), "pod name missing:\n{s}");
-    assert!(s.contains("disk full"), "log message missing:\n{s}");
-}
-
-#[test]
-fn layout_b_logs_quadrant_empty_state_when_no_lines() {
-    let mut app = App::new();
-    app.handle(Action::Snapshots(six_layers()));
-    app.handle(Action::ToggleLayout);
-    let s = render_to_string(&mut app, 140, 30);
     assert!(s.contains("no errors"), "empty-state copy missing:\n{s}");
 }
+
+// Layout B (Mission Control) view tests were removed in PRD-006 slice 1
+// (issue #367). The zoomed-logs-quadrant scroll honouring is now covered
+// by the scorecard drill panel tests further up.
 
 #[test]
 fn truncate_message_returns_input_when_under_budget() {
@@ -813,126 +771,12 @@ fn gruvbox_theme_paints_pips_with_gruvbox_palette() {
     assert_eq!(color, GRUVBOX.ok);
 }
 
-// ── Layout B (Mission Control, issue #155) ─────────────────────────
+// Mission Control (Layout B) view tests were removed in PRD-006 slice 1
+// (issue #367). They exercised the 2×3 quadrant grid renderer, the
+// `tui-big-text` Mission Control header, the Activity quadrant feed, the
+// per-quadrant zoom path, and the bespoke Layout-B hint bar — all of
+// which were deleted alongside `Layout::B` and the `Quadrant` type.
 
-fn app_in_layout_b() -> App {
-    let mut app = App::new();
-    app.handle(Action::Snapshots(six_layers()));
-    app.handle(Action::ToggleLayout);
-    app
-}
-
-#[test]
-fn layout_b_renders_all_six_quadrant_titles() {
-    let mut app = app_in_layout_b();
-    let s = render_to_string(&mut app, 140, 30);
-    for title in ["Cluster", "Workflows", "Services", "Postgres", "Logs", "Activity"] {
-        assert!(s.contains(title), "{title} quadrant missing:\n{s}");
-    }
-}
-
-#[test]
-fn layout_b_header_renders_verdict_word_via_big_text() {
-    let mut app = app_in_layout_b();
-    let s = render_to_string(&mut app, 140, 30);
-    // The big-text widget emits Quadrant glyphs (▀▄█▌▐ etc.) for the
-    // verdict word — assert that at least one such glyph is present.
-    let has_quadrant_glyph = s
-        .chars()
-        .any(|c| matches!(c, '▀' | '▄' | '█' | '▌' | '▐' | '▘' | '▝' | '▖' | '▗'));
-    assert!(has_quadrant_glyph, "expected tui-big-text glyphs:\n{s}");
-    assert!(s.contains("mission control"), "header title missing:\n{s}");
-}
-
-#[test]
-fn layout_b_activity_quadrant_shows_namespace_events() {
-    let mut app = app_in_layout_b();
-    let now = chrono::Utc::now();
-    app.handle(Action::NamespaceEvents(vec![
-        nico_correlate::Event {
-            ts: now,
-            source: "k8s".into(),
-            kind: "OOMKilled".into(),
-            message: "boom".into(),
-            severity: nico_correlate::Severity::Warning,
-            tags: Default::default(),
-        },
-        nico_correlate::Event {
-            ts: now,
-            source: "temporal".into(),
-            kind: "HostProvisioning".into(),
-            message: "hp-1".into(),
-            severity: nico_correlate::Severity::Info,
-            tags: Default::default(),
-        },
-    ]));
-    let s = render_to_string(&mut app, 160, 36);
-    assert!(s.contains("OOMKilled"), "k8s event missing:\n{s}");
-    assert!(s.contains("HostProvisioning"), "temporal event missing:\n{s}");
-}
-
-#[test]
-fn layout_b_activity_quadrant_empty_state_when_no_events() {
-    let mut app = app_in_layout_b();
-    let s = render_to_string(&mut app, 140, 30);
-    assert!(
-        s.contains("no recent namespace events"),
-        "empty Activity hint missing:\n{s}"
-    );
-}
-
-#[test]
-fn layout_b_focused_quadrant_marker_is_rendered() {
-    let mut app = app_in_layout_b();
-    let s = render_to_string(&mut app, 140, 30);
-    // Default focus is index 0 → Cluster.
-    assert!(s.contains("▶ Cluster"), "focus marker missing:\n{s}");
-}
-
-#[test]
-fn layout_b_zoomed_renders_only_focused_quadrant() {
-    let mut app = app_in_layout_b();
-    app.handle(Action::ZoomQuadrant);
-    let s = render_to_string(&mut app, 140, 30);
-    // Zoomed-in view shows the focused quadrant title; the others
-    // should not appear as quadrant headers.
-    assert!(s.contains("▶ Cluster"), "focused title missing:\n{s}");
-    // Body content (cluster snapshot evidence) should be visible.
-    assert!(
-        s.contains("3 nodes ready") || s.contains("checks ok"),
-        "zoomed quadrant body missing:\n{s}"
-    );
-    // Activity title should not appear (it's not the focused quadrant).
-    assert!(
-        !s.contains("Activity"),
-        "non-focused quadrant should not paint while zoomed:\n{s}"
-    );
-}
-
-#[test]
-fn layout_b_falls_back_to_ascii_verdict_at_short_height() {
-    let mut app = app_in_layout_b();
-    // height < 14 → header ASCII fallback path.
-    let s = render_to_string(&mut app, 140, 12);
-    assert!(s.contains("WARN"), "ASCII verdict word missing:\n{s}");
-    let has_quadrant_glyph = s
-        .chars()
-        .any(|c| matches!(c, '▀' | '▄' | '█' | '▌' | '▐' | '▘' | '▝' | '▖' | '▗'));
-    assert!(
-        !has_quadrant_glyph,
-        "tui-big-text should be skipped at short heights:\n{s}"
-    );
-}
-
-#[test]
-fn layout_b_hint_bar_changes_with_zoom() {
-    let mut app = app_in_layout_b();
-    let unzoomed = render_to_string(&mut app, 140, 30);
-    assert!(unzoomed.contains("Enter:zoom"), "missing zoom hint:\n{unzoomed}");
-    app.handle(Action::ZoomQuadrant);
-    let zoomed = render_to_string(&mut app, 140, 30);
-    assert!(zoomed.contains("Esc:restore"), "missing restore hint:\n{zoomed}");
-}
 #[test]
 fn hint_bar_shows_mouse_on_by_default() {
     let mut app = App::new();

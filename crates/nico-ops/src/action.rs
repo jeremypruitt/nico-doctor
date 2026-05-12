@@ -46,19 +46,9 @@ pub enum Action {
     /// `Effect::StartRefresh`. Throbber animation is also driven by
     /// the timestamp on this action.
     Tick(Instant),
-    /// `m` — toggle between Layout A (6-up scorecard) and Layout B
-    /// (Mission Control 2×3 grid). Issue #155.
-    ToggleLayout,
-    /// `Enter` while in Layout B — zoom the focused quadrant
-    /// full-screen. (In Layout A, `Enter` opens the detail overlay
-    /// instead — see [`Action::OpenDetail`].)
-    ZoomQuadrant,
-    /// New namespace-scoped events for Layout B's Activity quadrant.
-    /// Sourced from `nico_correlate::recent_namespace_events`.
-    NamespaceEvents(Vec<nico_correlate::Event>),
     /// Top-N error log lines from a completed refresh round. Powers the
-    /// snapshot logs panel (Layout A `logs` drill, Layout B `Logs`
-    /// quadrant). Issue #158.
+    /// snapshot logs panel (focused-layer drill panel and the Spotlight
+    /// `logs` incident card). Issue #158.
     LogLines(Vec<LogLine>),
     /// Left-click at terminal cell `(col, row)`. The reducer hit-tests
     /// against the scorecard regions captured during the last render.
@@ -69,11 +59,12 @@ pub enum Action {
     /// `M` — toggle terminal mouse capture so the operator can reach
     /// native scrollback when they need to.
     ToggleMouseCapture,
-    /// `s` from Layout A — switch to the Spotlight layout (incident-only
-    /// 3am page view; only non-green Layers get full cards).
+    /// `s` from the scorecard layout — switch to the Spotlight layout
+    /// (incident-only 3am page view; only non-green Layers get full
+    /// cards).
     ShowSpotlight,
-    /// `a` (or `s`, or `Esc`) from Layout C — return to Layout A's
-    /// show-all scorecard grid.
+    /// `a` (or `s`, or `Esc`) from Spotlight — return to the show-all
+    /// scorecard grid.
     ShowAll,
     /// `y` in Spotlight — copy the focused Finding's next-command to the
     /// system clipboard. Failure (e.g. headless Linux) raises a toast.

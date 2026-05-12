@@ -9,8 +9,6 @@ use crossterm::{
 };
 use futures::StreamExt;
 use nico_common::config::OutputFormat;
-use nico_common::k8s::K8sClient;
-use nico_common::temporal::{GrpcTemporalClient, TemporalClient};
 use nico_common::theme::{self, Theme};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -161,34 +159,29 @@ async fn run_event_loop<C: Clock>(
     interval: Duration,
     clock: C,
 ) -> io::Result<()> {
+    // Mission Control (Layout B) was removed in PRD-006 slice 1 (issue
+    // #367). Its Activity quadrant was the only consumer of
+    // `temporal_address`, `temporal_namespace`, and `k8s_client` in this
+    // event loop, so they are destructured but ignored — bootstrap still
+    // resolves them so the doctor layers keep working.
     let nico_doctor::Bootstrapped {
         layers,
         opts,
-        temporal_address,
-        temporal_namespace,
-        k8s_client,
+        temporal_address: _,
+        temporal_namespace: _,
+        k8s_client: _,
         log_source,
         log_collector,
         _pf_guards,
         ..
     } = bootstrapped;
     let layers = Arc::new(layers);
-    let temporal_client: Arc<dyn TemporalClient> =
-        Arc::new(GrpcTemporalClient::new(temporal_address));
-    let activity_since = chrono::Duration::from_std(opts.since)
-        .unwrap_or_else(|_| chrono::Duration::minutes(10));
 
     let mut app = App::with_interval(interval);
     app.set_baseline(nico_doctor::baseline::load());
     let (tx, mut rx) = mpsc::channel::<Action>(64);
 
     let refresh_ctx = RefreshCtx {
-        activity: ActivityCtx {
-            temporal: temporal_client.clone(),
-            k8s: k8s_client.clone(),
-            namespace: temporal_namespace.clone(),
-            since: activity_since,
-        },
         logs: LogsCtx {
             log_source: log_source.clone(),
             namespace: opts.namespace.clone(),
@@ -197,8 +190,12 @@ async fn run_event_loop<C: Clock>(
         log_collector,
     };
 
-    spawn_refresh(layers.clone(), opts.clone(), refresh_ctx.log_collector.clone(), tx.clone());
-    spawn_activity_refresh(&refresh_ctx.activity, tx.clone());
+    spawn_refresh(
+        layers.clone(),
+        opts.clone(),
+        refresh_ctx.log_collector.clone(),
+        tx.clone(),
+    );
     spawn_logs_refresh(&refresh_ctx.logs, tx.clone());
     let _ = app.handle(Action::Refresh);
 
@@ -260,20 +257,13 @@ pub fn resolve_interval(
 
 /// All non-layer fan-out dependencies the host loop spawns alongside a
 /// `StartRefresh`. One `R` press kicks off layer collection (via
-/// `spawn_refresh`) plus the Activity feed and the snapshot logs panel
-/// in lockstep. `log_collector` runs once per refresh before layers fan
-/// out (issue #201).
+/// `spawn_refresh`) plus the snapshot logs panel in lockstep.
+/// `log_collector` runs once per refresh before layers fan out (issue
+/// #201). The Activity feed used to live here too; it was removed
+/// together with Mission Control in PRD-006 slice 1 (issue #367).
 struct RefreshCtx {
-    activity: ActivityCtx,
     logs: LogsCtx,
     log_collector: Option<Arc<nico_doctor::log_collector::LogCollectorStage>>,
-}
-
-struct ActivityCtx {
-    temporal: Arc<dyn TemporalClient>,
-    k8s: Option<Arc<dyn K8sClient>>,
-    namespace: String,
-    since: chrono::Duration,
 }
 
 struct LogsCtx {
@@ -300,7 +290,6 @@ fn dispatch(
                 refresh.log_collector.clone(),
                 tx.clone(),
             );
-            spawn_activity_refresh(&refresh.activity, tx.clone());
             spawn_logs_refresh(&refresh.logs, tx.clone());
             false
         }
@@ -366,8 +355,7 @@ async fn run_correlate_collect(workflow_id: &str) -> (Vec<PopoverEvent>, Vec<Sou
     };
     let prepared = nico_correlate::prepare_sources(&args, &cfg).await;
     let id_str = args.id.clone().unwrap_or_default();
-    let results =
-        nico_correlate::collect_all(&prepared.named_sources, &id_str, &cfg.id_type).await;
+    let results = nico_correlate::collect_all(&prepared.named_sources, &id_str, &cfg.id_type).await;
     drop(prepared._pf_guards);
 
     let mut events: Vec<PopoverEvent> = Vec::new();
@@ -476,20 +464,6 @@ fn spawn_refresh(
     tokio::spawn(async move {
         let snapshots: Vec<LayerSnapshot> = data::collect(layers, opts, log_collector).await;
         let _ = tx.send(Action::Snapshots(snapshots)).await;
-    });
-}
-
-fn spawn_activity_refresh(ctx: &ActivityCtx, tx: mpsc::Sender<Action>) {
-    let Some(k8s) = ctx.k8s.clone() else {
-        // No reachable kubeconfig — leave the Activity feed empty.
-        return;
-    };
-    let temporal = ctx.temporal.clone();
-    let namespace = ctx.namespace.clone();
-    let since = ctx.since;
-    tokio::spawn(async move {
-        let events = nico_correlate::recent_namespace_events(temporal, k8s, &namespace, since).await;
-        let _ = tx.send(Action::NamespaceEvents(events)).await;
     });
 }
 
@@ -728,10 +702,7 @@ enum HbnTick {
     Error(String),
 }
 
-fn spawn_hbn_refresh(
-    client: Arc<dyn nico_doctor::hbn::HbnClient>,
-    tx: mpsc::Sender<HbnTick>,
-) {
+fn spawn_hbn_refresh(client: Arc<dyn nico_doctor::hbn::HbnClient>, tx: mpsc::Sender<HbnTick>) {
     tokio::spawn(async move {
         let result = client.fetch_all_snapshots().await;
         let msg = match result {
@@ -778,10 +749,7 @@ fn paint_hbn_status(
             format!(" sort:{sort_label}  refreshed:{refreshed}  "),
             Style::default().fg(theme.muted),
         ),
-        Span::styled(
-            "[r]efresh [s]ort [q]uit",
-            Style::default().fg(theme.muted),
-        ),
+        Span::styled("[r]efresh [s]ort [q]uit", Style::default().fg(theme.muted)),
     ];
     if refreshing {
         spans.insert(

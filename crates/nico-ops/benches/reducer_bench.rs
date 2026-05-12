@@ -4,9 +4,9 @@
 //! warmed `App` and drives a single `handle()` call so the wall-clock
 //! cost of each reducer arm shows up cleanly in the criterion output.
 //!
-//! Covers the six variants called out in the issue body:
-//! `Snapshots`, `NamespaceEvents`, `LogLines`, `Tick`-while-refreshing,
-//! `Focus`, `Refresh`.
+//! Covers the five variants still relevant after PRD-006 slice 1
+//! (issue #367) deleted `Action::NamespaceEvents`:
+//! `Snapshots`, `LogLines`, `Tick`-while-refreshing, `Focus`, `Refresh`.
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -19,7 +19,7 @@ use nico_ops::action::{Action, Dir};
 use nico_ops::app::App;
 
 mod common;
-use common::{fleet_log_lines, fleet_namespace_events, fleet_snapshots, warmed_app};
+use common::{fleet_log_lines, fleet_snapshots, warmed_app};
 
 const WARM_N: usize = 18;
 
@@ -29,17 +29,6 @@ fn bench_snapshots(c: &mut Criterion) {
         b.iter_batched(
             || (warmed_app(WARM_N), snapshots.clone()),
             |(mut app, snaps)| app.handle(Action::Snapshots(snaps)),
-            criterion::BatchSize::SmallInput,
-        );
-    });
-}
-
-fn bench_namespace_events(c: &mut Criterion) {
-    let events = fleet_namespace_events(WARM_N);
-    c.bench_function("reducer/namespace_events", |b| {
-        b.iter_batched(
-            || (warmed_app(WARM_N), events.clone()),
-            |(mut app, evs)| app.handle(Action::NamespaceEvents(evs)),
             criterion::BatchSize::SmallInput,
         );
     });
@@ -104,7 +93,6 @@ fn bench_refresh(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_snapshots,
-    bench_namespace_events,
     bench_log_lines,
     bench_tick_while_refreshing,
     bench_focus,
