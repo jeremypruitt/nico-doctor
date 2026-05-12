@@ -86,6 +86,7 @@ fn render_scorecard_layout(app: &mut App, theme: &Theme, frame: &mut Frame) {
         Overlay::Detail => render_detail_overlay(app, theme, frame, area),
         Overlay::Help => render_help_overlay(theme, frame, area),
         Overlay::Correlate => render_correlate_overlay(app, theme, frame, area),
+        Overlay::CorrelateChooser => render_correlate_chooser_overlay(app, theme, frame, area),
         Overlay::None => {}
     }
 }
@@ -114,6 +115,7 @@ fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
     match app.overlay() {
         Overlay::Help => render_help_overlay(theme, frame, area),
         Overlay::Correlate => render_correlate_overlay(app, theme, frame, area),
+        Overlay::CorrelateChooser => render_correlate_chooser_overlay(app, theme, frame, area),
         _ => {}
     }
 }
@@ -636,6 +638,63 @@ fn render_correlate_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: R
         scroll: 0,
     }
     .render(theme, frame, area);
+}
+
+/// PRD-007 Slice 1 (#372): multi-match chooser popup. Centered ~50%×40%
+/// modal that lists every entity the extraction primitive returned;
+/// arrow keys / `j` / `k` move focus, `Enter` opens the correlate popup
+/// for the highlighted entity, `Esc` cancels.
+fn render_correlate_chooser_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let Some(state) = app.chooser_state() else {
+        return;
+    };
+    Popup {
+        title: " drill into ".to_string(),
+        body: chooser_body_lines(state, theme),
+        size_pct: PopupSize {
+            width_pct: 50,
+            height_pct: 40,
+        },
+        dismiss_keys: vec![KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('Q')],
+        body_margin: Margin {
+            horizontal: 1,
+            vertical: 0,
+        },
+        scroll: 0,
+    }
+    .render(theme, frame, area);
+}
+
+fn chooser_body_lines(
+    state: &crate::app::ChooserState,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::from(Span::styled(
+        format!("{} candidates — Enter selects, Esc cancels", state.entities.len()),
+        Style::default().fg(theme.muted),
+    )));
+    out.push(Line::from(""));
+    for (i, entity) in state.entities.iter().enumerate() {
+        let focused = i == state.focus;
+        let marker = if focused { "▶ " } else { "  " };
+        let style = if focused {
+            Style::default()
+                .fg(theme.overlay_key)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.overlay_fg)
+        };
+        out.push(Line::from(vec![
+            Span::styled(marker.to_string(), style),
+            Span::styled(entity.id.clone(), style),
+            Span::styled(
+                format!("  ({})", entity.id_type.cli_name()),
+                Style::default().fg(theme.muted),
+            ),
+        ]));
+    }
+    out
 }
 
 fn correlate_title(app: &App, state: &CorrelateState) -> String {

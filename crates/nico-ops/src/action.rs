@@ -83,6 +83,19 @@ pub enum Action {
     /// entity. The general path the per-surface triggers (Spotlight rows,
     /// log lines, Findings detail, event timeline) all funnel into.
     OpenCorrelatePopup(EntityRef),
+    /// PRD-007 Slice 1 (#372): when a per-surface extraction returns 2+
+    /// entities, open the chooser popup so the operator can pick which
+    /// one to drill into. Closing the chooser with `Esc` is a no-op;
+    /// `Enter` re-dispatches as [`Action::OpenCorrelatePopup`] with the
+    /// focused entity.
+    ShowCorrelateChooser(Vec<EntityRef>),
+    /// Move chooser focus by one row. Only `Dir::Up` and `Dir::Down`
+    /// have meaning; horizontal directions are inert.
+    ChooserNavigate(Dir),
+    /// Confirm the chooser's focused entity — re-dispatches as
+    /// [`Action::OpenCorrelatePopup`] for that entity and clears the
+    /// chooser state.
+    ChooserConfirm,
     /// PRD-007 Slice 2: one increment of the in-flight correlate run.
     /// The host loop pumps one of these per [`CorrelateUpdate`] the
     /// runner yields; the reducer accumulates events, flips per-Source

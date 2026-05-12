@@ -16,14 +16,41 @@ pub struct Finding {
 }
 
 /// PRD-007: a typed pointer at one entity (workflow / host / DPU / request)
-/// the correlate drill-down popup is opened against. Constructed from
-/// `Finding.message` text via [`extract_entity_from_finding`] using the
-/// shared [`detect_id_type`] vocabulary so doctor / correlate / ops agree
-/// on what an entity ID looks like.
+/// the correlate drill-down popup is opened against. Slice 0 constructed
+/// these from `Finding.message` text via [`extract_entity_from_finding`];
+/// Slice 1 (#372) generalised extraction into the per-surface
+/// `extract_entities` primitive in [`crate::entity_extraction`], which
+/// tags each `EntityRef` with the [`Confidence`] level appropriate for
+/// the surface it was pulled from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityRef {
     pub id: String,
     pub id_type: IdType,
+    /// How sure the extraction primitive was about this match. `Explicit`
+    /// when the surface yielded the ID directly (Spotlight row, tagged
+    /// event), `Parsed` when pulled from a structured field (a
+    /// `next_command` CLI string), `Heuristic` when matched by regex on
+    /// free-form text (log line, untagged event message). Future surfaces
+    /// can render or weight matches by confidence; today the chooser
+    /// popup just consumes the IDs.
+    pub confidence: Confidence,
+}
+
+/// PRD-007 Slice 1: how reliable a given entity extraction is. The
+/// per-surface extractors in [`crate::entity_extraction`] set this so
+/// callers can distinguish a Spotlight row's `Explicit` ID from a
+/// best-effort log-line regex match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    /// Surface yielded an entity ID directly (Spotlight row, tagged
+    /// event row's `host_id` / `dpu_id` / `workflow_id` / `request_id`).
+    Explicit,
+    /// Parsed out of a structured field — the trailing argument of a
+    /// `next_command` CLI string is the canonical case.
+    Parsed,
+    /// Regex match on free-form text (log line message, event row
+    /// message when no matching tag is present).
+    Heuristic,
 }
 
 /// Severity of a single timeline entry inside the quick-correlate popover.
@@ -139,6 +166,7 @@ pub fn extract_entity_from_finding(f: &Finding) -> Option<EntityRef> {
         detect_id_type(tok).map(|id_type| EntityRef {
             id: tok.to_string(),
             id_type,
+            confidence: Confidence::Heuristic,
         })
     })
 }

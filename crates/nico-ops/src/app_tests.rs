@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{EntityRef, PopoverEvent, SourceStatus};
+use crate::model::{Confidence, EntityRef, PopoverEvent, SourceStatus};
 use nico_common::output::Status;
 use nico_correlate::id::IdType;
 
@@ -7,6 +7,7 @@ fn entity_wf(id: &str) -> EntityRef {
     EntityRef {
         id: id.into(),
         id_type: IdType::Workflow,
+        confidence: Confidence::Heuristic,
     }
 }
 
@@ -14,6 +15,7 @@ fn entity_dpu(id: &str) -> EntityRef {
     EntityRef {
         id: id.into(),
         id_type: IdType::Dpu,
+        confidence: Confidence::Heuristic,
     }
 }
 
@@ -1275,4 +1277,137 @@ fn snapshots_clamps_spotlight_focus_when_card_count_drops() {
         app.spotlight_focus(),
         app.spotlight_card_count()
     );
+}
+
+// ── PRD-007 Slice 1 (#372): multi-match chooser ─────────────────────────
+
+fn entity_host(id: &str) -> EntityRef {
+    EntityRef {
+        id: id.into(),
+        id_type: IdType::Host,
+        confidence: Confidence::Heuristic,
+    }
+}
+
+#[test]
+fn show_chooser_opens_overlay_and_seeds_state_focused_on_first() {
+    let mut app = App::new();
+    app.handle(Action::ShowCorrelateChooser(vec![
+        entity_host("host-r12u5"),
+        entity_dpu("dpu-bf3-r12u5"),
+    ]));
+    assert_eq!(app.overlay(), Overlay::CorrelateChooser);
+    let state = app.chooser_state().expect("chooser state seeded");
+    assert_eq!(state.entities.len(), 2);
+    assert_eq!(state.focus, 0);
+}
+
+#[test]
+fn show_chooser_with_empty_entities_is_inert() {
+    let mut app = App::new();
+    app.handle(Action::ShowCorrelateChooser(vec![]));
+    assert_eq!(app.overlay(), Overlay::None);
+    assert!(app.chooser_state().is_none());
+}
+
+#[test]
+fn show_chooser_inert_when_another_overlay_is_open() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::OpenHelp);
+    assert_eq!(app.overlay(), Overlay::Help);
+    app.handle(Action::ShowCorrelateChooser(vec![entity_host("host-x")]));
+    // Still Help — the chooser cannot overwrite an active overlay.
+    assert_eq!(app.overlay(), Overlay::Help);
+    assert!(app.chooser_state().is_none());
+}
+
+#[test]
+fn chooser_navigate_down_advances_focus_then_clamps() {
+    let mut app = App::new();
+    app.handle(Action::ShowCorrelateChooser(vec![
+        entity_host("host-r12u5"),
+        entity_dpu("dpu-bf3-r12u5"),
+    ]));
+    app.handle(Action::ChooserNavigate(Dir::Down));
+    assert_eq!(app.chooser_state().unwrap().focus, 1);
+    // Down at the end stays put.
+    app.handle(Action::ChooserNavigate(Dir::Down));
+    assert_eq!(app.chooser_state().unwrap().focus, 1);
+}
+
+#[test]
+fn chooser_navigate_up_decrements_focus_then_clamps() {
+    let mut app = App::new();
+    app.handle(Action::ShowCorrelateChooser(vec![
+        entity_host("host-r12u5"),
+        entity_dpu("dpu-bf3-r12u5"),
+    ]));
+    app.handle(Action::ChooserNavigate(Dir::Down));
+    app.handle(Action::ChooserNavigate(Dir::Up));
+    assert_eq!(app.chooser_state().unwrap().focus, 0);
+    // Up at index 0 stays put.
+    app.handle(Action::ChooserNavigate(Dir::Up));
+    assert_eq!(app.chooser_state().unwrap().focus, 0);
+}
+
+#[test]
+fn chooser_navigate_horizontal_directions_are_inert() {
+    let mut app = App::new();
+    app.handle(Action::ShowCorrelateChooser(vec![
+        entity_host("host-r12u5"),
+        entity_dpu("dpu-bf3-r12u5"),
+    ]));
+    app.handle(Action::ChooserNavigate(Dir::Left));
+    app.handle(Action::ChooserNavigate(Dir::Right));
+    assert_eq!(app.chooser_state().unwrap().focus, 0);
+}
+
+#[test]
+fn chooser_confirm_dispatches_open_correlate_for_focused_entity() {
+    let mut app = App::new();
+    app.handle(Action::ShowCorrelateChooser(vec![
+        entity_host("host-r12u5"),
+        entity_dpu("dpu-bf3-r12u5"),
+    ]));
+    app.handle(Action::ChooserNavigate(Dir::Down));
+    let effect = app.handle(Action::ChooserConfirm);
+    // Chooser closed, correlate popup opened in its place.
+    assert_eq!(app.overlay(), Overlay::Correlate);
+    assert!(app.chooser_state().is_none());
+    let state = app.correlate_state().expect("correlate popup opened");
+    assert_eq!(state.entity.id, "dpu-bf3-r12u5");
+    assert_eq!(state.entity.id_type, IdType::Dpu);
+    // The host loop must see a RunCorrelate effect so it can spawn the
+    // collect_all task; this is what makes the popup actually populate.
+    assert_eq!(
+        effect,
+        Some(Effect::RunCorrelate(EntityRef {
+            id: "dpu-bf3-r12u5".into(),
+            id_type: IdType::Dpu,
+            confidence: Confidence::Heuristic,
+        }))
+    );
+}
+
+#[test]
+fn chooser_confirm_without_open_chooser_is_inert() {
+    let mut app = App::new();
+    let effect = app.handle(Action::ChooserConfirm);
+    assert!(effect.is_none());
+    assert_eq!(app.overlay(), Overlay::None);
+}
+
+#[test]
+fn chooser_close_overlay_clears_state_no_correlate_dispatched() {
+    let mut app = App::new();
+    app.handle(Action::ShowCorrelateChooser(vec![
+        entity_host("host-r12u5"),
+        entity_dpu("dpu-bf3-r12u5"),
+    ]));
+    app.handle(Action::CloseOverlay);
+    assert_eq!(app.overlay(), Overlay::None);
+    assert!(app.chooser_state().is_none());
+    // No correlate popup was opened — dismissal is a clean no-op.
+    assert!(app.correlate_state().is_none());
 }

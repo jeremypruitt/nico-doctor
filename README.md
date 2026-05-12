@@ -300,12 +300,14 @@ kill $PF_PID
 
 | Entity type | ID prefix example | Tables queried |
 |-------------|------------------|---------------|
-| Host | `host-r12u5` | `hosts` (WHERE `id = ?`), `audit_log` |
-| DPU | `dpu-bf3-r12u5` | `hosts` (WHERE `dpu_id = ?`), `audit_log` |
-| Workflow | `<uuid>` or `hp-*` | `workflows` (WHERE `id = ?`), `audit_log` |
-| Request | `req-*` | `audit_log` only |
+| Host | `host-r12u5` | `machines` (WHERE `id = ?`), `machine_state_history` |
+| DPU | `dpu-bf3-r12u5` | `machines` (WHERE `id = ?`)¹, `machine_state_history` |
+| Workflow | `wf-*` or `hp-*` | _(none — events come from Temporal, state lives outside Postgres)_ |
+| Request | `req-*` | _(none — events live in Loki / app logs, not Postgres)_ |
 
-The `audit_log` table is queried for all entity types using `entity_id = ?`, returning the 100 most recent events ordered by `ts DESC`.
+¹ Carbide stores Hosts and DPUs in the same `machines` table; DPU IDs resolve via the shared `id` column.
+
+`machine_state_history` rows are projected to `state_change` events tagged with their `state_version`, ordered chronologically.
 
 ---
 

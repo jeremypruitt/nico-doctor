@@ -17,6 +17,11 @@ pub enum Overlay {
     /// the workflow ID, loading state, events, and source errors live
     /// on `App::correlate_state` so the overlay marker can stay `Copy`.
     Correlate,
+    /// PRD-007 Slice 1 (#372): multi-match chooser. Operator picks one
+    /// of N entities extracted from the trigger surface; `Enter` opens
+    /// the correlate popup for the focused entity, `Esc` cancels.
+    /// Entity list + focus index live on `App::chooser_state`.
+    CorrelateChooser,
 }
 
 /// Reserved for future input modes (filter bar, etc.). Today only `Normal`
@@ -72,6 +77,7 @@ fn translate_key(key: &KeyEvent, _mode: Mode, layout: Layout, overlay: Overlay) 
     match (layout, overlay) {
         (_, Overlay::Detail | Overlay::Help) => translate_overlay(key, overlay),
         (_, Overlay::Correlate) => translate_correlate_overlay(key),
+        (_, Overlay::CorrelateChooser) => translate_correlate_chooser(key),
         (Layout::Scorecard, Overlay::None) => translate_normal(key),
         (Layout::Spotlight, Overlay::None) => translate_spotlight(key),
     }
@@ -145,6 +151,20 @@ fn translate_overlay(key: &KeyEvent, overlay: Overlay) -> Option<Action> {
 fn translate_correlate_overlay(key: &KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::CloseOverlay),
+        _ => None,
+    }
+}
+
+/// PRD-007 Slice 1 (#372): multi-match chooser. Up/Down move focus,
+/// Enter confirms the focused entity, Esc cancels. `q` also cancels
+/// (consistent with the correlate popup); the underlying-view quit is
+/// locally overridden.
+fn translate_correlate_chooser(key: &KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => Some(Action::CloseOverlay),
+        KeyCode::Enter => Some(Action::ChooserConfirm),
+        KeyCode::Up | KeyCode::Char('k') => Some(Action::ChooserNavigate(Dir::Up)),
+        KeyCode::Down | KeyCode::Char('j') => Some(Action::ChooserNavigate(Dir::Down)),
         _ => None,
     }
 }
@@ -506,6 +526,57 @@ mod tests {
         );
     }
 
+    // ── Chooser overlay (PRD-007 Slice 1, #372) ─────────────────────────
+
+    fn chooser(event: &Event) -> Option<Action> {
+        translate(
+            event,
+            Mode::Normal,
+            Layout::Scorecard,
+            Overlay::CorrelateChooser,
+        )
+    }
+
+    #[test]
+    fn esc_dismisses_chooser_overlay() {
+        assert_eq!(chooser(&k(KeyCode::Esc)), Some(Action::CloseOverlay));
+    }
+
+    #[test]
+    fn q_dismisses_chooser_overlay_instead_of_quitting() {
+        assert_eq!(chooser(&k(KeyCode::Char('q'))), Some(Action::CloseOverlay));
+    }
+
+    #[test]
+    fn enter_in_chooser_emits_chooser_confirm() {
+        assert_eq!(chooser(&k(KeyCode::Enter)), Some(Action::ChooserConfirm));
+    }
+
+    #[test]
+    fn up_and_down_in_chooser_emit_chooser_navigate() {
+        assert_eq!(
+            chooser(&k(KeyCode::Up)),
+            Some(Action::ChooserNavigate(Dir::Up))
+        );
+        assert_eq!(
+            chooser(&k(KeyCode::Down)),
+            Some(Action::ChooserNavigate(Dir::Down))
+        );
+        assert_eq!(
+            chooser(&k(KeyCode::Char('k'))),
+            Some(Action::ChooserNavigate(Dir::Up))
+        );
+        assert_eq!(
+            chooser(&k(KeyCode::Char('j'))),
+            Some(Action::ChooserNavigate(Dir::Down))
+        );
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_inside_chooser_overlay() {
+        assert_eq!(chooser(&ctrl(KeyCode::Char('c'))), Some(Action::Quit));
+    }
+
     #[test]
     fn ctrl_c_still_quits_inside_correlate_overlay() {
         assert_eq!(
@@ -619,7 +690,12 @@ mod tests {
         ];
 
         for layout in [Layout::Scorecard, Layout::Spotlight] {
-            for overlay in [Overlay::Detail, Overlay::Help, Overlay::Correlate] {
+            for overlay in [
+                Overlay::Detail,
+                Overlay::Help,
+                Overlay::Correlate,
+                Overlay::CorrelateChooser,
+            ] {
                 for key in view_keys {
                     let result = translate(&k(*key), Mode::Normal, layout, overlay);
                     if let Some(action) = &result {
