@@ -216,6 +216,7 @@ mod tests {
         EntityRef {
             id: "dpu-r12u5".into(),
             id_type: IdType::Dpu,
+            confidence: crate::model::Confidence::Heuristic,
         }
     }
 

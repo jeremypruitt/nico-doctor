@@ -1192,6 +1192,7 @@ fn entity_wf(id: &str) -> crate::model::EntityRef {
     crate::model::EntityRef {
         id: id.into(),
         id_type: nico_correlate::id::IdType::Workflow,
+        confidence: crate::model::Confidence::Heuristic,
     }
 }
 
@@ -1199,6 +1200,7 @@ fn entity_dpu(id: &str) -> crate::model::EntityRef {
     crate::model::EntityRef {
         id: id.into(),
         id_type: nico_correlate::id::IdType::Dpu,
+        confidence: crate::model::Confidence::Heuristic,
     }
 }
 
@@ -1690,4 +1692,75 @@ fn popup_renders_partial_state_with_one_source_failed_inline() {
         s.contains("provision_fail"),
         "expected successful event:\n{s}"
     );
+}
+
+// ── PRD-007 Slice 1 (#372): chooser popup rendering ─────────────────────
+
+fn chooser_entities() -> Vec<crate::model::EntityRef> {
+    use crate::model::{Confidence, EntityRef};
+    use nico_correlate::id::IdType;
+    vec![
+        EntityRef {
+            id: "host-r12u5".into(),
+            id_type: IdType::Host,
+            confidence: Confidence::Heuristic,
+        },
+        EntityRef {
+            id: "dpu-bf3-r12u5".into(),
+            id_type: IdType::Dpu,
+            confidence: Confidence::Heuristic,
+        },
+    ]
+}
+
+#[test]
+fn chooser_overlay_renders_entity_list_with_focus_marker_on_first_row() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::ShowCorrelateChooser(chooser_entities()));
+    let s = render_to_string(&mut app, 120, 30);
+    assert!(s.contains("drill into"), "title missing:\n{s}");
+    assert!(s.contains("host-r12u5"), "host candidate missing:\n{s}");
+    assert!(s.contains("dpu-bf3-r12u5"), "dpu candidate missing:\n{s}");
+    assert!(s.contains("▶"), "focus marker missing on focused row:\n{s}");
+    assert!(s.contains("(host)"), "host axis label missing:\n{s}");
+    assert!(s.contains("(dpu)"), "dpu axis label missing:\n{s}");
+    assert!(s.contains("Enter selects"), "hint copy missing:\n{s}");
+}
+
+#[test]
+fn chooser_overlay_focus_marker_follows_down_navigation() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(six_layers()));
+    app.handle(Action::ShowCorrelateChooser(chooser_entities()));
+    app.handle(Action::ChooserNavigate(Dir::Down));
+    let s = render_to_string(&mut app, 120, 30);
+    let dpu_line: &str = s
+        .lines()
+        .find(|l| l.contains("dpu-bf3-r12u5"))
+        .expect("dpu row should render");
+    assert!(
+        dpu_line.contains("▶"),
+        "focus marker should be on dpu row after one Down:\n{s}"
+    );
+    let host_line: &str = s
+        .lines()
+        .find(|l| l.contains("host-r12u5"))
+        .expect("host row should render");
+    assert!(
+        !host_line.contains("▶"),
+        "focus marker should leave host row after one Down:\n{s}"
+    );
+}
+
+#[test]
+fn chooser_overlay_renders_at_narrow_and_wide_widths() {
+    for (w, h) in [(80u16, 24u16), (160, 40)] {
+        let mut app = App::new();
+        app.handle(Action::Snapshots(six_layers()));
+        app.handle(Action::ShowCorrelateChooser(chooser_entities()));
+        let s = render_to_string(&mut app, w, h);
+        assert!(s.contains("host-r12u5"), "host missing at {w}x{h}:\n{s}");
+        assert!(s.contains("dpu-bf3-r12u5"), "dpu missing at {w}x{h}:\n{s}");
+    }
 }

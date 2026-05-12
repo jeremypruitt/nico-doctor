@@ -113,6 +113,7 @@ pub struct App {
     spotlight_focus: usize,
     toast: Option<Toast>,
     correlate: Option<CorrelateState>,
+    chooser: Option<ChooserState>,
     log_lines: Vec<LogLine>,
 }
 
@@ -122,6 +123,15 @@ pub struct App {
 pub struct Toast {
     pub message: String,
     pub expires_at: Instant,
+}
+
+/// PRD-007 Slice 1 (#372): state for the multi-match chooser popup.
+/// `entities` is the list of candidates the extraction primitive
+/// returned; `focus` is the index the operator has highlighted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChooserState {
+    pub entities: Vec<EntityRef>,
+    pub focus: usize,
 }
 
 impl App {
@@ -156,6 +166,7 @@ impl App {
             spotlight_focus: 0,
             toast: None,
             correlate: None,
+            chooser: None,
             log_lines: Vec::new(),
         }
     }
@@ -234,6 +245,12 @@ impl App {
     /// only consults this when `overlay() == Overlay::Correlate`.
     pub fn correlate_state(&self) -> Option<&CorrelateState> {
         self.correlate.as_ref()
+    }
+
+    /// PRD-007 Slice 1 (#372): multi-match chooser state. `None` outside
+    /// of `Overlay::CorrelateChooser`.
+    pub fn chooser_state(&self) -> Option<&ChooserState> {
+        self.chooser.as_ref()
     }
 
     pub fn overlay_scroll(&self) -> u16 {
@@ -383,6 +400,7 @@ impl App {
                 let had_correlate = self.correlate.is_some();
                 self.overlay = Overlay::None;
                 self.correlate = None;
+                self.chooser = None;
                 self.dirty = true;
                 // Slice 2: tearing down the popup must abort the
                 // runner's per-Source futures so we never leak tasks
@@ -570,6 +588,44 @@ impl App {
                 apply_correlate_update(state, update);
                 self.dirty = true;
                 None
+            }
+            Action::ShowCorrelateChooser(entities) => {
+                if self.overlay != Overlay::None || entities.is_empty() {
+                    return None;
+                }
+                self.overlay = Overlay::CorrelateChooser;
+                self.chooser = Some(ChooserState {
+                    entities,
+                    focus: 0,
+                });
+                self.dirty = true;
+                None
+            }
+            Action::ChooserNavigate(dir) => {
+                let state = self.chooser.as_mut()?;
+                let n = state.entities.len();
+                if n == 0 {
+                    return None;
+                }
+                let next = match dir {
+                    Dir::Up => state.focus.saturating_sub(1),
+                    Dir::Down => (state.focus + 1).min(n - 1),
+                    Dir::Left | Dir::Right => state.focus,
+                };
+                if next != state.focus {
+                    state.focus = next;
+                    self.dirty = true;
+                }
+                None
+            }
+            Action::ChooserConfirm => {
+                let state = self.chooser.take()?;
+                let entity = state.entities.into_iter().nth(state.focus)?;
+                // Close the chooser overlay first so OpenCorrelatePopup's
+                // overlay-precondition check sees `Overlay::None`.
+                self.overlay = Overlay::None;
+                self.dirty = true;
+                self.handle(Action::OpenCorrelatePopup(entity))
             }
             Action::ShowToast(msg) => {
                 self.set_toast(&msg);

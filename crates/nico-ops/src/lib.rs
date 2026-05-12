@@ -20,6 +20,7 @@ pub mod cli;
 pub mod clock;
 pub mod correlate_runner;
 pub mod data;
+pub mod entity_extraction;
 pub mod events;
 pub mod hbn_panel;
 pub mod model;
