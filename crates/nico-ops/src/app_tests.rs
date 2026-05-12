@@ -1,6 +1,7 @@
 use super::*;
-use crate::model::{PopoverEvent, SourceError};
+use crate::model::{EntityRef, PopoverDiagnosis, PopoverEvent, SourceError};
 use nico_common::output::Status;
+use nico_correlate::id::IdType;
 
 fn snap(name: &str, status: Status) -> LayerSnapshot {
     LayerSnapshot {
@@ -925,6 +926,13 @@ fn workflows_warn_snap_with_id(workflow_id: &str) -> LayerSnapshot {
     }
 }
 
+fn wf_entity(id: &str) -> EntityRef {
+    EntityRef {
+        id_type: IdType::Workflow,
+        id: id.into(),
+    }
+}
+
 #[test]
 fn correlate_on_workflows_layer_opens_loading_overlay_and_emits_effect() {
     let mut app = App::new();
@@ -932,25 +940,30 @@ fn correlate_on_workflows_layer_opens_loading_overlay_and_emits_effect() {
         "wf-001",
     )]));
     let eff = app.handle(Action::Correlate);
-    assert_eq!(eff, Some(Effect::Correlate("wf-001".into())));
+    assert_eq!(eff, Some(Effect::OpenCorrelatePopup(wf_entity("wf-001"))));
     assert_eq!(app.overlay(), Overlay::Correlate);
     let cs = app.correlate_state().expect("correlate state set");
-    assert_eq!(cs.workflow_id, "wf-001");
+    assert_eq!(cs.entity, wf_entity("wf-001"));
     assert!(matches!(cs.status, CorrelateStatus::Loading));
 }
 
 #[test]
-fn correlate_on_non_workflows_layer_is_inert() {
+fn correlate_on_non_workflows_layer_in_scorecard_raises_no_entity_toast() {
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![warn_snap("logs")]));
     let eff = app.handle(Action::Correlate);
     assert_eq!(eff, None);
     assert_eq!(app.overlay(), Overlay::None);
     assert!(app.correlate_state().is_none());
+    let msg = app.toast().map(|t| t.message.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("no entity found"),
+        "expected no-entity toast on a non-correlatable focused layer, got: {msg:?}"
+    );
 }
 
 #[test]
-fn correlate_on_workflows_layer_with_no_id_is_inert() {
+fn correlate_on_workflows_layer_with_no_id_raises_no_entity_toast() {
     // workflows layer with only the aggregate "0 stuck, 0 failed"
     // style finding (no recognizable workflow ID token).
     let snap = LayerSnapshot {
@@ -965,24 +978,35 @@ fn correlate_on_workflows_layer_with_no_id_is_inert() {
     let eff = app.handle(Action::Correlate);
     assert_eq!(eff, None);
     assert_eq!(app.overlay(), Overlay::None);
+    assert!(
+        app.toast()
+            .map(|t| t.message.contains("no entity found"))
+            .unwrap_or(false)
+    );
 }
 
 #[test]
 fn correlate_in_spotlight_targets_focused_incident_card() {
     let mut app = App::new();
-    // Two non-green cards; the second is workflows.
+    // Two non-green cards; the first card carries no DPU id but does
+    // have a finding, so the slice-0 extractor should pass on it.
     app.handle(Action::Snapshots(vec![
         warn_snap("logs"),
         workflows_warn_snap_with_id("wf-042"),
     ]));
     app.handle(Action::ShowSpotlight);
-    // Default focus is 0 (logs) — should be inert.
+    // Default focus is 0 (logs) — no extractable DPU/workflow → toast.
     assert_eq!(app.handle(Action::Correlate), None);
     assert_eq!(app.overlay(), Overlay::None);
+    assert!(
+        app.toast()
+            .map(|t| t.message.contains("no entity found"))
+            .unwrap_or(false)
+    );
 }
 
 #[test]
-fn correlate_results_for_matching_workflow_id_populates_loaded_state() {
+fn correlate_results_for_matching_entity_populates_loaded_state() {
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
         "wf-001",
@@ -996,35 +1020,39 @@ fn correlate_results_for_matching_workflow_id_populates_loaded_state() {
         severity: crate::model::PopoverSeverity::Info,
     }];
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-001".into(),
+        entity: wf_entity("wf-001"),
         events: evs.clone(),
         source_errors: vec![],
+        diagnosis: None,
     });
     let cs = app.correlate_state().expect("still open");
     match &cs.status {
         CorrelateStatus::Loaded {
             events,
             source_errors,
+            diagnosis,
         } => {
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].kind, "WorkflowExecutionStarted");
             assert!(source_errors.is_empty());
+            assert!(diagnosis.is_none());
         }
         _ => panic!("expected Loaded, got {:?}", cs.status),
     }
 }
 
 #[test]
-fn correlate_results_for_stale_workflow_id_are_dropped() {
+fn correlate_results_for_stale_entity_are_dropped() {
     let mut app = App::new();
     app.handle(Action::Snapshots(vec![workflows_warn_snap_with_id(
         "wf-001",
     )]));
     app.handle(Action::Correlate);
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-OTHER".into(),
+        entity: wf_entity("wf-OTHER"),
         events: vec![],
         source_errors: vec![],
+        diagnosis: None,
     });
     let cs = app.correlate_state().unwrap();
     assert!(
@@ -1063,12 +1091,13 @@ fn correlate_results_when_no_overlay_open_are_dropped() {
     // Never opened the popover; out-of-band results must not crash
     // or flip state.
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-001".into(),
+        entity: wf_entity("wf-001"),
         events: vec![],
         source_errors: vec![SourceError {
             name: "loki".into(),
             reason: "x".into(),
         }],
+        diagnosis: None,
     });
     assert!(app.correlate_state().is_none());
 }
@@ -1110,4 +1139,131 @@ fn snapshots_clamps_spotlight_focus_when_card_count_drops() {
         app.spotlight_focus(),
         app.spotlight_card_count()
     );
+}
+
+// ─── PRD-007 slice 0 — correlate drill-down tracer bullet ──────────────
+
+fn dpu_finding_card_snap(dpu_id: &str) -> LayerSnapshot {
+    LayerSnapshot {
+        name: "dpu_health".into(),
+        status: Status::Fail,
+        evidence: "cert expired".into(),
+        findings: vec![crate::model::Finding {
+            status: Status::Fail,
+            message: format!("dpu_cert expired on {dpu_id}: 2 days ago"),
+            next_command: Some(format!("nico doctor dpu-cert {dpu_id}")),
+            link: None,
+        }],
+        duration_ms: 0,
+    }
+}
+
+#[test]
+fn correlate_key_on_focused_dpu_finding_in_spotlight_yields_open_correlate_popup_with_dpu_entity_ref()
+ {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![dpu_finding_card_snap(
+        "dpu-bf3-r12u5",
+    )]));
+    app.handle(Action::ShowSpotlight);
+    let derived = app.derive_correlate_action();
+    let expected = Action::OpenCorrelatePopup(EntityRef {
+        id_type: IdType::Dpu,
+        id: "dpu-bf3-r12u5".into(),
+    });
+    assert_eq!(derived, Some(expected));
+}
+
+#[test]
+fn correlate_key_on_spotlight_row_with_no_extractable_entity_raises_toast() {
+    let snap = LayerSnapshot {
+        name: "cluster".into(),
+        status: Status::Warn,
+        evidence: "no DNS".into(),
+        findings: vec![crate::model::Finding {
+            status: Status::Warn,
+            message: "1 pod not ready: kube-system/coredns-xxx".into(),
+            next_command: None,
+            link: None,
+        }],
+        duration_ms: 0,
+    };
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![snap]));
+    app.handle(Action::ShowSpotlight);
+    let eff = app.handle(Action::Correlate);
+    assert_eq!(eff, None);
+    assert_eq!(app.overlay(), Overlay::None);
+    let msg = app.toast().map(|t| t.message.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("no entity found"),
+        "expected no-entity toast, got: {msg:?}"
+    );
+}
+
+#[test]
+fn open_correlate_popup_for_dpu_entity_sets_loading_overlay_and_emits_effect() {
+    let entity = EntityRef {
+        id_type: IdType::Dpu,
+        id: "dpu-bf3-r12u5".into(),
+    };
+    let mut app = App::new();
+    let eff = app.handle(Action::OpenCorrelatePopup(entity.clone()));
+    assert_eq!(eff, Some(Effect::OpenCorrelatePopup(entity.clone())));
+    assert_eq!(app.overlay(), Overlay::Correlate);
+    let cs = app.correlate_state().expect("popup state populated");
+    assert_eq!(cs.entity, entity);
+    assert!(matches!(cs.status, CorrelateStatus::Loading));
+}
+
+#[test]
+fn esc_closes_correlate_popup_state() {
+    let entity = EntityRef {
+        id_type: IdType::Dpu,
+        id: "dpu-bf3-r12u5".into(),
+    };
+    let mut app = App::new();
+    app.handle(Action::OpenCorrelatePopup(entity));
+    app.handle(Action::CloseOverlay);
+    assert_eq!(app.overlay(), Overlay::None);
+    assert!(app.correlate_state().is_none());
+}
+
+#[test]
+fn correlate_results_with_diagnosis_lands_in_popup_state() {
+    let entity = EntityRef {
+        id_type: IdType::Dpu,
+        id: "dpu-bf3-r12u5".into(),
+    };
+    let mut app = App::new();
+    app.handle(Action::OpenCorrelatePopup(entity.clone()));
+    let events = vec![PopoverEvent {
+        ts: chrono::Utc::now(),
+        source: "k8s".into(),
+        kind: "Warning".into(),
+        message: "BackOff: pod x in CrashLoopBackOff".into(),
+        severity: crate::model::PopoverSeverity::Error,
+    }];
+    let diagnosis = Some(PopoverDiagnosis {
+        headline: "k8s_crash_loop — pod x in CrashLoopBackOff (12 restarts)".into(),
+    });
+    app.handle(Action::CorrelateResults {
+        entity: entity.clone(),
+        events: events.clone(),
+        source_errors: vec![],
+        diagnosis: diagnosis.clone(),
+    });
+    let cs = app.correlate_state().expect("still open");
+    match &cs.status {
+        CorrelateStatus::Loaded {
+            events: e,
+            source_errors,
+            diagnosis: d,
+        } => {
+            assert_eq!(e.len(), 1);
+            assert!(source_errors.is_empty());
+            assert_eq!(d, &diagnosis);
+        }
+        other => panic!("expected Loaded with diagnosis, got {other:?}"),
+    }
 }

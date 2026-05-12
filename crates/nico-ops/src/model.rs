@@ -1,5 +1,36 @@
 use chrono::{DateTime, Utc};
 use nico_common::output::Status;
+use nico_correlate::id::IdType;
+
+/// The subject of a Correlation: an Entity ID paired with its detected
+/// type. Constructed by the entity-extraction primitive (slice 0 only
+/// recognizes DPU; PRD-007 Slice 1 deepens this to cover all four entity
+/// types and their surface-specific extraction rules) and threaded
+/// through `Action::OpenCorrelatePopup` into the in-process runner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityRef {
+    pub id_type: IdType,
+    pub id: String,
+}
+
+/// Slice-0 entity extractor — recognizes a bare `dpu-…` prefixed token in
+/// a Finding's message. Returns the first matching token; slice 1 will
+/// replace this with the full multi-prefix primitive (workflow, host,
+/// request, plus the bare carbide-machine-id case) and a chooser when
+/// 2+ entities match.
+pub fn extract_dpu_entity_from_finding(f: &Finding) -> Option<EntityRef> {
+    f.message
+        .split(|c: char| !is_id_char(c))
+        .find(|tok| tok.starts_with("dpu-") && tok.len() > "dpu-".len())
+        .map(|s| EntityRef {
+            id_type: IdType::Dpu,
+            id: s.to_string(),
+        })
+}
+
+fn is_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
 
 /// A single warning/failure line attached to a Layer.
 #[derive(Debug, Clone, PartialEq)]
@@ -37,14 +68,27 @@ pub struct PopoverEvent {
 }
 
 /// Either the correlate run is still in flight (`Loading`) or it has
-/// landed and the renderer has events + per-source error lines to show.
+/// landed and the renderer has events + per-source error lines + an
+/// optional Diagnosis banner to show.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CorrelateStatus {
     Loading,
     Loaded {
         events: Vec<PopoverEvent>,
         source_errors: Vec<SourceError>,
+        diagnosis: Option<PopoverDiagnosis>,
     },
+}
+
+/// One-line Diagnosis banner rendered at the top of the correlate
+/// mini-dashboard popup. Mirrors a (subset of) `nico_correlate::Diagnosis`
+/// so the renderer never depends on the correlate crate's internal types.
+/// Slice 0 carries just the headline (`<pattern> — <error_signature>`);
+/// later slices may add the activity + next-commands once the popup's
+/// action row exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopoverDiagnosis {
+    pub headline: String,
 }
 
 /// One Source that errored during the correlate run. Rendered inline as
@@ -55,11 +99,11 @@ pub struct SourceError {
     pub reason: String,
 }
 
-/// The full state the correlate popover needs: which workflow it's for,
-/// and the in-flight / loaded payload.
+/// The full state the correlate mini-dashboard popup needs: which
+/// `EntityRef` it's for, and the in-flight / loaded payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorrelateState {
-    pub workflow_id: String,
+    pub entity: EntityRef,
     pub status: CorrelateStatus,
 }
 
@@ -196,6 +240,27 @@ mod tests {
     fn workflow_id_returns_none_when_no_prefixed_token() {
         let f = finding("0 stuck, 0 failed");
         assert_eq!(workflow_id_from_finding(&f), None);
+    }
+
+    #[test]
+    fn extract_dpu_entity_pulls_dpu_prefixed_token() {
+        let f = finding("dpu_cert expired on dpu-bf3-r12u5: 2 days ago");
+        let got = extract_dpu_entity_from_finding(&f).expect("dpu extracted");
+        assert_eq!(got.id_type, IdType::Dpu);
+        assert_eq!(got.id, "dpu-bf3-r12u5");
+    }
+
+    #[test]
+    fn extract_dpu_entity_returns_none_when_no_dpu_token() {
+        let f = finding("1 pod not ready: kube-system/coredns-xxx");
+        assert_eq!(extract_dpu_entity_from_finding(&f), None);
+    }
+
+    #[test]
+    fn extract_dpu_entity_requires_chars_after_dpu_prefix() {
+        // "dpu-" alone is not an Entity ID — it has no body.
+        let f = finding("malformed dpu- empty");
+        assert_eq!(extract_dpu_entity_from_finding(&f), None);
     }
 
     #[test]

@@ -1,7 +1,15 @@
 use super::*;
 use crate::action::{Action, Dir};
-use crate::model::{LayerSnapshot, PopoverEvent, PopoverSeverity, SourceError};
+use crate::model::{EntityRef, LayerSnapshot, PopoverEvent, PopoverSeverity, SourceError};
 use chrono::TimeZone;
+use nico_correlate::id::IdType;
+
+fn wf_entity_for_test(id: &str) -> EntityRef {
+    EntityRef {
+        id_type: IdType::Workflow,
+        id: id.into(),
+    }
+}
 use nico_common::theme::DEFAULT;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -1160,7 +1168,7 @@ fn correlate_overlay_body_renders_loaded_timeline_events() {
     app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
     open_correlate(&mut app);
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-001".into(),
+        entity: wf_entity_for_test("wf-001"),
         events: vec![
             PopoverEvent {
                 ts: chrono::Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 5).unwrap(),
@@ -1178,6 +1186,7 @@ fn correlate_overlay_body_renders_loaded_timeline_events() {
             },
         ],
         source_errors: vec![],
+        diagnosis: None,
     });
     let s = render_to_string(&mut app, 120, 30);
     assert!(
@@ -1204,12 +1213,13 @@ fn correlate_overlay_renders_source_errors_inline_as_source_error_rows() {
     app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
     open_correlate(&mut app);
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-001".into(),
+        entity: wf_entity_for_test("wf-001"),
         events: vec![],
         source_errors: vec![SourceError {
             name: "loki".into(),
             reason: "LOKI_URL not set".into(),
         }],
+        diagnosis: None,
     });
     let s = render_to_string(&mut app, 120, 30);
     assert!(
@@ -1229,9 +1239,10 @@ fn correlate_overlay_renders_empty_state_when_no_events_and_no_source_errors() {
     app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
     open_correlate(&mut app);
     app.handle(Action::CorrelateResults {
-        workflow_id: "wf-001".into(),
+        entity: wf_entity_for_test("wf-001"),
         events: vec![],
         source_errors: vec![],
+        diagnosis: None,
     });
     let s = render_to_string(&mut app, 120, 30);
     assert!(
@@ -1265,5 +1276,124 @@ fn correlate_overlay_renders_in_spotlight_layout_too() {
     assert!(
         s.contains("wf-001"),
         "wf id missing in Spotlight overlay:\n{s}"
+    );
+}
+
+// ── PRD-007 slice 0 — correlate mini-dashboard popup ────────────────────
+
+fn dpu_entity_for_test(id: &str) -> EntityRef {
+    EntityRef {
+        id_type: IdType::Dpu,
+        id: id.into(),
+    }
+}
+
+fn dpu_finding_card(dpu_id: &str) -> LayerSnapshot {
+    LayerSnapshot {
+        name: "dpu_health".into(),
+        status: Status::Fail,
+        evidence: "cert expired".into(),
+        findings: vec![Finding {
+            status: Status::Fail,
+            message: format!("dpu_cert expired on {dpu_id}: 2 days ago"),
+            next_command: Some(format!("nico doctor dpu-cert {dpu_id}")),
+            link: None,
+        }],
+        duration_ms: 0,
+    }
+}
+
+/// PRD-007 slice 0 acceptance: TestBackend snapshot of the popup at
+/// medium width (120 cols) against a fixture correlate result. The body
+/// must render the Diagnosis banner at the top followed by the Source-
+/// attributed event timeline. Slice 0 explicitly omits source dots and
+/// the `[Enter] full` action row.
+#[test]
+fn correlate_popup_snapshot_at_120_cols_renders_diagnosis_banner_then_timeline() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![dpu_finding_card("dpu-bf3-r12u5")]));
+    app.handle(Action::ShowSpotlight);
+    app.handle(Action::Correlate);
+    app.handle(Action::CorrelateResults {
+        entity: dpu_entity_for_test("dpu-bf3-r12u5"),
+        events: vec![
+            PopoverEvent {
+                ts: chrono::Utc.with_ymd_and_hms(2026, 5, 12, 9, 2, 5).unwrap(),
+                source: "postgres".into(),
+                kind: "agent_health".into(),
+                message: "client_certificate_expired".into(),
+                severity: PopoverSeverity::Error,
+            },
+            PopoverEvent {
+                ts: chrono::Utc.with_ymd_and_hms(2026, 5, 12, 9, 4, 11).unwrap(),
+                source: "k8s".into(),
+                kind: "Warning".into(),
+                message: "BackOff restarting failed container".into(),
+                severity: PopoverSeverity::Warning,
+            },
+        ],
+        source_errors: vec![],
+        diagnosis: Some(crate::model::PopoverDiagnosis {
+            headline: "k8s_crash_loop — pod nico-agent-x in CrashLoopBackOff (12 restarts)".into(),
+        }),
+    });
+    let s = render_to_string(&mut app, 120, 30);
+    assert!(
+        s.contains("correlate"),
+        "popup title missing at 120 cols:\n{s}"
+    );
+    assert!(
+        s.contains("dpu-bf3-r12u5"),
+        "Entity ID missing in popup title at 120 cols:\n{s}"
+    );
+    assert!(
+        s.contains("k8s_crash_loop"),
+        "Diagnosis banner pattern missing at 120 cols:\n{s}"
+    );
+    assert!(
+        s.contains("CrashLoopBackOff"),
+        "Diagnosis banner error_signature missing at 120 cols:\n{s}"
+    );
+    assert!(
+        s.contains("agent_health"),
+        "first timeline event missing at 120 cols:\n{s}"
+    );
+    assert!(
+        s.contains("BackOff restarting failed container"),
+        "second timeline event message missing at 120 cols:\n{s}"
+    );
+    let banner_pos = s.find("k8s_crash_loop").unwrap();
+    let event_pos = s.find("agent_health").unwrap();
+    assert!(
+        banner_pos < event_pos,
+        "Diagnosis banner must appear above the timeline at 120 cols:\n{s}"
+    );
+}
+
+#[test]
+fn correlate_popup_omits_diagnosis_banner_when_diagnosis_is_none() {
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![dpu_finding_card("dpu-bf3-r12u5")]));
+    app.handle(Action::ShowSpotlight);
+    app.handle(Action::Correlate);
+    app.handle(Action::CorrelateResults {
+        entity: dpu_entity_for_test("dpu-bf3-r12u5"),
+        events: vec![PopoverEvent {
+            ts: chrono::Utc.with_ymd_and_hms(2026, 5, 12, 9, 4, 11).unwrap(),
+            source: "k8s".into(),
+            kind: "Warning".into(),
+            message: "transient".into(),
+            severity: PopoverSeverity::Warning,
+        }],
+        source_errors: vec![],
+        diagnosis: None,
+    });
+    let s = render_to_string(&mut app, 120, 30);
+    assert!(s.contains("transient"), "timeline event missing:\n{s}");
+    // No bold patterned banner — sentinel is the textual pattern slice 0
+    // would otherwise show. Pure-absence test.
+    assert!(
+        !s.contains("k8s_crash_loop"),
+        "Diagnosis banner must be omitted when diagnosis is None:\n{s}"
     );
 }

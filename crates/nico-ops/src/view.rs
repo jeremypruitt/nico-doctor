@@ -16,8 +16,8 @@ use nico_doctor::baseline::Delta;
 use crate::app::{App, Layout as AppLayout};
 use crate::events::Overlay;
 use crate::model::{
-    CorrelateState, CorrelateStatus, Finding, LayerSnapshot, LogLine, PopoverEvent,
-    PopoverSeverity, SourceError, overall_verdict,
+    CorrelateState, CorrelateStatus, Finding, LayerSnapshot, LogLine, PopoverDiagnosis,
+    PopoverEvent, PopoverSeverity, SourceError, overall_verdict,
 };
 use crate::popup::{Popup, PopupSize};
 use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
@@ -46,7 +46,7 @@ pub const HELP_LINES: &[&str] = &[
     "a / Esc   show all (return from spotlight)",
     "y         copy focused next-command (spotlight)",
     "o         open focused link (spotlight)",
-    "c         quick-correlate popover (workflow Finding)",
+    "c         correlate mini-dashboard popup for focused entity",
     "Esc       close overlay",
     "?         this help",
     "q / ^C    quit",
@@ -647,10 +647,23 @@ fn correlate_title(app: &App, state: &CorrelateState) -> String {
     };
     format!(
         " correlate — {}{}{} ",
-        state.workflow_id, loading_marker, suffix
+        state.entity.id, loading_marker, suffix
     )
 }
 
+/// Body of the correlate mini-dashboard popup. PRD-007 slice 0 shape:
+///
+/// 1. Diagnosis banner at the top — omitted entirely when the pattern
+///    matcher returned `None`. One line plus a blank separator below.
+/// 2. Scrollable event timeline in the middle — Source-attributed, sorted
+///    chronologically. Each row carries the timestamp, source, kind, and
+///    message; rendered with severity-driven color.
+/// 3. Failed Source rows render inline as synthetic `source_error` lines
+///    so the operator sees *why* a Source dropped out without leaving the
+///    popup.
+///
+/// Source-availability dots and the `[Enter] full` action row are
+/// intentionally absent in slice 0 — they land in slices 2 and 4.
 fn correlate_body_lines(state: &CorrelateState, theme: &Theme) -> Vec<Line<'static>> {
     match &state.status {
         CorrelateStatus::Loading => vec![Line::from(Span::styled(
@@ -660,15 +673,19 @@ fn correlate_body_lines(state: &CorrelateState, theme: &Theme) -> Vec<Line<'stat
         CorrelateStatus::Loaded {
             events,
             source_errors,
+            diagnosis,
         } => {
-            if events.is_empty() && source_errors.is_empty() {
-                return vec![Line::from(Span::styled(
-                    "(no events found for this workflow)".to_string(),
-                    Style::default().fg(theme.muted),
-                ))];
+            let mut out: Vec<Line<'static>> = Vec::new();
+            if let Some(d) = diagnosis {
+                out.extend(diagnosis_banner_lines(d, theme));
             }
-            let mut out: Vec<Line<'static>> =
-                Vec::with_capacity(events.len() + source_errors.len());
+            if events.is_empty() && source_errors.is_empty() {
+                out.push(Line::from(Span::styled(
+                    format!("(no events found for {})", state.entity.id),
+                    Style::default().fg(theme.muted),
+                )));
+                return out;
+            }
             for e in events {
                 out.push(format_popover_event(e, theme));
             }
@@ -678,6 +695,19 @@ fn correlate_body_lines(state: &CorrelateState, theme: &Theme) -> Vec<Line<'stat
             out
         }
     }
+}
+
+/// Diagnosis banner: a bold, accented one-liner followed by a blank
+/// separator that sets it apart from the timeline rows beneath. The
+/// separator is dropped when the body would otherwise be empty.
+fn diagnosis_banner_lines(d: &PopoverDiagnosis, theme: &Theme) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            d.headline.clone(),
+            Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ]
 }
 
 fn format_popover_event(e: &PopoverEvent, theme: &Theme) -> Line<'static> {

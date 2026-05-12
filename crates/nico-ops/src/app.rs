@@ -9,10 +9,12 @@ use ratatui::layout::Rect;
 use crate::action::{Action, Dir, ScrollDir};
 use crate::events::Overlay;
 use crate::model::{
-    CorrelateState, CorrelateStatus, LayerSnapshot, LogLine, workflow_id_from_finding,
+    CorrelateState, CorrelateStatus, EntityRef, LayerSnapshot, LogLine,
+    extract_dpu_entity_from_finding, workflow_id_from_finding,
 };
 use crate::pulse::PulseTimer;
 use crate::ringbuffer::{LayerStat, RingBuffer, RunSnapshot};
+use nico_correlate::id::IdType;
 
 /// How long a transient toast is shown in the bottom bar before the
 /// reducer drops it. Picked to be long enough that the operator can read
@@ -53,7 +55,7 @@ pub const TICK: Duration = Duration::from_millis(100);
 
 /// Side-effects requested by the reducer that the host loop has to carry
 /// out (since `App::handle` is otherwise pure).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     /// Kick off a new collection round.
     StartRefresh,
@@ -70,10 +72,11 @@ pub enum Effect {
     /// default). Best-effort; failures translate into
     /// `Action::ShowToast`.
     OpenUrl(String),
-    /// Kick off `nico_correlate::collect_all` for the given workflow ID.
-    /// The host loop spawns the call and posts the results back via
-    /// `Action::CorrelateResults`. (Issue #157.)
-    Correlate(String),
+    /// Kick off a correlate run for the given `EntityRef`. The host loop
+    /// spawns the call against the shared `nico ops` bootstrap (no second
+    /// kubeconfig load) and posts the results back via
+    /// `Action::CorrelateResults`. PRD-007 Slice 0 — see [`EntityRef`].
+    OpenCorrelatePopup(EntityRef),
     /// Tear down and exit cleanly.
     Quit,
 }
@@ -515,27 +518,40 @@ impl App {
                 if self.overlay != Overlay::None {
                     return None;
                 }
-                let workflow_id = self.focused_workflow_id()?;
+                match self.derive_correlate_action() {
+                    Some(action) => self.handle(action),
+                    None => {
+                        self.set_toast("no entity found in this row");
+                        None
+                    }
+                }
+            }
+            Action::OpenCorrelatePopup(entity) => {
+                if self.overlay != Overlay::None {
+                    return None;
+                }
                 self.overlay = Overlay::Correlate;
                 self.correlate = Some(CorrelateState {
-                    workflow_id: workflow_id.clone(),
+                    entity: entity.clone(),
                     status: CorrelateStatus::Loading,
                 });
                 self.dirty = true;
-                Some(Effect::Correlate(workflow_id))
+                Some(Effect::OpenCorrelatePopup(entity))
             }
             Action::CorrelateResults {
-                workflow_id,
+                entity,
                 events,
                 source_errors,
+                diagnosis,
             } => {
                 let state = self.correlate.as_mut()?;
-                if state.workflow_id != workflow_id {
+                if state.entity != entity {
                     return None;
                 }
                 state.status = CorrelateStatus::Loaded {
                     events,
                     source_errors,
+                    diagnosis,
                 };
                 self.dirty = true;
                 None
@@ -560,17 +576,42 @@ impl App {
         self.dirty = true;
     }
 
-    /// Workflow ID extracted from the first Finding on the currently
-    /// focused Layer, if (a) the focused Layer is `workflows` and (b) at
-    /// least one Finding's message carries a recognizable workflow ID
-    /// (`wf-…` or `hp-…`). Drives the `[c]` quick-correlate trigger; see
-    /// [`workflow_id_from_finding`].
-    fn focused_workflow_id(&self) -> Option<String> {
+    /// Pure derivation of the typed correlate action from the current
+    /// focused state. PRD-007 Slice 0 tracer-bullet scope:
+    /// - Spotlight + a focused card whose Findings carry a `dpu-…` token
+    ///   → [`Action::OpenCorrelatePopup`] with an `IdType::Dpu` entity.
+    /// - Scorecard + a focused `workflows` Layer carrying a workflow ID
+    ///   → [`Action::OpenCorrelatePopup`] with an `IdType::Workflow`
+    ///   entity (preserves the issue-#157 path).
+    /// - Anything else → `None`, which the keystroke handler converts
+    ///   into a "no entity found in this row" toast.
+    ///
+    /// Slice 1 will replace the slice-0 DPU-only extractor with the full
+    /// entity-extraction primitive and surface a chooser when 2+ entities
+    /// match a row.
+    pub fn derive_correlate_action(&self) -> Option<Action> {
         let snap = self.focused_for_correlate()?;
-        if snap.name != "workflows" {
-            return None;
+        match self.layout {
+            Layout::Spotlight => snap
+                .findings
+                .iter()
+                .find_map(extract_dpu_entity_from_finding)
+                .map(Action::OpenCorrelatePopup),
+            Layout::Scorecard => {
+                if snap.name != "workflows" {
+                    return None;
+                }
+                snap.findings
+                    .iter()
+                    .find_map(workflow_id_from_finding)
+                    .map(|id| {
+                        Action::OpenCorrelatePopup(EntityRef {
+                            id_type: IdType::Workflow,
+                            id,
+                        })
+                    })
+            }
         }
-        snap.findings.iter().find_map(workflow_id_from_finding)
     }
 
     /// In Spotlight, `[c]` should target the focused incident card; in

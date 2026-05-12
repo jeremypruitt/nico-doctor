@@ -1,6 +1,8 @@
 use std::time::Instant;
 
-use crate::model::{LayerSnapshot, LogLine, PopoverEvent, SourceError};
+use crate::model::{
+    EntityRef, LayerSnapshot, LogLine, PopoverDiagnosis, PopoverEvent, SourceError,
+};
 
 /// Direction for focus navigation across the scorecard grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,19 +74,31 @@ pub enum Action {
     /// `o` in Spotlight — open the focused Finding's link via the system
     /// browser. Best-effort; toast on failure (or when no link is set).
     OpenLink,
-    /// `c` on a workflow Finding — open the quick-correlate popover for
-    /// the focused workflow ID and kick off `nico_correlate::collect_all`.
-    /// No-op when the focused Layer is not `workflows` or no finding
-    /// surfaces a workflow ID. (Issue #157.)
+    /// `c` keystroke — the operator's intent to open the correlate
+    /// mini-dashboard popup on the focused row. Payloadless because the
+    /// translator is pure; the reducer pairs it with focused state to
+    /// derive the typed [`Action::OpenCorrelatePopup`] via
+    /// [`crate::app::App::derive_correlate_action`]. Raises a "no entity
+    /// found in this row" toast when nothing extractable is focused.
     Correlate,
-    /// Results from a `nico_correlate::collect_all` round, posted by the
-    /// host loop. Carries the `workflow_id` so the reducer can drop stale
-    /// results when the operator has already closed or re-opened the
-    /// popover for a different workflow.
+    /// Open the correlate mini-dashboard popup for an extracted Entity.
+    /// PRD-007 Slice 0 emits this for DPU entities pulled out of a
+    /// Spotlight finding row; the existing workflow path keeps working by
+    /// constructing an `IdType::Workflow` entity from the focused
+    /// scorecard. Carries the full payload so the reducer test can read
+    /// `Action::OpenCorrelatePopup(EntityRef { id_type: Dpu, .. })` off
+    /// the keystroke path.
+    OpenCorrelatePopup(EntityRef),
+    /// Results from a correlate run, posted back by the host loop. Carries
+    /// the `EntityRef` the run was started for so the reducer can drop
+    /// stale results when the operator has already closed or re-opened the
+    /// popup for a different Entity. `diagnosis` is `None` when the
+    /// pattern matcher had nothing to say.
     CorrelateResults {
-        workflow_id: String,
+        entity: EntityRef,
         events: Vec<PopoverEvent>,
         source_errors: Vec<SourceError>,
+        diagnosis: Option<PopoverDiagnosis>,
     },
     /// Show a transient toast in the bottom bar (e.g. "clipboard
     /// unavailable"). Auto-clears after `TOAST_TTL`.
