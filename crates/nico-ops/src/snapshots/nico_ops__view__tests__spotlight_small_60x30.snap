@@ -1,0 +1,34 @@
+---
+source: crates/nico-ops/src/view_tests.rs
+expression: s
+---
+                      ▜▛▀▌▗█▖ ▝█▘ ▜▛                        
+                      ▐▙▌ █ █  █  ▐▌                        
+                      ▐▌▘ █▀█  █  ▐▌▗▌                      
+                      ▀▀  ▀ ▀ ▝▀▘ ▀▀▀▘                      
+                                                            
+✖ FAIL                                                      
+▶ ✖ grpc  unreachable                                       
+    dial tcp: i/o timeout                                   
+    next: kubectl describe svc -n nico grpc                 
+                                                            
+▲ WARN                                                      
+  ▲ workflows  1 stuck                                      
+    stuck wf abc123                                         
+  ▲ logs  12 errors                                         
+    12 ERROR lines                                          
+    next: kubectl logs -n nico foo                          
+                                                            
+○ UNKNOWN                                                   
+  ○ health  probe timeout                                   
+    no probe response                                       
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+● cluster ● postgres                                        
+  [y] copy   [o] open   [Enter] drill   [a] all   [esc] back
+✖ Fail  ·  ▲ Warn  ·  ● OK  ·  ○ Unknown                    
+ spotlight  R:refresh  ?:help  [y] copy  [o] open  [c] corre

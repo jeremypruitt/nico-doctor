@@ -134,6 +134,10 @@ fn translate_spotlight(key: &KeyEvent) -> Option<Action> {
             Some(Action::ShowAll)
         }
         KeyCode::Esc => Some(Action::ShowAll),
+        // PRD-006 Slice 5 (#371): Enter drives the drill-down trigger.
+        // Today it surfaces a documented stub toast; PRD-007 Slice 4
+        // replaces the stub with the correlate-popup launch.
+        KeyCode::Enter => Some(Action::SpotlightDrillStub),
         // Spotlight action row: y / o / c.
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(Action::CopyNextCommand),
         KeyCode::Char('o') | KeyCode::Char('O') => Some(Action::OpenLink),
@@ -574,6 +578,17 @@ mod tests {
     #[test]
     fn o_in_spotlight_emits_open_link() {
         assert_eq!(tr_spotlight(&k(KeyCode::Char('o'))), Some(Action::OpenLink));
+    }
+
+    #[test]
+    fn enter_in_spotlight_emits_drill_stub() {
+        // PRD-006 Slice 5 (#371): Enter in Spotlight surfaces the
+        // PRD-007 stub toast; the real drill-down primitive lands in
+        // PRD-007.
+        assert_eq!(
+            tr_spotlight(&k(KeyCode::Enter)),
+            Some(Action::SpotlightDrillStub)
+        );
     }
 
     #[test]

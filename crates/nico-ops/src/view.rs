@@ -17,8 +17,8 @@ use crate::app::{App, Layout as AppLayout};
 use crate::events::Overlay;
 use crate::layout_solver::{FocusState, SolverInput, solve};
 use crate::model::{
-    CorrelateState, Finding, LayerSnapshot, LogLine, PopoverEvent, PopoverSeverity, SourceError,
-    SourceStatus, overall_verdict,
+    CorrelateState, Finding, LogLine, PopoverEvent, PopoverSeverity, SourceError, SourceStatus,
+    overall_verdict,
 };
 use crate::popup::{Popup, PopupSize};
 use crate::widgets::{breadcrumb_verdicts, sparkline_for_layer};
@@ -99,24 +99,27 @@ fn render_scorecard_layout(app: &mut App, theme: &Theme, frame: &mut Frame) {
 
 fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
     let area = frame.area();
-    // Layout: big-text headline, vertical incident cards, green footer,
-    // hint bar.
+    // PRD-006 Slice 5 (#371): redesigned vertical stack —
+    //   big-text headline, severity-grouped findings list, green footer,
+    //   persistent action row, severity legend, hint/toast bar.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(SPOTLIGHT_HEADER_HEIGHT),
-            Constraint::Min(SPOTLIGHT_CARD_HEIGHT),
+            Constraint::Min(0),    // findings body fills the rest
             Constraint::Length(1), // green footer
+            Constraint::Length(1), // persistent action row
             Constraint::Length(1), // severity legend
-            Constraint::Length(1), // hint bar
+            Constraint::Length(1), // hint / toast bar
         ])
         .split(area);
 
     render_spotlight_header(app, theme, frame, chunks[0]);
-    render_spotlight_cards(app, theme, frame, chunks[1]);
+    render_spotlight_findings(app, theme, frame, chunks[1]);
     render_spotlight_green_footer(app, theme, frame, chunks[2]);
-    render_legend_bar(theme, frame, chunks[3]);
-    render_spotlight_hint_bar(app, theme, frame, chunks[4]);
+    render_spotlight_action_row(theme, frame, chunks[3]);
+    render_legend_bar(theme, frame, chunks[4]);
+    render_spotlight_hint_bar(app, theme, frame, chunks[5]);
 
     // Spotlight still honors the help overlay (`?`) so the operator can
     // see all keybinds, including the Spotlight-only ones. PRD-006 Slice
@@ -144,11 +147,41 @@ fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
 /// of padding above/below so it doesn't crowd the cards.
 const SPOTLIGHT_HEADER_HEIGHT: u16 = 5;
 
-/// Per-card row height in Layout C: title + evidence + dim next-cmd +
-/// action row + 2 border rows.
-const SPOTLIGHT_CARD_HEIGHT: u16 = 6;
+/// PRD-006 Slice 5 (#371): persistent action row text. Renders once,
+/// at the bottom of the view, above the legend / hint bars. Replaces
+/// the pre-Slice-5 per-card action line.
+const SPOTLIGHT_ACTION_LINE: &str = "  [y] copy   [o] open   [Enter] drill   [a] all   [esc] back";
 
-const SPOTLIGHT_ACTION_LINE: &str = "[y] copy   [o] open   [c] correlate   s/a/Esc: show all";
+/// PRD-007 stub toast surfaced when the operator presses `[Enter]` from
+/// Spotlight. The drill-down primitive itself lands in PRD-007; this
+/// slice ships the visual contract (the persistent `[Enter] drill` cue
+/// in the action row) so PRD-007 has a stable entry point to plug into.
+pub const SPOTLIGHT_DRILL_STUB_TOAST: &str = "Drill-down coming in PRD-007";
+
+/// Group header glyphs + labels for the severity-grouped findings list.
+fn group_header(theme: &Theme, status: &Status) -> Line<'static> {
+    let label = match status {
+        Status::Fail => "FAIL",
+        Status::Warn => "WARN",
+        Status::Unknown => "UNKNOWN",
+        _ => "OTHER",
+    };
+    Line::from(vec![
+        Span::styled(
+            pip_glyph(status).to_string(),
+            Style::default()
+                .fg(theme_color(theme, status))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(theme_color(theme, status))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
 
 fn render_spotlight_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let verdict = overall_verdict(app.snapshots());
@@ -163,7 +196,7 @@ fn render_spotlight_header(app: &App, theme: &Theme, frame: &mut Frame, area: Re
     frame.render_widget(big, area);
 }
 
-fn render_spotlight_cards(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+fn render_spotlight_findings(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let cards = app.spotlight_cards();
     if cards.is_empty() {
         // Empty-state placeholder is an inner widget — title only, no
@@ -179,74 +212,73 @@ fn render_spotlight_cards(app: &App, theme: &Theme, frame: &mut Frame, area: Rec
         return;
     }
 
-    let row_constraints: Vec<Constraint> =
-        std::iter::repeat_n(Constraint::Length(SPOTLIGHT_CARD_HEIGHT), cards.len()).collect();
-    let row_areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(row_constraints)
-        .split(area);
-    for (i, card) in cards.iter().enumerate() {
-        if i >= row_areas.len() {
-            break;
+    // Build a flat line list: severity group header, then per-card
+    // headline + indented detail. Focus-aware styling (focus accent for
+    // the focused row, dim for others) is applied per finding row.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let focused_idx = app.spotlight_focus();
+    let mut prev_status: Option<Status> = None;
+    for (i, snap) in cards.iter().enumerate() {
+        if prev_status.as_ref() != Some(&snap.status) {
+            if i != 0 {
+                // Blank separator between groups.
+                lines.push(Line::from(""));
+            }
+            lines.push(group_header(theme, &snap.status));
+            prev_status = Some(snap.status.clone());
         }
-        render_spotlight_card(app, i, card, theme, frame, row_areas[i]);
-    }
-}
-
-fn render_spotlight_card(
-    app: &App,
-    idx: usize,
-    snap: &LayerSnapshot,
-    theme: &Theme,
-    frame: &mut Frame,
-    area: Rect,
-) {
-    let focused = idx == app.spotlight_focus();
-    let pip_color = theme_color(theme, &snap.status);
-    let title = if focused {
-        format!(" ▶ {} ", snap.name)
-    } else {
-        format!("   {} ", snap.name)
-    };
-    // Per-card Spotlight frame is an outermost container — keep border.
-    let mut block = theme.container_block().title(Line::from(vec![
-        Span::styled(
-            pip_glyph(&snap.status).to_string(),
-            Style::default().fg(pip_color).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(title),
-    ]));
-    if focused {
-        block = block.border_style(
+        let focused = i == focused_idx;
+        let headline_style = if focused {
             Style::default()
                 .fg(theme.overlay_key)
-                .add_modifier(Modifier::BOLD),
-        );
-    }
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 {
-        return;
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        let detail_style = if focused {
+            Style::default().fg(theme.overlay_key)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        let cursor = if focused { "▶ " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(cursor, headline_style),
+            Span::styled(
+                pip_glyph(&snap.status).to_string(),
+                Style::default().fg(theme_color(theme, &snap.status)),
+            ),
+            Span::raw(" "),
+            Span::styled(snap.name.clone(), headline_style),
+            Span::raw("  "),
+            Span::styled(snap.evidence.clone(), headline_style),
+        ]));
+        let detail = snap
+            .findings
+            .iter()
+            .map(|f| f.message.clone())
+            .next()
+            .unwrap_or_else(|| "(no detail)".to_string());
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(detail, detail_style),
+        ]));
+        if let Some(cmd) = snap.findings.iter().find_map(|f| f.next_command.clone()) {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("next: {cmd}"), Style::default().fg(theme.muted)),
+            ]));
+        }
     }
 
-    let evidence_line = Line::from(Span::raw(snap.evidence.clone()));
-    let next_cmd = snap.findings.iter().find_map(|f| f.next_command.clone());
-    let next_line = match next_cmd {
-        Some(cmd) => Line::from(Span::styled(
-            format!("next: {cmd}"),
-            Style::default().fg(theme.muted),
-        )),
-        None => Line::from(Span::styled(
-            "next: (no command suggested)",
-            Style::default().fg(theme.muted),
-        )),
-    };
-    let action_line = Line::from(Span::styled(
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_spotlight_action_row(theme: &Theme, frame: &mut Frame, area: Rect) {
+    let line = Line::from(Span::styled(
         SPOTLIGHT_ACTION_LINE.to_string(),
         Style::default().fg(theme.overlay_key),
     ));
-    let lines = vec![evidence_line, next_line, action_line];
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_spotlight_green_footer(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
@@ -729,13 +761,13 @@ fn render_correlate_chooser_overlay(app: &App, theme: &Theme, frame: &mut Frame,
     .render(theme, frame, area);
 }
 
-fn chooser_body_lines(
-    state: &crate::app::ChooserState,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
+fn chooser_body_lines(state: &crate::app::ChooserState, theme: &Theme) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     out.push(Line::from(Span::styled(
-        format!("{} candidates — Enter selects, Esc cancels", state.entities.len()),
+        format!(
+            "{} candidates — Enter selects, Esc cancels",
+            state.entities.len()
+        ),
         Style::default().fg(theme.muted),
     )));
     out.push(Line::from(""));

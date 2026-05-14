@@ -1131,6 +1131,302 @@ fn render_in_spotlight_does_not_panic_at_narrow_widths() {
     }
 }
 
+// ── PRD-006 Slice 5 (#371) — Spotlight overhaul ─────────────────────
+
+/// Snapshot mix that exercises severity grouping AND within-group Delta
+/// ordering: Fail layer `grpc`, Warn layers `logs` (unchanged) and
+/// `workflows` (NEW vs baseline), Unknown layer `health`. Three OK / Skipped
+/// layers fill the green strip.
+fn mixed_for_grouping() -> Vec<LayerSnapshot> {
+    vec![
+        LayerSnapshot {
+            name: "cluster".into(),
+            status: Status::Ok,
+            evidence: "3 nodes ready".into(),
+            findings: vec![],
+            duration_ms: 0,
+        },
+        LayerSnapshot {
+            name: "logs".into(),
+            status: Status::Warn,
+            evidence: "12 errors".into(),
+            findings: vec![Finding {
+                status: Status::Warn,
+                message: "12 ERROR lines".into(),
+                next_command: Some("kubectl logs -n nico foo".into()),
+                link: None,
+            }],
+            duration_ms: 0,
+        },
+        LayerSnapshot {
+            name: "workflows".into(),
+            status: Status::Warn,
+            evidence: "1 stuck".into(),
+            findings: vec![Finding {
+                status: Status::Warn,
+                message: "stuck wf abc123".into(),
+                next_command: None,
+                link: None,
+            }],
+            duration_ms: 0,
+        },
+        LayerSnapshot {
+            name: "health".into(),
+            status: Status::Unknown,
+            evidence: "probe timeout".into(),
+            findings: vec![Finding {
+                status: Status::Unknown,
+                message: "no probe response".into(),
+                next_command: None,
+                link: None,
+            }],
+            duration_ms: 0,
+        },
+        LayerSnapshot {
+            name: "grpc".into(),
+            status: Status::Fail,
+            evidence: "unreachable".into(),
+            findings: vec![Finding {
+                status: Status::Fail,
+                message: "dial tcp: i/o timeout".into(),
+                next_command: Some("kubectl describe svc -n nico grpc".into()),
+                link: None,
+            }],
+            duration_ms: 0,
+        },
+        LayerSnapshot {
+            name: "postgres".into(),
+            status: Status::Skipped,
+            evidence: "skipped".into(),
+            findings: vec![],
+            duration_ms: 0,
+        },
+    ]
+}
+
+#[test]
+fn spotlight_cards_grouped_by_severity_fail_warn_unknown() {
+    // Acceptance: Findings rendered in severity groups (Fail / Warn / Unknown).
+    let mut app = App::new();
+    app.handle(Action::Snapshots(mixed_for_grouping()));
+    enter_spotlight(&mut app);
+    let names: Vec<&str> = app
+        .spotlight_cards()
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    // Fail comes first.
+    assert_eq!(names[0], "grpc", "Fail layer should sort first: {names:?}");
+    // Warn group second — both warn layers before the Unknown layer.
+    let warn_pos = (1..names.len() - 1).collect::<Vec<_>>();
+    for i in &warn_pos {
+        assert!(
+            ["logs", "workflows"].contains(&names[*i]),
+            "Warn group should hold logs+workflows in positions 1..n-1: {names:?}"
+        );
+    }
+    // Unknown last.
+    assert_eq!(
+        names[names.len() - 1],
+        "health",
+        "Unknown layer should sort last: {names:?}"
+    );
+}
+
+#[test]
+fn spotlight_renders_finding_headline_and_indented_detail() {
+    // Acceptance: each finding renders as headline + indented detail
+    // (no truncation that drops detail entirely). The headline carries
+    // the layer name + evidence; the detail line indents the finding's
+    // message under it so the operator sees both.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(mixed_for_grouping()));
+    enter_spotlight(&mut app);
+    let s = render_to_string(&mut app, 120, 40);
+    // Evidence appears on the headline …
+    assert!(s.contains("unreachable"), "grpc evidence missing:\n{s}");
+    // … and the finding message appears as a detail line under it.
+    assert!(
+        s.contains("dial tcp: i/o timeout"),
+        "grpc finding detail missing:\n{s}"
+    );
+    // Headline + detail lines for the workflows card too.
+    assert!(s.contains("1 stuck"), "workflows evidence missing:\n{s}");
+    assert!(
+        s.contains("stuck wf abc123"),
+        "workflows finding detail missing:\n{s}"
+    );
+}
+
+#[test]
+fn spotlight_persistent_action_row_carries_all_five_actions() {
+    // Acceptance: persistent action row renders `[y] [o] [Enter] [a] [esc]`
+    // whenever Spotlight is the active view.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(mixed_for_grouping()));
+    enter_spotlight(&mut app);
+    let s = render_to_string(&mut app, 120, 30);
+    for label in [
+        "[y] copy",
+        "[o] open",
+        "[Enter] drill",
+        "[a] all",
+        "[esc] back",
+    ] {
+        assert!(
+            s.contains(label),
+            "persistent action row missing {label:?}:\n{s}"
+        );
+    }
+}
+
+#[test]
+fn spotlight_action_row_renders_even_with_no_incidents() {
+    // Acceptance: persistent action row visible whenever Spotlight is
+    // the active view — including the all-green empty state.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![LayerSnapshot {
+        name: "cluster".into(),
+        status: Status::Ok,
+        evidence: "ok".into(),
+        findings: vec![],
+        duration_ms: 0,
+    }]));
+    enter_spotlight(&mut app);
+    let s = render_to_string(&mut app, 120, 24);
+    assert!(
+        s.contains("[Enter] drill"),
+        "action row should persist in empty state:\n{s}"
+    );
+}
+
+#[test]
+fn spotlight_focus_aware_styling_uses_accent_for_focused_row() {
+    // Acceptance: focus-aware rendering — focused row uses the focus
+    // accent (`theme.overlay_key`); non-focused rows render dim.
+    // Verified at the buffer level so the test pins the cell *style*,
+    // not just glyph contents.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(mixed_for_grouping()));
+    enter_spotlight(&mut app);
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(&mut app, &DEFAULT, f)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    // Find the ▶ cursor cell — it should be styled with the focus accent.
+    let mut accent_cells = 0usize;
+    let mut muted_cells = 0usize;
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            let cell = buf.cell((x, y)).unwrap();
+            if cell.fg == DEFAULT.overlay_key {
+                accent_cells += 1;
+            } else if cell.fg == DEFAULT.muted {
+                muted_cells += 1;
+            }
+        }
+    }
+    assert!(accent_cells > 0, "focused row must paint with accent color");
+    assert!(muted_cells > 0, "non-focused rows must paint dim/muted");
+}
+
+// PRD-006 Slice 5 (#371): insta snapshot tests at small / medium /
+// large widths pin the Spotlight rendering contract. The `.snap` files
+// land under `crates/nico-ops/src/snapshots/` and are reviewed in the
+// PR. They render with the seeded baseline so within-group Delta sort
+// (NEW > unchanged) is exercised too.
+fn spotlight_snapshot_app() -> App {
+    let mut app = App::new();
+    app.set_baseline(Some(baseline_with(&[
+        ("logs", "warn"),
+        ("workflows", "ok"),
+        ("grpc", "fail"),
+        ("health", "unknown"),
+    ])));
+    app.handle(Action::Snapshots(mixed_for_grouping()));
+    enter_spotlight(&mut app);
+    app
+}
+
+#[test]
+fn spotlight_snapshot_small_width() {
+    let mut app = spotlight_snapshot_app();
+    let s = render_to_string(&mut app, 60, 30);
+    insta::assert_snapshot!("spotlight_small_60x30", s);
+}
+
+#[test]
+fn spotlight_snapshot_medium_width() {
+    let mut app = spotlight_snapshot_app();
+    let s = render_to_string(&mut app, 100, 30);
+    insta::assert_snapshot!("spotlight_medium_100x30", s);
+}
+
+#[test]
+fn spotlight_snapshot_large_width() {
+    let mut app = spotlight_snapshot_app();
+    let s = render_to_string(&mut app, 160, 40);
+    insta::assert_snapshot!("spotlight_large_160x40", s);
+}
+
+#[test]
+fn spotlight_j_and_k_move_focus_through_sorted_cards() {
+    // Acceptance: navigation walks the sorted incident list. Default
+    // focus is index 0 (Fail-major); j moves it to 1, k brings it back.
+    let mut app = App::new();
+    app.handle(Action::Snapshots(mixed_for_grouping()));
+    enter_spotlight(&mut app);
+    assert_eq!(app.spotlight_focus(), 0);
+    app.handle(Action::Focus(Dir::Down));
+    assert_eq!(app.spotlight_focus(), 1);
+    app.handle(Action::Focus(Dir::Up));
+    assert_eq!(app.spotlight_focus(), 0);
+}
+
+#[test]
+fn spotlight_enter_shows_prd007_stub_toast() {
+    // Acceptance: pressing Enter in Spotlight shows the documented
+    // PRD-007-stub toast. The drill-down primitive itself ships in
+    // PRD-007 — this slice ships the visual contract only.
+    use crate::view::SPOTLIGHT_DRILL_STUB_TOAST;
+    let mut app = App::new();
+    app.handle(Action::Snapshots(mixed_for_grouping()));
+    enter_spotlight(&mut app);
+    app.handle(Action::SpotlightDrillStub);
+    let toast = app
+        .toast()
+        .expect("Enter in Spotlight should set the drill-stub toast");
+    assert_eq!(toast.message, SPOTLIGHT_DRILL_STUB_TOAST);
+}
+
+#[test]
+fn spotlight_within_group_orders_new_then_unchanged() {
+    // Acceptance: within-group Delta ordering — `new` ranks above
+    // `unchanged`. Baseline says `logs` was already warning (unchanged),
+    // `workflows` was previously ok (now warn → NEW). NEW must come first
+    // inside the Warn group.
+    let mut app = App::new();
+    app.set_baseline(Some(baseline_with(&[
+        ("logs", "warn"),
+        ("workflows", "ok"),
+        ("grpc", "fail"),
+        ("health", "unknown"),
+    ])));
+    app.handle(Action::Snapshots(mixed_for_grouping()));
+    enter_spotlight(&mut app);
+    let names: Vec<&str> = app
+        .spotlight_cards()
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    let logs_pos = names.iter().position(|n| *n == "logs").unwrap();
+    let workflows_pos = names.iter().position(|n| *n == "workflows").unwrap();
+    assert!(
+        workflows_pos < logs_pos,
+        "NEW (workflows) should sort before unchanged (logs) within Warn group: {names:?}"
+    );
+}
+
 // ── Quick-correlate popover (issue #157) ────────────────────────────
 
 fn workflows_snap_with_id(id: &str) -> LayerSnapshot {
@@ -1855,16 +2151,19 @@ fn scorecard_card_keeps_outer_border() {
 }
 
 #[test]
-fn spotlight_card_keeps_outer_border() {
+fn spotlight_marks_focused_row_with_cursor_glyph() {
+    // PRD-006 Slice 5 (#371): the Spotlight redesign replaces per-card
+    // borders with a flat, severity-grouped findings list. The focused
+    // row is marked with a leading `▶` cursor instead of a highlighted
+    // border (the contract `spotlight_card_keeps_outer_border` used to
+    // pin).
     let mut app = App::new();
     app.handle(Action::Snapshots(six_layers()));
     app.handle(Action::ShowSpotlight);
     let s = render_to_string(&mut app, 120, 24);
-    // Spotlight card border carries the focused-row marker `▶` and the
-    // pip glyph; the corner glyph anchors the outer frame.
     assert!(
-        s.contains("┌"),
-        "spotlight card must keep its outer border corner:\n{s}"
+        s.contains("▶"),
+        "focused row should be marked with the ▶ cursor glyph:\n{s}"
     );
 }
 
@@ -1986,7 +2285,10 @@ fn logs_overlay_renders_title_with_total_count_when_lines_present() {
     // Two lines from log_lines_sample(); title shows the count so the
     // operator knows the modal isn't truncating.
     assert!(s.contains("logs — 2"), "title with count missing:\n{s}");
-    assert!(s.contains("carbide-controller"), "first log line missing:\n{s}");
+    assert!(
+        s.contains("carbide-controller"),
+        "first log line missing:\n{s}"
+    );
 }
 
 #[test]
@@ -2054,8 +2356,14 @@ fn logs_overlay_reachable_from_spotlight() {
     app.handle(Action::LogLines(log_lines_sample()));
     app.handle(Action::ShowLogs);
     let s = render_to_string(&mut app, 140, 32);
-    assert!(s.contains("logs — 2"), "logs modal not on top of Spotlight:\n{s}");
-    assert!(s.contains("carbide-controller"), "log content missing:\n{s}");
+    assert!(
+        s.contains("logs — 2"),
+        "logs modal not on top of Spotlight:\n{s}"
+    );
+    assert!(
+        s.contains("carbide-controller"),
+        "log content missing:\n{s}"
+    );
 }
 
 #[test]

@@ -897,7 +897,9 @@ fn spotlight_cards_are_only_non_green_layers() {
         .iter()
         .map(|s| s.name.clone())
         .collect();
-    assert_eq!(names, vec!["logs", "grpc"]);
+    // PRD-006 Slice 5 (#371): severity-major ordering puts Fail above
+    // Warn, so `grpc` (Fail) precedes `logs` (Warn).
+    assert_eq!(names, vec!["grpc", "logs"]);
     assert_eq!(app.spotlight_card_count(), 2);
 }
 
@@ -924,9 +926,11 @@ fn copy_next_command_emits_clipboard_effect_with_focused_command() {
     app.handle(Action::Snapshots(mixed_layers()));
     app.handle(Action::ShowSpotlight);
     let eff = app.handle(Action::CopyNextCommand);
+    // PRD-006 Slice 5 (#371): Fail-major sort puts `grpc` (Fail) at
+    // spotlight_focus=0; its next-command comes from `fail_snap`.
     assert_eq!(
         eff,
-        Some(Effect::CopyToClipboard("kubectl describe logs".into()))
+        Some(Effect::CopyToClipboard("kubectl logs grpc".into()))
     );
 }
 
@@ -955,9 +959,13 @@ fn copy_next_command_with_no_command_raises_toast() {
 
 #[test]
 fn open_link_emits_open_url_effect_when_link_present() {
+    // PRD-006 Slice 5 (#371): default focus is `grpc` (Fail-major sort).
+    // `grpc` has no link; we navigate down once to reach `logs` whose
+    // fixture carries a link, then assert OpenUrl fires.
     let mut app = App::new();
     app.handle(Action::Snapshots(mixed_layers()));
     app.handle(Action::ShowSpotlight);
+    app.handle(Action::Focus(Dir::Down));
     let eff = app.handle(Action::OpenLink);
     assert_eq!(
         eff,

@@ -369,6 +369,25 @@ impl App {
                 if self.overlay != Overlay::None {
                     return None;
                 }
+                // PRD-006 Slice 5 (#371): j/k in Spotlight walks the
+                // sorted incident-card list rather than the (invisible)
+                // scorecard grid focus.
+                if self.layout == Layout::Spotlight && matches!(dir, Dir::Up | Dir::Down) {
+                    let n = self.spotlight_card_count();
+                    if n == 0 {
+                        return None;
+                    }
+                    let next = match dir {
+                        Dir::Up => self.spotlight_focus.saturating_sub(1),
+                        Dir::Down => (self.spotlight_focus + 1).min(n - 1),
+                        _ => self.spotlight_focus,
+                    };
+                    if next != self.spotlight_focus {
+                        self.spotlight_focus = next;
+                        self.dirty = true;
+                    }
+                    return None;
+                }
                 if self.logs_panel_dominant() && matches!(dir, Dir::Up | Dir::Down) {
                     let next = match dir {
                         Dir::Up => self.logs_scroll.saturating_sub(1),
@@ -657,6 +676,13 @@ impl App {
                 self.set_toast(&msg);
                 None
             }
+            Action::SpotlightDrillStub => {
+                if self.layout != Layout::Spotlight || self.overlay != Overlay::None {
+                    return None;
+                }
+                self.set_toast(crate::view::SPOTLIGHT_DRILL_STUB_TOAST);
+                None
+            }
             Action::CorrelateEventRow { text, tags } => {
                 self.correlate_from_event_row(&text, &tags)
             }
@@ -773,10 +799,31 @@ impl App {
     }
 
     fn non_green_snapshots(&self) -> Vec<&LayerSnapshot> {
-        self.snapshots
+        let mut cards: Vec<&LayerSnapshot> = self
+            .snapshots
             .iter()
             .filter(|s| !matches!(s.status, Status::Ok | Status::Skipped))
-            .collect()
+            .collect();
+        // PRD-006 Slice 5 (#371): severity-major, Delta-minor ordering so
+        // the most actionable card is on top. Severity rank: Fail > Warn >
+        // Unknown. Within a group, NEW > Unchanged > Fixed (Fixed never
+        // shows here today — fixed layers are green and live in the
+        // footer — but the comparator is total so the contract is stable).
+        cards.sort_by_key(|s| {
+            let sev = match s.status {
+                Status::Fail => 0,
+                Status::Warn => 1,
+                Status::Unknown => 2,
+                _ => 3,
+            };
+            let delta = match self.deltas.get(&s.name) {
+                Some(Delta::New) => 0,
+                Some(Delta::Unchanged) | None => 1,
+                Some(Delta::Fixed) => 2,
+            };
+            (sev, delta)
+        });
+        cards
     }
 
     fn spotlight_next_command(&self) -> Option<String> {
