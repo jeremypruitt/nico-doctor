@@ -106,11 +106,6 @@ pub enum Action {
         entity: EntityRef,
         update: CorrelateUpdate,
     },
-    /// PRD-006 Slice 5 (#371): `Enter` in Spotlight. Ships the visual
-    /// contract for the drill-down trigger; until PRD-007 lands, the
-    /// reducer turns this into the documented stub toast. PRD-007 Slice
-    /// 4 (#377) replaces the stub with the real correlate-popup launch.
-    SpotlightDrillStub,
     /// PRD-007 Slice 4 (#377): toggle between the condensed correlate
     /// popup ([`crate::events::Overlay::Correlate`]) and the full-screen
     /// correlate view ([`crate::events::Overlay::CorrelateFullscreen`]).
