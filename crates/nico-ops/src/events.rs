@@ -142,14 +142,12 @@ fn translate_spotlight(key: &KeyEvent) -> Option<Action> {
             Some(Action::ShowAll)
         }
         KeyCode::Esc => Some(Action::ShowAll),
-        // PRD-006 Slice 5 (#371): Enter drives the drill-down trigger.
-        // Today it surfaces a documented stub toast; PRD-007 Slice 4
-        // replaces the stub with the correlate-popup launch.
-        KeyCode::Enter => Some(Action::SpotlightDrillStub),
-        // Spotlight action row: y / o / c.
+        // Enter and `c` are both bound to the correlate-popup trigger —
+        // identical behaviour, second key binding. (#396)
+        KeyCode::Enter | KeyCode::Char('c') | KeyCode::Char('C') => Some(Action::Correlate),
+        // Spotlight action row: y / o.
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(Action::CopyNextCommand),
         KeyCode::Char('o') | KeyCode::Char('O') => Some(Action::OpenLink),
-        KeyCode::Char('c') | KeyCode::Char('C') => Some(Action::Correlate),
         // PRD-006 Slice 2 (#368): `l` opens the logs modal from
         // Spotlight too. The toast pointing at logs has always said
         // "press `l` for logs"; this slice finally implements it.
@@ -606,14 +604,10 @@ mod tests {
     }
 
     #[test]
-    fn enter_in_spotlight_emits_drill_stub() {
-        // PRD-006 Slice 5 (#371): Enter in Spotlight surfaces the
-        // PRD-007 stub toast; the real drill-down primitive lands in
-        // PRD-007.
-        assert_eq!(
-            tr_spotlight(&k(KeyCode::Enter)),
-            Some(Action::SpotlightDrillStub)
-        );
+    fn enter_in_spotlight_emits_correlate() {
+        // #396: Enter is a second binding for the correlate-popup trigger
+        // — identical UX to `c`. (Layout::Spotlight, Overlay::None.)
+        assert_eq!(tr_spotlight(&k(KeyCode::Enter)), Some(Action::Correlate));
     }
 
     #[test]

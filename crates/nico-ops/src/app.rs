@@ -685,13 +685,6 @@ impl App {
                 self.dirty = true;
                 None
             }
-            Action::SpotlightDrillStub => {
-                if self.layout != Layout::Spotlight || self.overlay != Overlay::None {
-                    return None;
-                }
-                self.set_toast(crate::view::SPOTLIGHT_DRILL_STUB_TOAST);
-                None
-            }
             Action::CorrelateEventRow { text, tags } => {
                 self.correlate_from_event_row(&text, &tags)
             }

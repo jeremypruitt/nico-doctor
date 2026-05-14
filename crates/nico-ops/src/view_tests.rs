@@ -1384,19 +1384,90 @@ fn spotlight_j_and_k_move_focus_through_sorted_cards() {
 }
 
 #[test]
-fn spotlight_enter_shows_prd007_stub_toast() {
-    // Acceptance: pressing Enter in Spotlight shows the documented
-    // PRD-007-stub toast. The drill-down primitive itself ships in
-    // PRD-007 — this slice ships the visual contract only.
-    use crate::view::SPOTLIGHT_DRILL_STUB_TOAST;
+fn spotlight_enter_opens_correlate_popup_for_focused_entity() {
+    // #396: Enter on a focused Spotlight card with a parseable
+    // `next_command` opens the correlate popup with the parsed entity
+    // (`Confidence::Parsed`) — identical UX to `c`.
+    use crate::events::Overlay;
     let mut app = App::new();
-    app.handle(Action::Snapshots(mixed_for_grouping()));
+    app.handle(Action::Snapshots(vec![workflows_snap_with_id("wf-001")]));
     enter_spotlight(&mut app);
-    app.handle(Action::SpotlightDrillStub);
-    let toast = app
-        .toast()
-        .expect("Enter in Spotlight should set the drill-stub toast");
-    assert_eq!(toast.message, SPOTLIGHT_DRILL_STUB_TOAST);
+    let eff = app.handle(Action::Correlate);
+    let expected = entity_wf("wf-001");
+    assert_eq!(eff, Some(crate::app::Effect::RunCorrelate(expected.clone())));
+    assert_eq!(app.overlay(), Overlay::Correlate);
+    let cs = app
+        .correlate_state()
+        .expect("correlate state set after Enter");
+    assert_eq!(cs.entity, expected);
+    assert_eq!(
+        expected.confidence,
+        crate::model::Confidence::Parsed,
+        "NextCommand-first extraction must tag the entity as Parsed"
+    );
+}
+
+#[test]
+fn spotlight_enter_with_no_entity_in_focused_row_raises_toast() {
+    // #396: no parseable entity in the focused card → "no entity found
+    // in this row" toast, no overlay. Same path as `c`.
+    use crate::events::Overlay;
+    let snap = LayerSnapshot {
+        name: "logs".into(),
+        status: Status::Warn,
+        evidence: "12 errors".into(),
+        findings: vec![Finding {
+            status: Status::Warn,
+            message: "generic warn with no parsable id".into(),
+            next_command: None,
+            link: None,
+        }],
+        duration_ms: 0,
+    };
+    let mut app = App::new();
+    app.handle(Action::Snapshots(vec![snap]));
+    enter_spotlight(&mut app);
+    let eff = app.handle(Action::Correlate);
+    assert_eq!(eff, None);
+    assert_eq!(app.overlay(), Overlay::None);
+    assert_eq!(
+        app.toast().map(|t| t.message.as_str()),
+        Some("no entity found in this row")
+    );
+}
+
+#[test]
+fn spotlight_enter_is_identical_to_c_for_correlate_dispatch() {
+    // #396: Enter is a second binding for the correlate-popup trigger.
+    // Translating Enter and `c` against `(Layout::Spotlight, Overlay::None)`
+    // must yield the same `Action::Correlate` — the reducer paths
+    // (popup / chooser / toast) are then automatically identical because
+    // a single action drives them.
+    use crate::app::Layout as AppLayout;
+    use crate::events::{Mode, Overlay as OverlayKey, translate};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    fn k(code: KeyCode) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+    let enter = translate(
+        &k(KeyCode::Enter),
+        Mode::Normal,
+        AppLayout::Spotlight,
+        OverlayKey::None,
+    );
+    let c = translate(
+        &k(KeyCode::Char('c')),
+        Mode::Normal,
+        AppLayout::Spotlight,
+        OverlayKey::None,
+    );
+    assert_eq!(enter, Some(Action::Correlate));
+    assert_eq!(enter, c, "Enter and `c` must dispatch identically");
 }
 
 #[test]

@@ -154,12 +154,6 @@ const SPOTLIGHT_HEADER_HEIGHT: u16 = 5;
 /// the pre-Slice-5 per-card action line.
 const SPOTLIGHT_ACTION_LINE: &str = "  [y] copy   [o] open   [Enter] drill   [a] all   [esc] back";
 
-/// PRD-007 stub toast surfaced when the operator presses `[Enter]` from
-/// Spotlight. The drill-down primitive itself lands in PRD-007; this
-/// slice ships the visual contract (the persistent `[Enter] drill` cue
-/// in the action row) so PRD-007 has a stable entry point to plug into.
-pub const SPOTLIGHT_DRILL_STUB_TOAST: &str = "Drill-down coming in PRD-007";
-
 /// Group header glyphs + labels for the severity-grouped findings list.
 fn group_header(theme: &Theme, status: &Status) -> Line<'static> {
     let label = match status {
