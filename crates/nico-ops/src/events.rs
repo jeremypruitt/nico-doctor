@@ -187,6 +187,11 @@ fn translate_correlate_chooser(key: &KeyEvent) -> Option<Action> {
 /// dismiss. Quit-on-`q` is locally overridden so the operator can close
 /// the overlay without exiting the process; Ctrl-C still quits because
 /// the higher-level translator branch handles it before reaching here.
+///
+/// PRD-007 Slice 3 (#376) added `c` — the log-line trigger for the
+/// correlate drill. The reducer pulls the focused log line out of state,
+/// runs the Slice 1 extraction primitive on it, and dispatches to the
+/// popup, chooser, or a toast.
 fn translate_logs_overlay(key: &KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Esc
@@ -194,6 +199,7 @@ fn translate_logs_overlay(key: &KeyEvent) -> Option<Action> {
         | KeyCode::Char('Q')
         | KeyCode::Char('l')
         | KeyCode::Char('L') => Some(Action::CloseOverlay),
+        KeyCode::Char('c') | KeyCode::Char('C') => Some(Action::Correlate),
         _ => None,
     }
 }
@@ -330,10 +336,7 @@ mod tests {
 
     #[test]
     fn l_opens_logs_overlay_from_spotlight() {
-        assert_eq!(
-            tr_spotlight(&k(KeyCode::Char('l'))),
-            Some(Action::ShowLogs)
-        );
+        assert_eq!(tr_spotlight(&k(KeyCode::Char('l'))), Some(Action::ShowLogs));
     }
 
     fn logs_overlay(event: &Event, layout: Layout) -> Option<Action> {
@@ -365,6 +368,23 @@ mod tests {
             logs_overlay(&ctrl(KeyCode::Char('c')), Layout::Scorecard),
             Some(Action::Quit)
         );
+    }
+
+    #[test]
+    fn c_inside_logs_overlay_emits_correlate() {
+        // PRD-007 Slice 3 (#376): `c` on a focused log line is the
+        // log-line trigger for the correlate drill. The reducer is
+        // responsible for extracting entities from the focused line and
+        // routing to popup / chooser / toast.
+        for layout in [Layout::Scorecard, Layout::Spotlight] {
+            for key in [KeyCode::Char('c'), KeyCode::Char('C')] {
+                assert_eq!(
+                    logs_overlay(&k(key), layout),
+                    Some(Action::Correlate),
+                    "key={key:?} layout={layout:?}"
+                );
+            }
+        }
     }
 
     #[test]

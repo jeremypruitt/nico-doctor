@@ -554,6 +554,9 @@ impl App {
                 }
             }
             Action::Correlate => {
+                if self.overlay == Overlay::Logs {
+                    return self.correlate_from_focused_log_line();
+                }
                 if self.overlay != Overlay::None {
                     return None;
                 }
@@ -602,10 +605,7 @@ impl App {
                     return None;
                 }
                 self.overlay = Overlay::CorrelateChooser;
-                self.chooser = Some(ChooserState {
-                    entities,
-                    focus: 0,
-                });
+                self.chooser = Some(ChooserState { entities, focus: 0 });
                 self.dirty = true;
                 None
             }
@@ -664,6 +664,41 @@ impl App {
     fn focused_entity(&self) -> Option<EntityRef> {
         let snap = self.focused_for_correlate()?;
         snap.findings.iter().find_map(extract_entity_from_finding)
+    }
+
+    /// PRD-007 Slice 3 (#376): handle `c` while the logs overlay is open.
+    /// Extracts entities from the focused log line via the Slice 1
+    /// primitive and dispatches to popup / chooser / toast. Returning
+    /// here is the only `Action::Correlate` path that may transition out
+    /// of `Overlay::Logs` (single or multi-match cases) — the no-entity
+    /// case keeps the overlay open so the operator can keep scrolling.
+    fn correlate_from_focused_log_line(&mut self) -> Option<Effect> {
+        use crate::entity_extraction::{ExtractionContext, extract_entities};
+        let message = match self.log_lines.get(self.logs_scroll as usize) {
+            Some(line) => line.message.clone(),
+            None => return None,
+        };
+        let entities = extract_entities(&message, ExtractionContext::LogLine);
+        match entities.len() {
+            0 => {
+                self.set_toast("no entity found in this row");
+                None
+            }
+            // OpenCorrelatePopup and ShowCorrelateChooser both reject if
+            // an overlay is already up — close the logs overlay first so
+            // they see `Overlay::None` and seed cleanly.
+            1 => {
+                self.overlay = Overlay::None;
+                self.dirty = true;
+                let entity = entities.into_iter().next().unwrap();
+                self.handle(Action::OpenCorrelatePopup(entity))
+            }
+            _ => {
+                self.overlay = Overlay::None;
+                self.dirty = true;
+                self.handle(Action::ShowCorrelateChooser(entities))
+            }
+        }
     }
 
     /// In Spotlight, `[c]` should target the focused incident card; in

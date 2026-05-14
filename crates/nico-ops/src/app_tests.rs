@@ -1461,3 +1461,102 @@ fn chooser_close_overlay_clears_state_no_correlate_dispatched() {
     // No correlate popup was opened — dismissal is a clean no-op.
     assert!(app.correlate_state().is_none());
 }
+
+// ── PRD-007 Slice 3 (#376): log-line trigger ────────────────────────────
+
+fn log_line(message: &str) -> LogLine {
+    LogLine {
+        ts: chrono::Utc::now(),
+        pod: "core-abc".into(),
+        level: Status::Warn,
+        message: message.into(),
+    }
+}
+
+#[test]
+fn correlate_in_logs_overlay_with_no_entity_line_raises_toast_and_keeps_overlay() {
+    let mut app = App::new();
+    app.handle(Action::LogLines(vec![log_line("nothing useful here")]));
+    app.handle(Action::ShowLogs);
+    let eff = app.handle(Action::Correlate);
+    assert_eq!(eff, None);
+    // Logs overlay must stay open — the operator's mental anchor is the
+    // log line they were looking at, not the dashboard underneath.
+    assert_eq!(app.overlay(), Overlay::Logs);
+    assert_eq!(
+        app.toast().map(|t| t.message.as_str()),
+        Some("no entity found in this row")
+    );
+}
+
+#[test]
+fn correlate_in_logs_overlay_with_single_entity_opens_correlate_popup() {
+    let mut app = App::new();
+    app.handle(Action::LogLines(vec![log_line(
+        "provisioning dpu-r12u5 failed",
+    )]));
+    app.handle(Action::ShowLogs);
+    let eff = app.handle(Action::Correlate);
+    // The logs overlay yields to the correlate popup. The host loop
+    // sees a RunCorrelate effect so it can spawn the per-Source futures.
+    assert_eq!(eff, Some(Effect::RunCorrelate(entity_dpu("dpu-r12u5"))));
+    assert_eq!(app.overlay(), Overlay::Correlate);
+    let state = app.correlate_state().expect("correlate popup opened");
+    assert_eq!(state.entity, entity_dpu("dpu-r12u5"));
+    assert!(state.is_loading());
+}
+
+#[test]
+fn correlate_in_logs_overlay_with_multi_entity_line_opens_chooser() {
+    let mut app = App::new();
+    app.handle(Action::LogLines(vec![log_line(
+        "host-r12u5 had dpu-bf3-r12u5 disconnect",
+    )]));
+    app.handle(Action::ShowLogs);
+    let eff = app.handle(Action::Correlate);
+    assert_eq!(eff, None);
+    assert_eq!(app.overlay(), Overlay::CorrelateChooser);
+    let chooser = app.chooser_state().expect("chooser opened");
+    assert_eq!(chooser.entities.len(), 2);
+    assert_eq!(chooser.entities[0].id, "host-r12u5");
+    assert_eq!(chooser.entities[1].id, "dpu-bf3-r12u5");
+    assert_eq!(chooser.focus, 0);
+}
+
+#[test]
+fn correlate_in_logs_overlay_with_no_log_lines_is_inert() {
+    let mut app = App::new();
+    app.handle(Action::ShowLogs);
+    let eff = app.handle(Action::Correlate);
+    assert_eq!(eff, None);
+    assert_eq!(app.overlay(), Overlay::Logs);
+    assert!(app.toast().is_none());
+}
+
+#[test]
+fn keypress_c_in_logs_overlay_routes_through_translator_to_popup_open() {
+    // Integration: full event-pipeline test. Translator + reducer must
+    // agree on the log-line trigger.
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    let mut app = App::new();
+    app.handle(Action::LogLines(vec![log_line(
+        "provisioning dpu-r12u5 failed",
+    )]));
+    app.handle(Action::ShowLogs);
+    let ev = Event::Key(KeyEvent {
+        code: KeyCode::Char('c'),
+        modifiers: KeyModifiers::NONE,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    });
+    let action = crate::events::translate(
+        &ev,
+        crate::events::Mode::Normal,
+        app.layout(),
+        app.overlay(),
+    )
+    .expect("translator must emit an action for `c` in the logs overlay");
+    let eff = app.handle(action);
+    assert_eq!(eff, Some(Effect::RunCorrelate(entity_dpu("dpu-r12u5"))));
+    assert_eq!(app.overlay(), Overlay::Correlate);
+}
