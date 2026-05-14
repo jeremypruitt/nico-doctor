@@ -17,6 +17,8 @@ futures = "0.3"
 chrono = "0.4"
 humantime = "2"
 arboard = { version = "3", default-features = false }
+# Throwaway prototype dep — tachyonfx 0.20.x pairs with ratatui 0.29.
+tachyonfx = "0.20"
 
 [features]
 # Opt-in dhat heap-profiling allocator. Off by default; enable for

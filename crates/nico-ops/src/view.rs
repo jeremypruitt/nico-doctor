@@ -96,6 +96,7 @@ fn render_scorecard_layout(app: &mut App, theme: &Theme, frame: &mut Frame) {
         Overlay::Logs => render_logs_overlay(app, theme, frame, plan.logs_overlay.unwrap_or(area)),
         Overlay::None => {}
     }
+    apply_popup_fx(app, frame, area);
 }
 
 fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
@@ -141,6 +142,7 @@ fn render_spotlight(app: &mut App, theme: &Theme, frame: &mut Frame) {
         }
         _ => {}
     }
+    apply_popup_fx(app, frame, area);
 }
 
 /// Approximate row height of the tui-big-text headline at
@@ -717,6 +719,37 @@ fn render_detail_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect
 /// the Source-attributed Timeline. Failed Sources surface as inline
 /// `source_error` rows so the operator can see *why* a Source dropped
 /// out without leaving the dashboard.
+/// Throwaway prototype: apply the tachyonfx fade-in effect to the
+/// correlate popup's centered rect, post-render. Runs after every
+/// frame; no-op unless `app.step_popup_fx()` returns `Some`.
+///
+/// Mirrors the centered-rect math in `popup::centered` (kept private
+/// there). For a prototype we hard-code the correlate popup's 80×70
+/// percentages instead of plumbing them out of the renderer.
+fn apply_popup_fx(app: &mut crate::app::App, frame: &mut Frame, viewport: Rect) {
+    if !matches!(app.overlay(), Overlay::Correlate) {
+        return;
+    }
+    let popup_area = centered_pct(viewport, 80, 70);
+    if let Some((effect, dt)) = app.step_popup_fx() {
+        let _ = effect.process(dt.into(), frame.buffer_mut(), popup_area);
+    }
+    app.clear_popup_fx_if_done();
+}
+
+fn centered_pct(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let h = (area.width * pct_x) / 100;
+    let v = (area.height * pct_y) / 100;
+    let x = area.x + (area.width.saturating_sub(h)) / 2;
+    let y = area.y + (area.height.saturating_sub(v)) / 2;
+    Rect {
+        x,
+        y,
+        width: h,
+        height: v,
+    }
+}
+
 fn render_correlate_overlay(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let Some(state) = app.correlate_state() else {
         return;

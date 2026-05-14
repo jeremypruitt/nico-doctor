@@ -117,6 +117,14 @@ pub struct App {
     chooser: Option<ChooserState>,
     log_lines: Vec<LogLine>,
     features: FeatureFlags,
+    /// Throwaway prototype: fade-in effect for the correlate popup.
+    /// Initialised on `OpenCorrelatePopup`, advanced each `Tick`, cleared
+    /// when `done()`. See `view::render_correlate_overlay`.
+    popup_fx: Option<tachyonfx::Effect>,
+    /// Wall-clock of the last frame the popup_fx was advanced against.
+    /// `Effect::process` needs the *delta* since the last render, not
+    /// since the effect started, so we keep the previous timestamp here.
+    popup_fx_last_render: Option<Instant>,
 }
 
 /// A transient bottom-bar message and its expiry timestamp. Cleared by
@@ -171,6 +179,8 @@ impl App {
             chooser: None,
             log_lines: Vec::new(),
             features: FeatureFlags::default(),
+            popup_fx: None,
+            popup_fx_last_render: None,
         }
     }
 
@@ -296,6 +306,26 @@ impl App {
 
     pub fn overlay(&self) -> Overlay {
         self.overlay
+    }
+
+    /// Throwaway prototype: return the active popup fade-in effect and
+    /// the wall-clock delta since the last render. Updates the bookkeeping
+    /// timestamp as a side effect — call once per frame.
+    pub fn step_popup_fx(&mut self) -> Option<(&mut tachyonfx::Effect, Duration)> {
+        let now = self.now?;
+        let last = self.popup_fx_last_render.replace(now);
+        let dt = now.saturating_duration_since(last.unwrap_or(now));
+        self.popup_fx.as_mut().map(|fx| (fx, dt))
+    }
+
+    /// Drop the popup fade-in effect once it has finished animating.
+    /// Renderer calls this right after `step_popup_fx` so the next Tick
+    /// stops marking the app dirty.
+    pub fn clear_popup_fx_if_done(&mut self) {
+        if self.popup_fx.as_ref().is_some_and(|e| e.done()) {
+            self.popup_fx = None;
+            self.popup_fx_last_render = None;
+        }
     }
 
     pub fn refreshing(&self) -> bool {
@@ -487,6 +517,19 @@ impl App {
                     self.boot = Some(now);
                 }
                 self.now = Some(now);
+                // Throwaway prototype: keep redrawing while the popup
+                // fade-in is alive so its per-frame progress reaches the
+                // renderer (the host loop only `draw`s when `dirty`). If
+                // the overlay was dismissed mid-fade, drop the effect so
+                // we don't churn the loop forever.
+                if self.popup_fx.is_some() {
+                    if self.overlay != Overlay::Correlate {
+                        self.popup_fx = None;
+                        self.popup_fx_last_render = None;
+                    } else {
+                        self.dirty = true;
+                    }
+                }
                 if let Some(t) = &self.toast
                     && now >= t.expires_at
                 {
@@ -624,6 +667,17 @@ impl App {
                     diagnosis: None,
                     run_done: false,
                 });
+                // Throwaway prototype: kick a 350ms fade-from-black on the
+                // popup area. Reset the "last render" timestamp so the
+                // first `process` call gets a sensible dt.
+                self.popup_fx = Some(tachyonfx::fx::fade_from_fg(
+                    ratatui::style::Color::Black,
+                    tachyonfx::EffectTimer::from_ms(
+                        350,
+                        tachyonfx::Interpolation::SineOut,
+                    ),
+                ));
+                self.popup_fx_last_render = self.now;
                 self.dirty = true;
                 Some(Effect::RunCorrelate(entity))
             }
